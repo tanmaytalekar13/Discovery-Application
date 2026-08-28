@@ -11,38 +11,77 @@ class ArcadeDBError(RuntimeError):
 
 
 class ArcadeDBClient:
+    """Asynchronous client for interacting with ArcadeDB."""
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-
-    @property
-    def ready_url(self) -> str:
-        host = self._settings.arcadedb_host
-        port = self._settings.arcadedb_port
-        return f"http://{host}:{port}/api/v1/ready"
-
-    async def check_connection(self) -> bool:
-        auth = (
+        self._auth = (
             self._settings.arcadedb_user,
             self._settings.arcadedb_password,
         )
 
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(
-                self.ready_url,
-                auth=auth,
+    @property
+    def base_url(self) -> str:
+        return f"http://{self._settings.arcadedb_host}:{self._settings.arcadedb_port}"
+
+    @property
+    def ready_url(self) -> str:
+        return f"{self.base_url}/api/v1/ready"
+
+    @property
+    def server_url(self) -> str:
+        return f"{self.base_url}/api/v1/server"
+
+    @property
+    def command_url(self) -> str:
+        database = quote(self._settings.arcadedb_database, safe="")
+        return f"{self.base_url}/api/v1/command/{database}"
+
+    async def _request(
+        self, 
+        method: str, 
+        url: str, 
+        timeout: float = 10.0, 
+        **kwargs: Any
+    ) -> httpx.Response:
+        """Centralized request handler for HTTP calls."""
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.request(method, url, auth=self._auth, **kwargs)
+
+    async def check_connection(self) -> bool:
+        """Check if the ArcadeDB server is ready to accept requests."""
+        try:
+            response = await self._request("GET", self.ready_url, timeout=3.0)
+            return response.is_success
+        except httpx.RequestError:
+            return False
+
+    async def server_databases(self) -> list[str]:
+        """Return the databases currently available on the ArcadeDB server."""
+        response = await self._request("GET", f"{self.base_url}/api/v1/databases")
+
+        if not response.is_success:
+            raise ArcadeDBError(
+                f"Failed to list ArcadeDB databases ({response.status_code}): {response.text}"
             )
 
-        return response.is_success
+        payload = response.json()
+        result = payload.get("result", [])
 
-    def database_url(self, path: str = "") -> str:
-        host = self._settings.arcadedb_host
-        port = self._settings.arcadedb_port
-        database = quote(
-            self._settings.arcadedb_database,
-            safe="",
-        )
+        if not isinstance(result, list):
+            raise ArcadeDBError("Unexpected ArcadeDB database response format.")
 
-        return f"http://{host}:{port}/api/v1/{database}{path}"
+        return [str(database) for database in result]
+
+    async def create_database(self, database: str) -> None:
+        """Create a new ArcadeDB database."""
+        payload = {"command": f"create database {database}"}
+        response = await self._request("POST", self.server_url, json=payload)
+
+        if not response.is_success:
+            raise ArcadeDBError(
+                f"Failed to create ArcadeDB database ({response.status_code}): {response.text}"
+            )
 
     async def command(
         self,
@@ -50,34 +89,20 @@ class ArcadeDBClient:
         command: str,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """
-        Execute a command against the configured ArcadeDB database.
-        """
-
+        """Execute a command against the configured ArcadeDB database."""
         payload: dict[str, Any] = {
             "language": language,
             "command": command,
         }
 
-        if params:
+        if params is not None:
             payload["params"] = params
 
-        auth = (
-            self._settings.arcadedb_user,
-            self._settings.arcadedb_password,
-        )
-
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                self.database_url("/command"),
-                json=payload,
-                auth=auth,
-            )
+        response = await self._request("POST", self.command_url, json=payload)
 
         if not response.is_success:
             raise ArcadeDBError(
-                f"ArcadeDB command failed "
-                f"({response.status_code}): {response.text}"
+                f"ArcadeDB command failed ({response.status_code}): {response.text}"
             )
 
         return response.json()

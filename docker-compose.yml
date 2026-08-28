@@ -34,10 +34,12 @@ services:
       DISCOVERY_MODE: ${DISCOVERY_MODE}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       GEMINI_MODEL: ${GEMINI_MODEL}
-    depends_on:
-      - arcadedb
+    volumes:
+      - ./platform/arcadedb/init:/app/arcadedb/init:ro
     ports:
       - "8000:8000"
+    depends_on:
+      - arcadedb
     networks:
       - platform
 
@@ -45,10 +47,10 @@ services:
     build:
       context: ./platform/frontend
     hostname: frontend
-    depends_on:
-      - backend
     ports:
       - "4200:4200"
+    depends_on:
+      - backend
     networks:
       - platform
 

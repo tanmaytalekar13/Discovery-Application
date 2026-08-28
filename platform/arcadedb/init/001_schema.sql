@@ -1,13 +1,17 @@
+-- ============================================================
+-- Database Initialization
+-- ============================================================
+
 CREATE DATABASE platform IF NOT EXISTS;
 
 
 -- ============================================================
--- Base Item
+-- Base Item (Vertex)
 -- ============================================================
 
-CREATE DOCUMENT TYPE Item;
+CREATE VERTEX TYPE Item;
 
-CREATE PROPERTY Item.item_id UUID;
+CREATE PROPERTY Item.item_id STRING;
 CREATE PROPERTY Item.type STRING;
 CREATE PROPERTY Item.name STRING;
 CREATE PROPERTY Item.description STRING;
@@ -38,10 +42,10 @@ CREATE PROPERTY Item.embedding ARRAY_OF_FLOATS;
 
 
 -- ============================================================
--- Tool
+-- Tool (Vertex)
 -- ============================================================
 
-CREATE DOCUMENT TYPE Tool;
+CREATE VERTEX TYPE Tool;
 
 CREATE PROPERTY Tool.server_id STRING;
 CREATE PROPERTY Tool.tool_name STRING;
@@ -49,33 +53,33 @@ CREATE PROPERTY Tool.mcp_schema EMBEDDED;
 
 
 -- ============================================================
--- Agent
+-- Agent (Vertex)
 -- ============================================================
 
-CREATE DOCUMENT TYPE Agent;
+CREATE VERTEX TYPE Agent;
 
 CREATE PROPERTY Agent.endpoint STRING;
 CREATE PROPERTY Agent.agent_card EMBEDDED;
-CREATE PROPERTY Agent.skills EMBEDDEDLIST;
-CREATE PROPERTY Agent.capabilities EMBEDDEDLIST;
-CREATE PROPERTY Agent.declared_dependencies EMBEDDEDLIST;
+CREATE PROPERTY Agent.skills LIST;
+CREATE PROPERTY Agent.capabilities LIST;
+CREATE PROPERTY Agent.declared_dependencies LIST;
 
 
 -- ============================================================
--- Skill
+-- Skill (Vertex)
 -- ============================================================
 
-CREATE DOCUMENT TYPE Skill;
+CREATE VERTEX TYPE Skill;
 
 CREATE PROPERTY Skill.name STRING;
 CREATE PROPERTY Skill.description STRING;
 
 
 -- ============================================================
--- Discovery Source
+-- Discovery Source (Vertex)
 -- ============================================================
 
-CREATE DOCUMENT TYPE DiscoverySource;
+CREATE VERTEX TYPE DiscoverySource;
 
 CREATE PROPERTY DiscoverySource.source_type STRING;
 CREATE PROPERTY DiscoverySource.source_id STRING;
@@ -83,7 +87,7 @@ CREATE PROPERTY DiscoverySource.url STRING;
 
 
 -- ============================================================
--- Artifact
+-- Artifact (Document)
 -- ============================================================
 
 CREATE DOCUMENT TYPE Artifact;
@@ -94,13 +98,13 @@ CREATE PROPERTY Artifact.content STRING;
 
 
 -- ============================================================
--- Test Run
+-- Test Run (Vertex)
 -- ============================================================
 
-CREATE DOCUMENT TYPE TestRun;
+CREATE VERTEX TYPE TestRun;
 
-CREATE PROPERTY TestRun.run_id UUID;
-CREATE PROPERTY TestRun.item_id UUID;
+CREATE PROPERTY TestRun.run_id STRING;
+CREATE PROPERTY TestRun.item_id STRING;
 CREATE PROPERTY TestRun.type STRING;
 
 CREATE PROPERTY TestRun.started_at DATETIME;
@@ -108,23 +112,23 @@ CREATE PROPERTY TestRun.completed_at DATETIME;
 
 CREATE PROPERTY TestRun.status STRING;
 
-CREATE PROPERTY TestRun.input EMBEDDED;
-CREATE PROPERTY TestRun.output EMBEDDED;
+CREATE PROPERTY TestRun.input MAP;
+CREATE PROPERTY TestRun.output MAP;
 
 CREATE PROPERTY TestRun.duration_ms LONG;
 
-CREATE PROPERTY TestRun.errors EMBEDDEDLIST;
-CREATE PROPERTY TestRun.logs EMBEDDEDLIST;
-CREATE PROPERTY TestRun.dependencies EMBEDDED;
+CREATE PROPERTY TestRun.errors LIST;
+CREATE PROPERTY TestRun.logs LIST;
+CREATE PROPERTY TestRun.dependencies MAP;
 
 
 -- ============================================================
--- Reliability Evaluation
+-- Reliability Evaluation (Vertex)
 -- ============================================================
 
-CREATE DOCUMENT TYPE ReliabilityEvaluation;
+CREATE VERTEX TYPE ReliabilityEvaluation;
 
-CREATE PROPERTY ReliabilityEvaluation.item_id UUID;
+CREATE PROPERTY ReliabilityEvaluation.item_id STRING;
 CREATE PROPERTY ReliabilityEvaluation.score DOUBLE;
 CREATE PROPERTY ReliabilityEvaluation.confidence DOUBLE;
 CREATE PROPERTY ReliabilityEvaluation.scoring_version STRING;
@@ -146,13 +150,13 @@ CREATE EDGE TYPE HAS_TEST_RUN;
 -- Indexes
 -- ============================================================
 
-CREATE INDEX Item.item_id UNIQUE;
+CREATE INDEX ON Item (item_id) UNIQUE;
 
-CREATE INDEX Item.name FULL_TEXT;
-CREATE INDEX Item.description FULL_TEXT;
+CREATE INDEX ON Item (name) FULL_TEXT;
+CREATE INDEX ON Item (description) FULL_TEXT;
 
-CREATE INDEX Skill.name FULL_TEXT;
+CREATE INDEX ON Skill (name) FULL_TEXT;
 
-CREATE INDEX DiscoverySource.source_key NOTUNIQUE;
+CREATE INDEX ON DiscoverySource (source_id) NOTUNIQUE;
 
-CREATE INDEX TestRun.run_id UNIQUE;
+CREATE INDEX ON TestRun (run_id) UNIQUE;

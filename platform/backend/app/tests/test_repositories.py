@@ -1,9 +1,12 @@
 from datetime import datetime, timezone
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
-from app.db.repositories import ItemRepository, TestRunRepository
+from app.db.repositories import (
+    ItemRepository,
+    TestRunRepository as TestRunRepo,
+)
 from app.models import (
     AgentMetadata,
     ArtifactMetadata,
@@ -14,8 +17,8 @@ from app.models import (
     ItemType,
     Reliability,
     SourceType,
-    TestRun,
-    TestRunStatus,
+    TestRun as TestRunModel,
+    TestRunStatus as TestRunStatusModel,
     ToolMetadata,
 )
 
@@ -48,10 +51,32 @@ class FakeArcadeDB:
         normalized = " ".join(command.split()).upper()
 
         # ----------------------------------------------------
+        # Graph edges
+        #
+        # IMPORTANT:
+        # This must be checked before SELECT FROM ITEM
+        # because CREATE EDGE contains SELECT statements.
+        # ----------------------------------------------------
+
+        if normalized.startswith("CREATE EDGE"):
+            assert params is not None
+
+            self.edges.append(
+                {
+                    "command": command,
+                    "params": params,
+                }
+            )
+
+            return {
+                "result": [],
+            }
+
+        # ----------------------------------------------------
         # Item
         # ----------------------------------------------------
 
-        if "CREATE DOCUMENT ITEM" in normalized:
+        if "INSERT INTO ITEM" in normalized:
             assert params is not None
 
             item_id = str(params["item_id"])
@@ -111,7 +136,9 @@ class FakeArcadeDB:
             record = self.item_records.get(item_id)
 
             if record is None:
-                return {"result": []}
+                return {
+                    "result": [],
+                }
 
             for key, value in params.items():
                 if key != "item_id":
@@ -128,18 +155,34 @@ class FakeArcadeDB:
 
             if item_id in self.item_records:
                 del self.item_records[item_id]
-                return {"count": 1}
 
-            return {"count": 0}
+                return {
+                    "count": 1,
+                }
+
+            return {
+                "count": 0,
+            }
 
         # ----------------------------------------------------
         # TestRun
         # ----------------------------------------------------
 
-        if "CREATE DOCUMENT TESTRUN" in normalized:
+        if "INSERT INTO TESTRUN" in normalized:
             assert params is not None
 
             run_id = str(params["run_id"])
+
+            input_data = dict(params["input"])
+            input_data.pop("@type", None)
+
+            output_data = dict(params["output"])
+            output_data.pop("@type", None)
+
+            dependencies_data = dict(
+                params["dependencies"]
+            )
+            dependencies_data.pop("@type", None)
 
             record = {
                 "run_id": run_id,
@@ -148,12 +191,12 @@ class FakeArcadeDB:
                 "started_at": params["started_at"],
                 "completed_at": params["completed_at"],
                 "status": params["status"],
-                "input": params["input"],
-                "output": params["output"],
+                "input": input_data,
+                "output": output_data,
                 "duration_ms": params["duration_ms"],
                 "errors": params["errors"],
                 "logs": params["logs"],
-                "dependencies": params["dependencies"],
+                "dependencies": dependencies_data,
             }
 
             self.test_run_records[run_id] = record
@@ -180,7 +223,9 @@ class FakeArcadeDB:
             record = self.test_run_records.get(run_id)
 
             if record is None:
-                return {"result": []}
+                return {
+                    "result": [],
+                }
 
             for key, value in params.items():
                 if key != "run_id":
@@ -197,26 +242,13 @@ class FakeArcadeDB:
 
             if run_id in self.test_run_records:
                 del self.test_run_records[run_id]
-                return {"count": 1}
 
-            return {"count": 0}
-
-        # ----------------------------------------------------
-        # Graph edges
-        # ----------------------------------------------------
-
-        if "CREATE EDGE" in normalized:
-            assert params is not None
-
-            self.edges.append(
-                {
-                    "command": command,
-                    "params": params,
+                return {
+                    "count": 1,
                 }
-            )
 
             return {
-                "result": [],
+                "count": 0,
             }
 
         raise AssertionError(
@@ -266,7 +298,9 @@ def tool_item() -> Item:
                         "type": "string",
                     },
                 },
-                "required": ["query"],
+                "required": [
+                    "query",
+                ],
             },
         ),
         artifacts=ArtifactMetadata(
@@ -335,13 +369,15 @@ def agent_item() -> Item:
 
 
 @pytest.fixture
-def test_run(tool_item: Item) -> TestRun:
-    return TestRun(
+def test_run(
+    tool_item: Item,
+) -> TestRunModel:
+    return TestRunModel(
         run_id=uuid4(),
         item_id=tool_item.item_id,
         type="tool",
         started_at=datetime.now(timezone.utc),
-        status=TestRunStatus.RUNNING,
+        status=TestRunStatusModel.RUNNING,
         input={
             "query": "Taylor Swift",
         },
@@ -524,9 +560,11 @@ async def test_create_agent_item(
     ]
 
     assert stored["agent"] is not None
+
+    # Pydantic HttpUrl normalizes the URL with a trailing slash.
     assert (
         stored["agent"]["endpoint"]
-        == "http://financial-agent:9000"
+        == "http://financial-agent:9000/"
     )
 
     assert stored["agent"]["skills"] == [
@@ -580,13 +618,13 @@ async def test_create_uses_tool_edge(
 async def test_create_test_run_edge(
     fake_db: FakeArcadeDB,
     tool_item: Item,
-    test_run: TestRun,
+    test_run: TestRunModel,
 ) -> None:
     repository = ItemRepository(fake_db)
 
     await repository.create(tool_item)
 
-    test_run_repository = TestRunRepository(
+    test_run_repository = TestRunRepo(
         fake_db
     )
 
@@ -606,6 +644,14 @@ async def test_create_test_run_edge(
     edge = fake_db.edges[0]
 
     assert "CREATE EDGE HAS_TEST_RUN" in edge[
+        "command"
+    ]
+
+    assert "SELECT FROM TestRun" in edge[
+        "command"
+    ]
+
+    assert "WHERE run_id = :to_id" in edge[
         "command"
     ]
 
@@ -677,15 +723,15 @@ async def test_create_edge_rejects_invalid_target_type(
 @pytest.mark.asyncio
 async def test_create_test_run(
     fake_db: FakeArcadeDB,
-    test_run: TestRun,
+    test_run: TestRunModel,
 ) -> None:
-    repository = TestRunRepository(fake_db)
+    repository = TestRunRepo(fake_db)
 
     result = await repository.create(test_run)
 
     assert result.run_id == test_run.run_id
     assert result.item_id == test_run.item_id
-    assert result.status == TestRunStatus.RUNNING
+    assert result.status == TestRunStatusModel.RUNNING
 
     stored = fake_db.test_run_records[
         str(test_run.run_id)
@@ -694,15 +740,16 @@ async def test_create_test_run(
     assert stored["item_id"] == str(
         test_run.item_id
     )
+
     assert stored["status"] == "running"
 
 
 @pytest.mark.asyncio
 async def test_get_test_run(
     fake_db: FakeArcadeDB,
-    test_run: TestRun,
+    test_run: TestRunModel,
 ) -> None:
-    repository = TestRunRepository(fake_db)
+    repository = TestRunRepo(fake_db)
 
     await repository.create(test_run)
 
@@ -713,14 +760,14 @@ async def test_get_test_run(
     assert result is not None
     assert result.run_id == test_run.run_id
     assert result.item_id == test_run.item_id
-    assert result.status == TestRunStatus.RUNNING
+    assert result.status == TestRunStatusModel.RUNNING
 
 
 @pytest.mark.asyncio
 async def test_get_missing_test_run(
     fake_db: FakeArcadeDB,
 ) -> None:
-    repository = TestRunRepository(fake_db)
+    repository = TestRunRepo(fake_db)
 
     result = await repository.get(uuid4())
 
@@ -730,9 +777,9 @@ async def test_get_missing_test_run(
 @pytest.mark.asyncio
 async def test_update_test_run(
     fake_db: FakeArcadeDB,
-    test_run: TestRun,
+    test_run: TestRunModel,
 ) -> None:
-    repository = TestRunRepository(fake_db)
+    repository = TestRunRepo(fake_db)
 
     await repository.create(test_run)
 
@@ -748,7 +795,7 @@ async def test_update_test_run(
     )
 
     assert result is not None
-    assert result.status == TestRunStatus.SUCCESS
+    assert result.status == TestRunStatusModel.SUCCESS
     assert result.duration_ms == 1250
     assert result.output == {
         "tracks": 10,
@@ -758,9 +805,9 @@ async def test_update_test_run(
 @pytest.mark.asyncio
 async def test_update_empty_test_run(
     fake_db: FakeArcadeDB,
-    test_run: TestRun,
+    test_run: TestRunModel,
 ) -> None:
-    repository = TestRunRepository(fake_db)
+    repository = TestRunRepo(fake_db)
 
     await repository.create(test_run)
 
@@ -776,9 +823,9 @@ async def test_update_empty_test_run(
 @pytest.mark.asyncio
 async def test_update_test_run_rejects_invalid_field(
     fake_db: FakeArcadeDB,
-    test_run: TestRun,
+    test_run: TestRunModel,
 ) -> None:
-    repository = TestRunRepository(fake_db)
+    repository = TestRunRepo(fake_db)
 
     await repository.create(test_run)
 
@@ -794,9 +841,9 @@ async def test_update_test_run_rejects_invalid_field(
 @pytest.mark.asyncio
 async def test_delete_test_run(
     fake_db: FakeArcadeDB,
-    test_run: TestRun,
+    test_run: TestRunModel,
 ) -> None:
-    repository = TestRunRepository(fake_db)
+    repository = TestRunRepo(fake_db)
 
     await repository.create(test_run)
 
@@ -817,7 +864,7 @@ async def test_delete_test_run(
 async def test_delete_missing_test_run(
     fake_db: FakeArcadeDB,
 ) -> None:
-    repository = TestRunRepository(fake_db)
+    repository = TestRunRepo(fake_db)
 
     deleted = await repository.delete(uuid4())
 
