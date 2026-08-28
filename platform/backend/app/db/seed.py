@@ -30,9 +30,9 @@ async def seed() -> None:
 
     now = datetime.now(timezone.utc)
 
-    # --------------------------------------------------------
+    # ========================================================
     # Tool
-    # --------------------------------------------------------
+    # ========================================================
 
     tool = Item(
         item_id=uuid4(),
@@ -80,9 +80,9 @@ async def seed() -> None:
         ),
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Agent
-    # --------------------------------------------------------
+    # ========================================================
 
     agent = Item(
         item_id=uuid4(),
@@ -131,16 +131,16 @@ async def seed() -> None:
         ),
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Persist Items
-    # --------------------------------------------------------
+    # ========================================================
 
     await item_repository.create(tool)
     await item_repository.create(agent)
 
-    # --------------------------------------------------------
+    # ========================================================
     # TestRun for Tool
-    # --------------------------------------------------------
+    # ========================================================
 
     tool_test_run = TestRun(
         run_id=uuid4(),
@@ -171,9 +171,9 @@ async def seed() -> None:
         },
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # TestRun for Agent
-    # --------------------------------------------------------
+    # ========================================================
 
     agent_test_run = TestRun(
         run_id=uuid4(),
@@ -207,14 +207,66 @@ async def seed() -> None:
         },
     )
 
+    # ========================================================
+    # Persist TestRuns
+    # ========================================================
+
     await test_run_repository.create(tool_test_run)
     await test_run_repository.create(agent_test_run)
 
+    # ========================================================
+    # Graph Relationships
+    # ========================================================
+
+    # Agent -> Tool
+    await item_repository.create_edge(
+        edge_type="USES_TOOL",
+        from_type="Item",
+        from_id=agent.item_id,
+        to_type="Item",
+        to_id=tool.item_id,
+    )
+
+    # Tool -> TestRun
+    await item_repository.create_edge(
+        edge_type="HAS_TEST_RUN",
+        from_type="Item",
+        from_id=tool.item_id,
+        to_type="TestRun",
+        to_id=tool_test_run.run_id,
+        to_field="run_id",
+    )
+
+    # Agent -> TestRun
+    await item_repository.create_edge(
+        edge_type="HAS_TEST_RUN",
+        from_type="Item",
+        from_id=agent.item_id,
+        to_type="TestRun",
+        to_id=agent_test_run.run_id,
+        to_field="run_id",
+    )
+
+    # ========================================================
+    # Output
+    # ========================================================
+
     print("Seed completed successfully.")
-    print(f"Tool:  {tool.item_id}")
-    print(f"Agent: {agent.item_id}")
-    print(f"Tool TestRun:  {tool_test_run.run_id}")
-    print(f"Agent TestRun: {agent_test_run.run_id}")
+
+    print(f"Tool:           {tool.item_id}")
+    print(f"Agent:          {agent.item_id}")
+
+    print(
+        f"Tool TestRun:   {tool_test_run.run_id}"
+    )
+    print(
+        f"Agent TestRun:  {agent_test_run.run_id}"
+    )
+
+    print("Relationships:")
+    print("  Agent -> Tool       [USES_TOOL]")
+    print("  Tool -> TestRun     [HAS_TEST_RUN]")
+    print("  Agent -> TestRun    [HAS_TEST_RUN]")
 
 
 if __name__ == "__main__":
