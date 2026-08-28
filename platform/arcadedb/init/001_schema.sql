@@ -32,10 +32,12 @@ CREATE PROPERTY Item.first_seen DATETIME;
 CREATE PROPERTY Item.last_seen DATETIME;
 CREATE PROPERTY Item.last_synced DATETIME;
 
--- Embedded metadata used by the unified Item model.
-CREATE PROPERTY Item.tool EMBEDDED;
-CREATE PROPERTY Item.agent EMBEDDED;
-CREATE PROPERTY Item.artifacts EMBEDDED;
+-- Freeform metadata used by the unified Item model.
+-- MAP (not EMBEDDED) because these are stored as plain JSON-like
+-- dicts with no ArcadeDB "@type" entry — see repositories.py.
+CREATE PROPERTY Item.tool MAP;
+CREATE PROPERTY Item.agent MAP;
+CREATE PROPERTY Item.artifacts MAP;
 
 -- Populated later by the embedding pipeline.
 CREATE PROPERTY Item.embedding ARRAY_OF_FLOATS;
@@ -49,7 +51,7 @@ CREATE VERTEX TYPE Tool;
 
 CREATE PROPERTY Tool.server_id STRING;
 CREATE PROPERTY Tool.tool_name STRING;
-CREATE PROPERTY Tool.mcp_schema EMBEDDED;
+CREATE PROPERTY Tool.mcp_schema MAP;
 
 
 -- ============================================================
@@ -59,7 +61,7 @@ CREATE PROPERTY Tool.mcp_schema EMBEDDED;
 CREATE VERTEX TYPE Agent;
 
 CREATE PROPERTY Agent.endpoint STRING;
-CREATE PROPERTY Agent.agent_card EMBEDDED;
+CREATE PROPERTY Agent.agent_card MAP;
 CREATE PROPERTY Agent.skills LIST;
 CREATE PROPERTY Agent.capabilities LIST;
 CREATE PROPERTY Agent.declared_dependencies LIST;
@@ -133,7 +135,7 @@ CREATE PROPERTY ReliabilityEvaluation.score DOUBLE;
 CREATE PROPERTY ReliabilityEvaluation.confidence DOUBLE;
 CREATE PROPERTY ReliabilityEvaluation.scoring_version STRING;
 CREATE PROPERTY ReliabilityEvaluation.evaluated_at DATETIME;
-CREATE PROPERTY ReliabilityEvaluation.signals EMBEDDED;
+CREATE PROPERTY ReliabilityEvaluation.signals MAP;
 
 
 -- ============================================================
