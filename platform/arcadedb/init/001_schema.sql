@@ -28,6 +28,12 @@ CREATE PROPERTY Item.first_seen DATETIME;
 CREATE PROPERTY Item.last_seen DATETIME;
 CREATE PROPERTY Item.last_synced DATETIME;
 
+-- Embedded metadata for the unified Item model.
+CREATE PROPERTY Item.tool EMBEDDED;
+CREATE PROPERTY Item.agent EMBEDDED;
+CREATE PROPERTY Item.artifacts EMBEDDED;
+
+-- Populated by the local embedding pipeline in Phase 5.
 CREATE PROPERTY Item.embedding ARRAY_OF_FLOATS;
 
 
