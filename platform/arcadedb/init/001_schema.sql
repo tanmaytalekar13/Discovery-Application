@@ -79,6 +79,7 @@ CREATE DOCUMENT TYPE DiscoverySource;
 
 CREATE PROPERTY DiscoverySource.source_type STRING;
 CREATE PROPERTY DiscoverySource.source_id STRING;
+CREATE PROPERTY DiscoverySource.source_key STRING;
 CREATE PROPERTY DiscoverySource.url STRING;
 
 
@@ -130,6 +131,19 @@ CREATE PROPERTY ReliabilityEvaluation.confidence DOUBLE;
 CREATE PROPERTY ReliabilityEvaluation.scoring_version STRING;
 CREATE PROPERTY ReliabilityEvaluation.evaluated_at DATETIME;
 CREATE PROPERTY ReliabilityEvaluation.signals EMBEDDED;
+
+
+-- ============================================================
+-- Graph Edge Types
+-- ============================================================
+
+CREATE EDGE TYPE USES_TOOL;
+
+CREATE EDGE TYPE HAS_SKILL;
+
+CREATE EDGE TYPE DISCOVERED_FROM;
+
+CREATE EDGE TYPE HAS_TEST_RUN;
 
 
 -- ============================================================
