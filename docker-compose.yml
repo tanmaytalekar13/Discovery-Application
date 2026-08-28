@@ -1,0 +1,61 @@
+name: agentic-discovery-platform
+
+services:
+  arcadedb:
+    build:
+      context: ./platform/arcadedb
+    hostname: arcadedb
+    environment:
+      ARCADEDB_ROOT_PASSWORD: ${ARCADEDB_ROOT_PASSWORD}
+      ARCADEDB_USER: ${ARCADEDB_USER}
+      ARCADEDB_PASSWORD: ${ARCADEDB_PASSWORD}
+      ARCADEDB_DATABASE: ${ARCADEDB_DATABASE}
+      ARCADEDB_SETTINGS: -Darcadedb.server.rootPassword=${ARCADEDB_ROOT_PASSWORD}
+    ports:
+      - "2480:2480"
+      - "2424:2424"
+    volumes:
+      - agentic_discovery_platform_arcadedb_data:/home/arcadedb/databases
+    networks:
+      - platform
+
+  backend:
+    build:
+      context: ./platform/backend
+    hostname: backend
+    environment:
+      ARCADEDB_ROOT_PASSWORD: ${ARCADEDB_ROOT_PASSWORD}
+      ARCADEDB_HOST: arcadedb
+      ARCADEDB_PORT: ${ARCADEDB_PORT}
+      ARCADEDB_DATABASE: ${ARCADEDB_DATABASE}
+      ARCADEDB_USER: ${ARCADEDB_USER}
+      ARCADEDB_PASSWORD: ${ARCADEDB_PASSWORD}
+      RELIABILITY_THRESHOLD: ${RELIABILITY_THRESHOLD}
+      DISCOVERY_MODE: ${DISCOVERY_MODE}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL}
+    depends_on:
+      - arcadedb
+    ports:
+      - "8000:8000"
+    networks:
+      - platform
+
+  frontend:
+    build:
+      context: ./platform/frontend
+    hostname: frontend
+    depends_on:
+      - backend
+    ports:
+      - "4200:4200"
+    networks:
+      - platform
+
+networks:
+  platform:
+    name: agentic-discovery-platform-network
+
+volumes:
+  agentic_discovery_platform_arcadedb_data:
+    name: agentic_discovery_platform_arcadedb_data

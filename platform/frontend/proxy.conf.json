@@ -1,0 +1,6 @@
+{
+  "/health": {
+    "target": "http://backend:8000",
+    "secure": false
+  }
+}
