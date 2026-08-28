@@ -153,17 +153,24 @@ class ItemRepository:
     async def create_edge(
         self,
         edge_type: str,
-        from_item_id: UUID,
-        to_item_id: UUID,
+        from_type: str,
+        from_id: UUID | str,
+        to_type: str,
+        to_id: UUID | str,
+        from_field: str = "item_id",
+        to_field: str = "item_id",
     ) -> None:
         """
-        Create a graph relationship between two Item records.
+        Create a graph edge between two records.
 
         Example:
-            USES_TOOL
-            HAS_SKILL
-            DISCOVERED_FROM
-            HAS_TEST_RUN
+
+            Item -> Skill
+            Item -> DiscoverySource
+            Item -> TestRun
+
+        The edge type and record types are allowlisted so callers
+        cannot inject arbitrary SQL identifiers.
         """
 
         allowed_edges = {
@@ -173,9 +180,29 @@ class ItemRepository:
             "HAS_TEST_RUN",
         }
 
+        allowed_types = {
+            "Item",
+            "Tool",
+            "Agent",
+            "Skill",
+            "DiscoverySource",
+            "Artifact",
+            "TestRun",
+        }
+
         if edge_type not in allowed_edges:
             raise ValueError(
                 f"Unsupported edge type: {edge_type}"
+            )
+
+        if from_type not in allowed_types:
+            raise ValueError(
+                f"Unsupported source type: {from_type}"
+            )
+
+        if to_type not in allowed_types:
+            raise ValueError(
+                f"Unsupported target type: {to_type}"
             )
 
         await self._db.command(
@@ -183,17 +210,19 @@ class ItemRepository:
             f"""
             CREATE EDGE {edge_type}
             FROM (
-                SELECT FROM Item
-                WHERE item_id = :from_id
+                SELECT FROM {from_type}
+                WHERE {from_field} = :from_id
+                LIMIT 1
             )
             TO (
-                SELECT FROM Item
-                WHERE item_id = :to_id
+                SELECT FROM {to_type}
+                WHERE {to_field} = :to_id
+                LIMIT 1
             )
             """,
             {
-                "from_id": str(from_item_id),
-                "to_id": str(to_item_id),
+                "from_id": str(from_id),
+                "to_id": str(to_id),
             },
         )
 
@@ -201,11 +230,6 @@ class ItemRepository:
     def _record_to_item(
         record: dict[str, Any],
     ) -> Item:
-        """
-        Convert an ArcadeDB Item document into the
-        Pydantic Item model.
-        """
-
         return Item(
             item_id=UUID(str(record["item_id"])),
 
@@ -248,7 +272,10 @@ class ItemRepository:
 
             tool=record.get("tool"),
             agent=record.get("agent"),
-            artifacts=record.get("artifacts", {}),
+            artifacts=record.get(
+                "artifacts",
+                {},
+            ),
 
             embedding=record.get("embedding"),
         )
@@ -394,13 +421,29 @@ class TestRunRepository:
                 "item_id": record["item_id"],
                 "type": record["type"],
                 "started_at": record["started_at"],
-                "completed_at": record.get("completed_at"),
+                "completed_at": record.get(
+                    "completed_at"
+                ),
                 "status": record["status"],
-                "input": record.get("input", {}),
-                "output": record.get("output", {}),
-                "duration_ms": record.get("duration_ms"),
-                "errors": record.get("errors", []),
-                "logs": record.get("logs", []),
+                "input": record.get(
+                    "input",
+                    {},
+                ),
+                "output": record.get(
+                    "output",
+                    {},
+                ),
+                "duration_ms": record.get(
+                    "duration_ms"
+                ),
+                "errors": record.get(
+                    "errors",
+                    [],
+                ),
+                "logs": record.get(
+                    "logs",
+                    [],
+                ),
                 "dependencies": record.get(
                     "dependencies",
                     {},
