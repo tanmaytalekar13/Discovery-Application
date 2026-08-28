@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -22,16 +22,14 @@ from app.models import (
 
 class FakeArcadeDB:
     """
-    In-memory fake for repository unit tests.
-
-    It records commands sent by the repository without
-    requiring a running ArcadeDB instance.
+    In-memory fake ArcadeDB client used for repository unit tests.
     """
 
     def __init__(self) -> None:
         self.commands: list[dict] = []
         self.item_records: dict[str, dict] = {}
         self.test_run_records: dict[str, dict] = {}
+        self.edges: list[dict] = []
 
     async def command(
         self,
@@ -49,31 +47,67 @@ class FakeArcadeDB:
 
         normalized = " ".join(command.split()).upper()
 
+        # ----------------------------------------------------
+        # Item
+        # ----------------------------------------------------
+
         if "CREATE DOCUMENT ITEM" in normalized:
             assert params is not None
-            item_id = params["item_id"]
-            self.item_records[item_id] = self._item_record(params)
+
+            item_id = str(params["item_id"])
+
+            record = {
+                "item_id": item_id,
+                "type": params["type"],
+                "name": params["name"],
+                "description": params["description"],
+                "source_type": params["source_type"],
+                "source_id": params["source_id"],
+                "source_url": params["source_url"],
+                "version": params["version"],
+                "status": params["status"],
+                "reliability_score": params[
+                    "reliability_score"
+                ],
+                "reliability_confidence": params[
+                    "reliability_confidence"
+                ],
+                "scoring_version": params[
+                    "scoring_version"
+                ],
+                "last_evaluated": params[
+                    "last_evaluated"
+                ],
+                "first_seen": params["first_seen"],
+                "last_seen": params["last_seen"],
+                "last_synced": params["last_synced"],
+                "tool": params["tool"],
+                "agent": params["agent"],
+                "artifacts": params["artifacts"],
+                "embedding": params["embedding"],
+            }
+
+            self.item_records[item_id] = record
 
             return {
-                "result": [
-                    self.item_records[item_id],
-                ]
+                "result": [record],
             }
 
         if "SELECT FROM ITEM" in normalized:
             assert params is not None
+
             record = self.item_records.get(
-                params["item_id"]
+                str(params["item_id"])
             )
 
             return {
-                "result": [record] if record else []
+                "result": [record] if record else [],
             }
 
         if "UPDATE ITEM" in normalized:
             assert params is not None
 
-            item_id = params["item_id"]
+            item_id = str(params["item_id"])
             record = self.item_records.get(item_id)
 
             if record is None:
@@ -90,7 +124,7 @@ class FakeArcadeDB:
         if "DELETE FROM ITEM" in normalized:
             assert params is not None
 
-            item_id = params["item_id"]
+            item_id = str(params["item_id"])
 
             if item_id in self.item_records:
                 del self.item_records[item_id]
@@ -98,17 +132,18 @@ class FakeArcadeDB:
 
             return {"count": 0}
 
-        if "CREATE EDGE" in normalized:
-            return {"result": []}
+        # ----------------------------------------------------
+        # TestRun
+        # ----------------------------------------------------
 
         if "CREATE DOCUMENT TESTRUN" in normalized:
             assert params is not None
 
-            run_id = params["run_id"]
+            run_id = str(params["run_id"])
 
             record = {
                 "run_id": run_id,
-                "item_id": params["item_id"],
+                "item_id": str(params["item_id"]),
                 "type": params["type"],
                 "started_at": params["started_at"],
                 "completed_at": params["completed_at"],
@@ -131,17 +166,17 @@ class FakeArcadeDB:
             assert params is not None
 
             record = self.test_run_records.get(
-                params["run_id"]
+                str(params["run_id"])
             )
 
             return {
-                "result": [record] if record else []
+                "result": [record] if record else [],
             }
 
         if "UPDATE TESTRUN" in normalized:
             assert params is not None
 
-            run_id = params["run_id"]
+            run_id = str(params["run_id"])
             record = self.test_run_records.get(run_id)
 
             if record is None:
@@ -158,7 +193,7 @@ class FakeArcadeDB:
         if "DELETE FROM TESTRUN" in normalized:
             assert params is not None
 
-            run_id = params["run_id"]
+            run_id = str(params["run_id"])
 
             if run_id in self.test_run_records:
                 del self.test_run_records[run_id]
@@ -166,42 +201,27 @@ class FakeArcadeDB:
 
             return {"count": 0}
 
-        raise AssertionError(
-            f"Unexpected command in FakeArcadeDB:\n{command}"
-        )
+        # ----------------------------------------------------
+        # Graph edges
+        # ----------------------------------------------------
 
-    @staticmethod
-    def _item_record(params: dict) -> dict:
-        return {
-            "item_id": params["item_id"],
-            "type": params["type"],
-            "name": params["name"],
-            "description": params["description"],
-            "source_type": params["source_type"],
-            "source_id": params["source_id"],
-            "source_url": params["source_url"],
-            "version": params["version"],
-            "status": params["status"],
-            "reliability_score": params[
-                "reliability_score"
-            ],
-            "reliability_confidence": params[
-                "reliability_confidence"
-            ],
-            "scoring_version": params[
-                "scoring_version"
-            ],
-            "last_evaluated": params[
-                "last_evaluated"
-            ],
-            "first_seen": params["first_seen"],
-            "last_seen": params["last_seen"],
-            "last_synced": params["last_synced"],
-            "tool": params["tool"],
-            "agent": params["agent"],
-            "artifacts": params["artifacts"],
-            "embedding": params["embedding"],
-        }
+        if "CREATE EDGE" in normalized:
+            assert params is not None
+
+            self.edges.append(
+                {
+                    "command": command,
+                    "params": params,
+                }
+            )
+
+            return {
+                "result": [],
+            }
+
+        raise AssertionError(
+            f"Unexpected ArcadeDB command:\n{command}"
+        )
 
 
 @pytest.fixture
@@ -220,13 +240,15 @@ def tool_item() -> Item:
         description="Search Spotify tracks",
         source=DiscoverySource(
             type=SourceType.MCP_REGISTRY,
-            id="spotify-mcp",
+            id="spotify-mcp-server",
+            url="https://example.com/spotify-mcp",
         ),
         version="1.0.0",
         status=ItemStatus.ACTIVE,
         reliability=Reliability(
             score=0.91,
             confidence=0.88,
+            scoring_version="v1",
             last_evaluated=now,
         ),
         discovery=DiscoveryMetadata(
@@ -235,22 +257,27 @@ def tool_item() -> Item:
             last_synced=now,
         ),
         tool=ToolMetadata(
-            server_id="spotify-mcp",
+            server_id="spotify-mcp-server",
             tool_name="search_tracks",
             mcp_schema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                    }
+                    },
                 },
                 "required": ["query"],
             },
         ),
         artifacts=ArtifactMetadata(
             source_available=True,
-            source_url="https://example.com/source",
-            source_code="def search_tracks(): pass",
+            source_url=(
+                "https://example.com/spotify-mcp/source"
+            ),
+            source_code=(
+                "def search_tracks(query: str):\n"
+                "    return search_spotify(query)\n"
+            ),
         ),
     )
 
@@ -263,16 +290,21 @@ def agent_item() -> Item:
         item_id=uuid4(),
         type=ItemType.AGENT,
         name="Financial Research Agent",
-        description="Researches financial information.",
+        description=(
+            "Researches financial information "
+            "and produces summaries."
+        ),
         source=DiscoverySource(
             type=SourceType.A2A_CATALOG,
-            id="financial-agent",
+            id="financial-research-agent",
+            url="https://example.com/a2a",
         ),
         version="1.0.0",
         status=ItemStatus.ACTIVE,
         reliability=Reliability(
             score=0.87,
             confidence=0.82,
+            scoring_version="v1",
             last_evaluated=now,
         ),
         discovery=DiscoveryMetadata(
@@ -281,17 +313,23 @@ def agent_item() -> Item:
             last_synced=now,
         ),
         agent=AgentMetadata(
-            endpoint="http://financial-agent",
+            endpoint="http://financial-agent:9000",
             agent_card={
                 "name": "Financial Research Agent",
+                "description": (
+                    "Researches financial information."
+                ),
             },
             skills=[
                 "financial-research",
+                "market-summary",
             ],
             capabilities=[
                 "task-processing",
             ],
-            declared_dependencies=[],
+            declared_dependencies=[
+                "search_tracks",
+            ],
         ),
     )
 
@@ -305,7 +343,7 @@ def test_run(tool_item: Item) -> TestRun:
         started_at=datetime.now(timezone.utc),
         status=TestRunStatus.RUNNING,
         input={
-            "query": "Taylor Swift"
+            "query": "Taylor Swift",
         },
     )
 
@@ -335,6 +373,7 @@ async def test_create_item(
     assert stored["name"] == "search_tracks"
     assert stored["tool"] is not None
     assert stored["artifacts"] is not None
+    assert stored["embedding"] is None
 
 
 @pytest.mark.asyncio
@@ -355,6 +394,11 @@ async def test_get_item(
     assert result.name == tool_item.name
     assert result.description == tool_item.description
     assert result.type == ItemType.TOOL
+
+    assert result.tool is not None
+    assert result.tool.tool_name == "search_tracks"
+
+    assert result.artifacts.source_code is not None
 
 
 @pytest.mark.asyncio
@@ -388,6 +432,42 @@ async def test_update_item(
     assert result is not None
     assert result.name == "updated_search_tracks"
     assert result.status == ItemStatus.DEPRECATED
+
+
+@pytest.mark.asyncio
+async def test_update_empty_item(
+    fake_db: FakeArcadeDB,
+    tool_item: Item,
+) -> None:
+    repository = ItemRepository(fake_db)
+
+    await repository.create(tool_item)
+
+    result = await repository.update(
+        tool_item.item_id,
+        {},
+    )
+
+    assert result is not None
+    assert result.item_id == tool_item.item_id
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_invalid_field(
+    fake_db: FakeArcadeDB,
+    tool_item: Item,
+) -> None:
+    repository = ItemRepository(fake_db)
+
+    await repository.create(tool_item)
+
+    with pytest.raises(ValueError):
+        await repository.update(
+            tool_item.item_id,
+            {
+                "invalid_field": "value",
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -446,17 +526,22 @@ async def test_create_agent_item(
     assert stored["agent"] is not None
     assert (
         stored["agent"]["endpoint"]
-        == "http://financial-agent"
+        == "http://financial-agent:9000"
     )
+
+    assert stored["agent"]["skills"] == [
+        "financial-research",
+        "market-summary",
+    ]
 
 
 # ============================================================
-# Graph Edge
+# Graph Edges
 # ============================================================
 
 
 @pytest.mark.asyncio
-async def test_create_edge(
+async def test_create_uses_tool_edge(
     fake_db: FakeArcadeDB,
     tool_item: Item,
     agent_item: Item,
@@ -467,21 +552,69 @@ async def test_create_edge(
     await repository.create(agent_item)
 
     await repository.create_edge(
-        "USES_TOOL",
-        agent_item.item_id,
-        tool_item.item_id,
+        edge_type="USES_TOOL",
+        from_type="Item",
+        from_id=agent_item.item_id,
+        to_type="Item",
+        to_id=tool_item.item_id,
     )
 
-    command = fake_db.commands[-1]
+    assert len(fake_db.edges) == 1
 
-    assert "CREATE EDGE USES_TOOL" in command[
+    edge = fake_db.edges[0]
+
+    assert "CREATE EDGE USES_TOOL" in edge[
         "command"
     ]
-    assert command["params"]["from_id"] == str(
+
+    assert edge["params"]["from_id"] == str(
         agent_item.item_id
     )
-    assert command["params"]["to_id"] == str(
+
+    assert edge["params"]["to_id"] == str(
         tool_item.item_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_test_run_edge(
+    fake_db: FakeArcadeDB,
+    tool_item: Item,
+    test_run: TestRun,
+) -> None:
+    repository = ItemRepository(fake_db)
+
+    await repository.create(tool_item)
+
+    test_run_repository = TestRunRepository(
+        fake_db
+    )
+
+    await test_run_repository.create(test_run)
+
+    await repository.create_edge(
+        edge_type="HAS_TEST_RUN",
+        from_type="Item",
+        from_id=tool_item.item_id,
+        to_type="TestRun",
+        to_id=test_run.run_id,
+        to_field="run_id",
+    )
+
+    assert len(fake_db.edges) == 1
+
+    edge = fake_db.edges[0]
+
+    assert "CREATE EDGE HAS_TEST_RUN" in edge[
+        "command"
+    ]
+
+    assert edge["params"]["from_id"] == str(
+        tool_item.item_id
+    )
+
+    assert edge["params"]["to_id"] == str(
+        test_run.run_id
     )
 
 
@@ -494,9 +627,45 @@ async def test_create_edge_rejects_unknown_edge(
 
     with pytest.raises(ValueError):
         await repository.create_edge(
-            "INVALID_EDGE",
-            tool_item.item_id,
-            uuid4(),
+            edge_type="INVALID_EDGE",
+            from_type="Item",
+            from_id=tool_item.item_id,
+            to_type="Item",
+            to_id=uuid4(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_edge_rejects_invalid_source_type(
+    fake_db: FakeArcadeDB,
+    tool_item: Item,
+) -> None:
+    repository = ItemRepository(fake_db)
+
+    with pytest.raises(ValueError):
+        await repository.create_edge(
+            edge_type="USES_TOOL",
+            from_type="InvalidType",
+            from_id=tool_item.item_id,
+            to_type="Item",
+            to_id=uuid4(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_edge_rejects_invalid_target_type(
+    fake_db: FakeArcadeDB,
+    tool_item: Item,
+) -> None:
+    repository = ItemRepository(fake_db)
+
+    with pytest.raises(ValueError):
+        await repository.create_edge(
+            edge_type="USES_TOOL",
+            from_type="Item",
+            from_id=tool_item.item_id,
+            to_type="InvalidType",
+            to_id=uuid4(),
         )
 
 
@@ -515,6 +684,7 @@ async def test_create_test_run(
     result = await repository.create(test_run)
 
     assert result.run_id == test_run.run_id
+    assert result.item_id == test_run.item_id
     assert result.status == TestRunStatus.RUNNING
 
     stored = fake_db.test_run_records[
@@ -583,6 +753,42 @@ async def test_update_test_run(
     assert result.output == {
         "tracks": 10,
     }
+
+
+@pytest.mark.asyncio
+async def test_update_empty_test_run(
+    fake_db: FakeArcadeDB,
+    test_run: TestRun,
+) -> None:
+    repository = TestRunRepository(fake_db)
+
+    await repository.create(test_run)
+
+    result = await repository.update(
+        test_run.run_id,
+        {},
+    )
+
+    assert result is not None
+    assert result.run_id == test_run.run_id
+
+
+@pytest.mark.asyncio
+async def test_update_test_run_rejects_invalid_field(
+    fake_db: FakeArcadeDB,
+    test_run: TestRun,
+) -> None:
+    repository = TestRunRepository(fake_db)
+
+    await repository.create(test_run)
+
+    with pytest.raises(ValueError):
+        await repository.update(
+            test_run.run_id,
+            {
+                "invalid_field": "value",
+            },
+        )
 
 
 @pytest.mark.asyncio

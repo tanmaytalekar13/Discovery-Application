@@ -65,14 +65,16 @@ async def seed() -> None:
                 "properties": {
                     "query": {
                         "type": "string",
-                    }
+                    },
                 },
                 "required": ["query"],
             },
         ),
         artifacts=ArtifactMetadata(
             source_available=True,
-            source_url="https://example.com/spotify-mcp/source",
+            source_url=(
+                "https://example.com/spotify-mcp/source"
+            ),
             source_code=(
                 "def search_tracks(query: str):\n"
                 "    return search_spotify(query)\n"
@@ -139,7 +141,7 @@ async def seed() -> None:
     await item_repository.create(agent)
 
     # ========================================================
-    # TestRun for Tool
+    # Tool TestRun
     # ========================================================
 
     tool_test_run = TestRun(
@@ -172,7 +174,7 @@ async def seed() -> None:
     )
 
     # ========================================================
-    # TestRun for Agent
+    # Agent TestRun
     # ========================================================
 
     agent_test_run = TestRun(
@@ -252,17 +254,12 @@ async def seed() -> None:
     # ========================================================
 
     print("Seed completed successfully.")
-
+    print()
     print(f"Tool:           {tool.item_id}")
     print(f"Agent:          {agent.item_id}")
-
-    print(
-        f"Tool TestRun:   {tool_test_run.run_id}"
-    )
-    print(
-        f"Agent TestRun:  {agent_test_run.run_id}"
-    )
-
+    print(f"Tool TestRun:   {tool_test_run.run_id}")
+    print(f"Agent TestRun:  {agent_test_run.run_id}")
+    print()
     print("Relationships:")
     print("  Agent -> Tool       [USES_TOOL]")
     print("  Tool -> TestRun     [HAS_TEST_RUN]")

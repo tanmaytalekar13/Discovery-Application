@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl
 
 
 class ItemType(str, Enum):
@@ -25,8 +25,14 @@ class SourceType(str, Enum):
 
 
 class Reliability(BaseModel):
-    score: float = Field(ge=0.0, le=1.0)
-    confidence: float = Field(ge=0.0, le=1.0)
+    score: float = Field(
+        ge=0.0,
+        le=1.0,
+    )
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+    )
     scoring_version: str = "v1"
     last_evaluated: datetime | None = None
 
@@ -40,32 +46,45 @@ class DiscoveryMetadata(BaseModel):
 class DiscoverySource(BaseModel):
     type: SourceType
     id: str
-    url: str | None = None
+    url: HttpUrl | None = None
 
 
 class ToolMetadata(BaseModel):
     server_id: str
     tool_name: str
-    mcp_schema: dict[str, Any] = Field(default_factory=dict)
+    mcp_schema: dict[str, Any] = Field(
+        default_factory=dict
+    )
 
 
 class AgentMetadata(BaseModel):
-    endpoint: str
-    agent_card: dict[str, Any] = Field(default_factory=dict)
-    skills: list[str] = Field(default_factory=list)
-    capabilities: list[str] = Field(default_factory=list)
-    declared_dependencies: list[str] = Field(default_factory=list)
+    endpoint: HttpUrl
+    agent_card: dict[str, Any] = Field(
+        default_factory=dict
+    )
+    skills: list[str] = Field(
+        default_factory=list
+    )
+    capabilities: list[str] = Field(
+        default_factory=list
+    )
+    declared_dependencies: list[str] = Field(
+        default_factory=list
+    )
 
 
 class ArtifactMetadata(BaseModel):
     source_available: bool = False
-    source_url: str | None = None
+    source_url: HttpUrl | None = None
     source_code: str | None = None
-    config_files: list[dict[str, Any]] = Field(default_factory=list)
+    config_files: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
 
 
 class Item(BaseModel):
     item_id: UUID
+
     type: ItemType
     name: str
     description: str
@@ -78,12 +97,17 @@ class Item(BaseModel):
     reliability: Reliability
     discovery: DiscoveryMetadata
 
+    # Tool-specific metadata.
     tool: ToolMetadata | None = None
+
+    # Agent-specific metadata.
     agent: AgentMetadata | None = None
 
+    # Source code, source URL and configuration metadata.
     artifacts: ArtifactMetadata = Field(
         default_factory=ArtifactMetadata
     )
 
-    # Populated by the local embedding pipeline in Phase 5.
+    # Phase 5 will populate this field using the
+    # local embedding pipeline.
     embedding: list[float] | None = None

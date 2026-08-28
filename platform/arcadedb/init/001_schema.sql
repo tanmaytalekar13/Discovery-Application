@@ -28,12 +28,12 @@ CREATE PROPERTY Item.first_seen DATETIME;
 CREATE PROPERTY Item.last_seen DATETIME;
 CREATE PROPERTY Item.last_synced DATETIME;
 
--- Embedded metadata for the unified Item model.
+-- Embedded metadata used by the unified Item model.
 CREATE PROPERTY Item.tool EMBEDDED;
 CREATE PROPERTY Item.agent EMBEDDED;
 CREATE PROPERTY Item.artifacts EMBEDDED;
 
--- Populated by the local embedding pipeline in Phase 5.
+-- Populated later by the embedding pipeline.
 CREATE PROPERTY Item.embedding ARRAY_OF_FLOATS;
 
 
@@ -79,7 +79,6 @@ CREATE DOCUMENT TYPE DiscoverySource;
 
 CREATE PROPERTY DiscoverySource.source_type STRING;
 CREATE PROPERTY DiscoverySource.source_id STRING;
-CREATE PROPERTY DiscoverySource.source_key STRING;
 CREATE PROPERTY DiscoverySource.url STRING;
 
 
@@ -134,15 +133,12 @@ CREATE PROPERTY ReliabilityEvaluation.signals EMBEDDED;
 
 
 -- ============================================================
--- Graph Edge Types
+-- Graph Edges
 -- ============================================================
 
 CREATE EDGE TYPE USES_TOOL;
-
 CREATE EDGE TYPE HAS_SKILL;
-
 CREATE EDGE TYPE DISCOVERED_FROM;
-
 CREATE EDGE TYPE HAS_TEST_RUN;
 
 
