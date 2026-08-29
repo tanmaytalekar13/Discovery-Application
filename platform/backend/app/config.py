@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     arcadedb_user: str = Field(min_length=1)
     arcadedb_password: str = Field(min_length=1)
     reliability_threshold: float = Field(default=0.75, ge=0, le=1)
-    discovery_mode: str = Field(default="mock", pattern="^(mock|live)$")
+    discovery_mode: str = Field(default="mock", pattern="^(mock|live|mixed)$")
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
 
