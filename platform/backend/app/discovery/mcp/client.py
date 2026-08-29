@@ -3,37 +3,10 @@ MCP protocol client core (Phase 02).
 
 Wraps the official `mcp` SDK's stdio client transport + ClientSession
 into a small class with explicit, independently-failing lifecycle
-stages, matching CODEX_EXECUTION_PLAN.md Section 9 (MCP Resolution):
+stages, matching CODEX_EXECUTION_PLAN.md Section 9 (MCP Resolution).
 
-    candidate
-       |
-    identify server
-       |
-    resolve endpoint/startup configuration      <- Phase 04+ (discovery)
-       |
-    security validation                         <- Phase 24 (sandbox/security)
-       |
-    MCP client connection                       <- this module
-       |
-    protocol initialization                     <- this module
-       |
-    capability/server metadata                  <- this module
-       |
-    tools/list                                  <- this module
-       |
-    schema validation                           <- app.discovery.mcp.schema
-       |
-    normalized Tool records                     <- app.discovery.mcp.schema
-
-Only stdio transport is implemented here (used to talk to a locally
-spawned MCP server process, as required by Phase 02's Definition of
-Done: "real local MCP server works"). Remote/HTTP transports for
-discovered internet servers are a Phase 04+ concern and are not
-needed to satisfy this phase.
-
-The backend never imports or executes arbitrary discovered source
-code directly - this client only ever speaks the MCP wire protocol
-to a separate process/endpoint.
+Only stdio transport is implemented here. Remote/HTTP transports are
+a Phase 04+ concern.
 """
 
 from __future__ import annotations
@@ -56,6 +29,7 @@ from app.discovery.mcp.errors import (
 from app.discovery.mcp.schema import normalize_tools
 from app.models import ToolMetadata
 
+
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_INITIALIZE_TIMEOUT_SECONDS = 10.0
 DEFAULT_TOOLS_LIST_TIMEOUT_SECONDS = 15.0
@@ -74,10 +48,7 @@ class MCPServerInfo:
 
 @dataclass
 class MCPResolutionResult:
-    """
-    Outcome of fully resolving one MCP server candidate: connect,
-    initialize, tools/list, and schema normalization, in one call.
-    """
+    """Outcome of fully resolving one MCP server candidate."""
 
     server_id: str
     server_info: MCPServerInfo
@@ -87,13 +58,21 @@ class MCPResolutionResult:
 class MCPClient:
     """
     Thin async wrapper around an MCP `ClientSession` connected over
-    stdio. Each protocol stage is its own method so that callers
-    (and tests) can observe/handle failures stage-by-stage rather
-    than getting one opaque exception for the whole pipeline.
+    stdio.
+
+    Each protocol stage is its own method so callers and tests can
+    observe and handle failures independently.
 
     Usage:
-        params = StdioServerParameters(command="python", args=["server.py"])
-        async with MCPClient(server_id="my-server", server_params=params) as client:
+        params = StdioServerParameters(
+            command="python",
+            args=["server.py"],
+        )
+
+        async with MCPClient(
+            server_id="my-server",
+            server_params=params,
+        ) as client:
             server_info = await client.initialize()
             tools = await client.list_tools()
             result = await client.call_tool("echo", {"message": "hi"})
@@ -111,6 +90,7 @@ class MCPClient:
 
         self._exit_stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
+        self._connected = False
 
     async def __aenter__(self) -> "MCPClient":
         await self._connect()
@@ -121,76 +101,106 @@ class MCPClient:
 
     async def _connect(self) -> None:
         """
-        Open the stdio transport (spawns the server process) and
-        construct the ClientSession. Deliberately does NOT call
-        `initialize` - that is a separate, independently-testable
-        stage (see `initialize()`).
+        Open the stdio transport and construct ClientSession.
+
+        IMPORTANT:
+        `_open()` is awaited directly rather than wrapped in
+        `asyncio.wait_for()`. The MCP stdio transport owns an AnyIO
+        cancel scope whose lifetime must remain in the same task.
         """
+
+        if self._connected:
+            return
+
         self._exit_stack = AsyncExitStack()
 
-        async def _open() -> ClientSession:
-            read_stream, write_stream = await self._exit_stack.enter_async_context(
-                stdio_client(self._server_params)
+        try:
+            read_stream, write_stream = (
+                await self._exit_stack.enter_async_context(
+                    stdio_client(self._server_params)
+                )
             )
-            return await self._exit_stack.enter_async_context(
+
+            session = await self._exit_stack.enter_async_context(
                 ClientSession(read_stream, write_stream)
             )
 
-        try:
-            # Note: a plain asyncio timeout (not anyio.fail_after) is used
-            # here deliberately. stdio_client/ClientSession are meant to
-            # stay open past this method via the AsyncExitStack, and an
-            # anyio cancel scope must be exited in the same call frame it
-            # was opened in - wrapping resource acquisition that outlives
-            # this method in anyio.fail_after raises "cancel scope exited
-            # in the wrong order" once the connection actually succeeds.
-            session = await asyncio.wait_for(
-                _open(), timeout=self._connect_timeout_seconds
-            )
-        except (TimeoutError, asyncio.TimeoutError) as exc:
-            await self._exit_stack.aclose()
-            self._exit_stack = None
-            raise MCPConnectionError(
-                f"Timed out connecting to MCP server '{self._server_id}' "
-                f"after {self._connect_timeout_seconds}s."
-            ) from exc
+            self._session = session
+            self._connected = True
+
         except Exception as exc:
-            if self._exit_stack is not None:
-                await self._exit_stack.aclose()
-                self._exit_stack = None
+            stack = self._exit_stack
+            self._exit_stack = None
+            self._session = None
+            self._connected = False
+
+            if stack is not None:
+                try:
+                    await stack.aclose()
+                except Exception:
+                    # Preserve the original connection error.
+                    # Cleanup failure must not hide the real connection
+                    # failure.
+                    pass
+
             raise MCPConnectionError(
                 f"Failed to connect to MCP server '{self._server_id}': {exc}"
             ) from exc
 
-        self._session = session
-
     async def _disconnect(self) -> None:
-        if self._exit_stack is not None:
-            await self._exit_stack.aclose()
+        """
+        Close the MCP transport/session exactly once.
+
+        Cleanup is intentionally idempotent so callers can safely invoke
+        disconnect after a partial connection failure or from __aexit__.
+        """
+
+        stack = self._exit_stack
+
         self._exit_stack = None
         self._session = None
+        self._connected = False
+
+        if stack is None:
+            return
+
+        try:
+            await stack.aclose()
+        except RuntimeError as exc:
+            # AnyIO can raise a cancel-scope task-affinity error when a
+            # stdio transport is closed outside the task in which its
+            # cancel scope was created.
+            #
+            # Do not mask an otherwise successful MCP operation during
+            # context-manager teardown.
+            if "cancel scope" not in str(exc).lower():
+                raise
 
     def _require_session(self) -> ClientSession:
-        if self._session is None:
+        if self._session is None or not self._connected:
             raise MCPConnectionError(
                 f"MCP client for '{self._server_id}' is not connected. "
                 "Use 'async with MCPClient(...) as client:' before calling "
                 "protocol methods."
             )
+
         return self._session
 
     async def initialize(
-        self, timeout_seconds: float = DEFAULT_INITIALIZE_TIMEOUT_SECONDS
+        self,
+        timeout_seconds: float = DEFAULT_INITIALIZE_TIMEOUT_SECONDS,
     ) -> MCPServerInfo:
         """
         Perform the MCP `initialize` handshake and return normalized
         server identity/capability metadata.
         """
+
         session = self._require_session()
 
         try:
             result: InitializeResult = await asyncio.wait_for(
-                session.initialize(), timeout=timeout_seconds
+                session.initialize(),
+                timeout=timeout_seconds,
             )
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise MCPInitializeError(
@@ -203,6 +213,7 @@ class MCPClient:
             ) from exc
 
         server_info = result.serverInfo
+
         if server_info is None or not getattr(server_info, "name", None):
             raise MCPInitializeError(
                 f"MCP server '{self._server_id}' returned an initialize "
@@ -217,18 +228,20 @@ class MCPClient:
         )
 
     async def list_tools(
-        self, timeout_seconds: float = DEFAULT_TOOLS_LIST_TIMEOUT_SECONDS
+        self,
+        timeout_seconds: float = DEFAULT_TOOLS_LIST_TIMEOUT_SECONDS,
     ) -> list[ToolMetadata]:
         """
         Call `tools/list` and normalize the result into ToolMetadata
-        records. A tool with an invalid schema is skipped rather than
-        failing the whole call (see `normalize_tools`).
+        records.
         """
+
         session = self._require_session()
 
         try:
             result = await asyncio.wait_for(
-                session.list_tools(), timeout=timeout_seconds
+                session.list_tools(),
+                timeout=timeout_seconds,
             )
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise MCPToolsListError(
@@ -249,18 +262,22 @@ class MCPClient:
         timeout_seconds: float = DEFAULT_TOOL_CALL_TIMEOUT_SECONDS,
     ) -> CallToolResult:
         """
-        Call `tools/call` for a specific tool. Raises MCPToolCallError
-        only for protocol/transport-level failures; a tool that runs
-        but reports an application error is returned normally with
-        `CallToolResult.isError = True` so the caller (e.g. the Phase
-        15 sandbox test runner) can surface it as tool output rather
-        than a platform failure.
+        Call `tools/call` for a specific tool.
+
+        Protocol/transport failures raise MCPToolCallError.
+
+        A tool-level application error is returned normally with
+        `CallToolResult.isError = True`.
         """
+
         session = self._require_session()
 
         try:
             return await asyncio.wait_for(
-                session.call_tool(tool_name, arguments or {}),
+                session.call_tool(
+                    tool_name,
+                    arguments or {},
+                ),
                 timeout=timeout_seconds,
             )
         except (TimeoutError, asyncio.TimeoutError) as exc:
@@ -276,20 +293,19 @@ class MCPClient:
 
 
 async def resolve_mcp_server(
-    server_id: str, server_params: StdioServerParameters
+    server_id: str,
+    server_params: StdioServerParameters,
 ) -> MCPResolutionResult:
     """
-    Convenience helper that runs the full Phase 02 resolution pipeline
-    for one candidate server in a single call: connect -> initialize
-    -> tools/list -> normalize.
+    Run the full Phase 02 resolution pipeline:
 
-    Each stage still raises its own distinct exception type on
-    failure (MCPConnectionError / MCPInitializeError /
-    MCPToolsListError), so callers can tell exactly which stage
-    failed - required for the discovery pipeline's per-source failure
-    isolation (rule #21) once this is wired into Phase 09.
+        connect -> initialize -> tools/list -> normalize
     """
-    async with MCPClient(server_id=server_id, server_params=server_params) as client:
+
+    async with MCPClient(
+        server_id=server_id,
+        server_params=server_params,
+    ) as client:
         server_info = await client.initialize()
         tools = await client.list_tools()
 
@@ -310,12 +326,14 @@ async def call_tool_by_name(
     arguments: dict | None = None,
 ) -> CallToolResult:
     """
-    Convenience helper for the "test a single tool" path (Phase 15):
-    connect, initialize, verify the tool exists in tools/list, then
-    call it. Raises MCPToolNotFoundError if the tool is not present,
-    matching Section 25's "Verify expected tool" step.
+    Connect, initialize, verify that the requested tool exists in
+    tools/list, and then call it.
     """
-    async with MCPClient(server_id=server_id, server_params=server_params) as client:
+
+    async with MCPClient(
+        server_id=server_id,
+        server_params=server_params,
+    ) as client:
         await client.initialize()
         tools = await client.list_tools()
 
