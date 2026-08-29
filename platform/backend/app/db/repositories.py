@@ -30,19 +30,12 @@ class ItemRepository:
 
     ALLOWED_EDGE_TYPES = {
         "USES_TOOL",
-        "HAS_SKILL",
-        "DISCOVERED_FROM",
         "HAS_TEST_RUN",
     }
 
     ALLOWED_VERTEX_TYPES = {
         "Item",
-        "Tool",
-        "Agent",
-        "Skill",
-        "DiscoverySource",
         "TestRun",
-        "ReliabilityEvaluation",
     }
 
     ALLOWED_UPDATE_FIELDS = {

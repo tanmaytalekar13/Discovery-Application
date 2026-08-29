@@ -59,8 +59,10 @@ class FakeArcadeDB:
         # ----------------------------------------------------
 
         if normalized.startswith("CREATE EDGE"):
-            assert params is not None
-
+            # Real repositories.py embeds resolved @rid values
+            # directly in the SQL text (ArcadeDB's CREATE EDGE
+            # FROM/TO clause requires literal RIDs, not bind
+            # params) — so params is None here, by design.
             self.edges.append(
                 {
                     "command": command,
@@ -73,43 +75,77 @@ class FakeArcadeDB:
             }
 
         # ----------------------------------------------------
+        # @rid lookups (used by create_edge to resolve
+        # logical ids like item_id/run_id to an ArcadeDB @rid)
+        # ----------------------------------------------------
+
+        if normalized.startswith("SELECT @RID FROM ITEM"):
+            assert params is not None
+
+            item_id = str(params["value"])
+
+            if item_id in self.item_records:
+                return {
+                    "result": [{"@rid": f"#1:{item_id}"}],
+                }
+
+            return {
+                "result": [],
+            }
+
+        if normalized.startswith("SELECT @RID FROM TESTRUN"):
+            assert params is not None
+
+            run_id = str(params["value"])
+
+            if run_id in self.test_run_records:
+                return {
+                    "result": [{"@rid": f"#2:{run_id}"}],
+                }
+
+            return {
+                "result": [],
+            }
+
+        # ----------------------------------------------------
         # Item
         # ----------------------------------------------------
 
-        if "INSERT INTO ITEM" in normalized:
+        if "CREATE VERTEX ITEM" in normalized:
             assert params is not None
 
-            item_id = str(params["item_id"])
+            payload = params["payload"]
+            item_id = str(payload["item_id"])
 
             record = {
                 "item_id": item_id,
-                "type": params["type"],
-                "name": params["name"],
-                "description": params["description"],
-                "source_type": params["source_type"],
-                "source_id": params["source_id"],
-                "source_url": params["source_url"],
-                "version": params["version"],
-                "status": params["status"],
-                "reliability_score": params[
+                "type": payload["type"],
+                "name": payload["name"],
+                "description": payload["description"],
+                "source_type": payload["source_type"],
+                "source_id": payload["source_id"],
+                "source_url": payload["source_url"],
+                "version": payload["version"],
+                "status": payload["status"],
+                "reliability_score": payload[
                     "reliability_score"
                 ],
-                "reliability_confidence": params[
+                "reliability_confidence": payload[
                     "reliability_confidence"
                 ],
-                "scoring_version": params[
+                "scoring_version": payload[
                     "scoring_version"
                 ],
-                "last_evaluated": params[
+                "last_evaluated": payload[
                     "last_evaluated"
                 ],
-                "first_seen": params["first_seen"],
-                "last_seen": params["last_seen"],
-                "last_synced": params["last_synced"],
-                "tool": params["tool"],
-                "agent": params["agent"],
-                "artifacts": params["artifacts"],
-                "embedding": params["embedding"],
+                "first_seen": payload["first_seen"],
+                "last_seen": payload["last_seen"],
+                "last_synced": payload["last_synced"],
+                "tool": payload["tool"],
+                "agent": payload["agent"],
+                "artifacts": payload["artifacts"],
+                "embedding": payload["embedding"],
             }
 
             self.item_records[item_id] = record
@@ -168,34 +204,35 @@ class FakeArcadeDB:
         # TestRun
         # ----------------------------------------------------
 
-        if "INSERT INTO TESTRUN" in normalized:
+        if "CREATE VERTEX TESTRUN" in normalized:
             assert params is not None
 
-            run_id = str(params["run_id"])
+            payload = params["payload"]
+            run_id = str(payload["run_id"])
 
-            input_data = dict(params["input"])
+            input_data = dict(payload["input"])
             input_data.pop("@type", None)
 
-            output_data = dict(params["output"])
+            output_data = dict(payload["output"])
             output_data.pop("@type", None)
 
             dependencies_data = dict(
-                params["dependencies"]
+                payload["dependencies"]
             )
             dependencies_data.pop("@type", None)
 
             record = {
                 "run_id": run_id,
-                "item_id": str(params["item_id"]),
-                "type": params["type"],
-                "started_at": params["started_at"],
-                "completed_at": params["completed_at"],
-                "status": params["status"],
+                "item_id": str(payload["item_id"]),
+                "type": payload["type"],
+                "started_at": payload["started_at"],
+                "completed_at": payload["completed_at"],
+                "status": payload["status"],
                 "input": input_data,
                 "output": output_data,
-                "duration_ms": params["duration_ms"],
-                "errors": params["errors"],
-                "logs": params["logs"],
+                "duration_ms": payload["duration_ms"],
+                "errors": payload["errors"],
+                "logs": payload["logs"],
                 "dependencies": dependencies_data,
             }
 
@@ -605,13 +642,15 @@ async def test_create_uses_tool_edge(
         "command"
     ]
 
-    assert edge["params"]["from_id"] == str(
-        agent_item.item_id
-    )
+    # create_edge resolves logical ids to @rid values and
+    # embeds them directly in the SQL text (no bind params).
+    assert f"#1:{agent_item.item_id}" in edge[
+        "command"
+    ]
 
-    assert edge["params"]["to_id"] == str(
-        tool_item.item_id
-    )
+    assert f"#1:{tool_item.item_id}" in edge[
+        "command"
+    ]
 
 
 @pytest.mark.asyncio
@@ -647,21 +686,15 @@ async def test_create_test_run_edge(
         "command"
     ]
 
-    assert "SELECT FROM TestRun" in edge[
+    # create_edge resolves logical ids to @rid values and
+    # embeds them directly in the SQL text (no bind params).
+    assert f"#1:{tool_item.item_id}" in edge[
         "command"
     ]
 
-    assert "WHERE run_id = :to_id" in edge[
+    assert f"#2:{test_run.run_id}" in edge[
         "command"
     ]
-
-    assert edge["params"]["from_id"] == str(
-        tool_item.item_id
-    )
-
-    assert edge["params"]["to_id"] == str(
-        test_run.run_id
-    )
 
 
 @pytest.mark.asyncio
