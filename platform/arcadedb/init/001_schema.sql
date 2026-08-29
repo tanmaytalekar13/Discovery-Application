@@ -67,12 +67,12 @@ CREATE PROPERTY TestRun.errors LIST;
 CREATE PROPERTY TestRun.logs LIST;
 CREATE PROPERTY TestRun.dependencies MAP;
 
-
 -- ============================================================
 -- Graph Edges
 -- ============================================================
 
 CREATE EDGE TYPE USES_TOOL;
+
 CREATE EDGE TYPE HAS_TEST_RUN;
 
 

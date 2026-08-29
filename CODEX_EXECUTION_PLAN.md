@@ -1,642 +1,1944 @@
-SECTION 0 — RULES OF EXECUTION (READ THIS FIRST, FOLLOW FOR THE ENTIRE PROJECT)
+# CODEX_EXECUTION_PLAN.md
 
-You are building a full production-quality platform, not a prototype. Follow these rules without exception:
+# Agentic Discovery Platform
+## Internet-Wide MCP Tool & A2A Agent Discovery, Persistence, Inspection, and Sandboxed Testing
 
-Strict sequential phases. This plan has Phases 0 through 11. You must complete one phase fully — including code, tests, and the "Definition of Done" checklist for that phase — before starting the next phase. Never start Phase N+1 while Phase N is partially done. Never interleave work from two phases.
-No silent skipping. If a task inside a phase cannot be completed (missing credential, ambiguous requirement, unavailable dependency), stop and ask a clarifying question instead of guessing, stubbing silently, or inventing a fake resolution. Only proceed once you have an answer or an explicit instruction to assume a default.
-End-of-phase report is mandatory. After finishing a phase, produce a short report using the "Phase Completion Report" template in Section 10, including: what was built, how it was tested, what is stubbed/mocked vs real, and any open questions. Wait for confirmation ("continue" / "proceed to Phase X") before moving on, unless the user has explicitly told you to run all phases autonomously — if so, still write the report between phases so there is a clear audit trail in commit history.
-Every phase must be runnable and testable in isolation. Each phase ends with something that actually runs (a passing test suite, a working endpoint you can curl, a UI screen you can load) — never "code written but unverified."
-One commit (or commit group) per phase, with a commit message prefixed phase-N:. Do not mix code from two phases in one commit.
-Never fabricate data sources, registries, or credentials. Where a real external registry/API is not confirmed, build against a clearly-labeled mock/stub adapter (see Section 2) with an interface that a real adapter can later implement without changing calling code.
-Security is not optional in any phase. Sandbox isolation, input validation, and allowlisting must be implemented for real from Phase 9 onward — not deferred to "later hardening." Phase 11 hardens what already exists; it does not introduce basic security for the first time.
-Keep the two protocols (MCP and A2A) architecturally separate. Never merge MCP tool discovery and A2A agent discovery into one code path "for simplicity." They have different discovery mechanisms, different schemas, and different execution models. Only the UI and the top-level Search Orchestrator unify them.
-SECTION 1 — PROJECT OVERVIEW
+**Status:** Authoritative master execution plan for Codex / AI coding agents  
+**Version:** 4.0  
+**Backend:** Python + FastAPI only  
+**Frontend:** Angular + TypeScript  
+**Database:** ArcadeDB  
+**Protocols:** MCP + A2A  
+**Execution isolation:** Docker sandbox
 
-Build a centralized web platform where an AI application developer can:
+---
 
-Search for MCP tools and A2A agents (across a persisted catalog and live discovery).
-View a tool's/agent's source code, configuration, MCP schema, or Agent Card (read-only, no execution).
-Test an MCP tool with real parameters inside an isolated sandbox.
-Test an A2A agent with a natural-language task inside an isolated sandbox.
-Persist reliable discoveries and test-execution history in ArcadeDB so future searches are faster and better-ranked.
+# 1. PURPOSE
 
-Out of scope for V1 (do not build): publishing tools/agents back to public registries, billing, product-level rate limiting, building a public MCP/A2A registry, treating "skills" as independently executable entities, auto-modifying discovered tools/agents.
+Build a central discovery platform where an AI application developer can search by natural language and discover reliable:
 
-SECTION 2 — CONFIRMED TECHNICAL DECISIONS
+- MCP tools
+- MCP servers
+- A2A agents
+- agent skills/capabilities
 
-These have been decided; do not re-litigate them or ask about them again:
+without already knowing their names, repositories, registries, or endpoints.
 
-Topic	Decision
-Repository	Fresh repo, built from scratch. No existing codebase to integrate with.
-Frontend	Angular (latest stable), TypeScript, Monaco Editor for code viewing
-Backend	Python, FastAPI (async, OpenAPI docs, native SSE support)
-Database	ArcadeDB (document + graph + vector search)
-Discovery sources (MCP + A2A)	Pluggable adapter interfaces, backed by mock/stub data sources for V1. Real registries/catalogs are integrated later behind the same interface — do not hardcode assumptions about a specific real registry's API shape. Each adapter must be swappable via configuration (e.g. DISCOVERY_MODE=mock vs DISCOVERY_MODE=live).
-Semantic search / embeddings	Local, open-source embedding model for vectors — no external API call for embeddings. Use a small local sentence-embedding model (e.g. sentence-transformers/all-MiniLM-L6-v2 run via the sentence-transformers Python library, CPU-friendly) to generate vectors stored in ArcadeDB.
-Query understanding (generation)	Gemini API. Query understanding/planning (keyword extraction, preferred_type inference, query expansion/rewriting) is done via a call to the Gemini API, not rule-based NLP. This is a text-generation call, separate from the local embedding step above — embeddings stay local; only the understanding/planning step uses Gemini.
-Mock A2A test agent "intelligence" (generation)	Gemini API. The local A2A test agent built in Phase 3 uses the Gemini API to actually generate its responses to a given task (instead of returning a canned/hardcoded string), so Phase 10's agent-testing flow exercises a real generation call end-to-end.
-Sandbox	Docker, ephemeral containers, one container per test run
-Protocols	MCP (Model Context Protocol) for tools, A2A (Agent-to-Agent) for agents
-Environment variables (already provided — wire these in as config, do not hardcode)
-ARCADEDB_ROOT_PASSWORD=playwithdata
-ARCADEDB_HOST=localhost
-ARCADEDB_PORT=2480
-ARCADEDB_DATABASE=platform
-ARCADEDB_USER=root
-ARCADEDB_PASSWORD=playwithdata
+The platform must discover candidates from the public internet, validate them, deduplicate them, score reliability, persist approved results in ArcadeDB, and make them available for future searches.
 
-RELIABILITY_THRESHOLD=0.75
-DISCOVERY_MODE=mock
-GEMINI_API_KEY=<to be supplied by the user at runtime — do not hardcode, do not commit>
-GEMINI_MODEL=gemini-2.5-flash   # default; confirm/adjust with the user if a different Gemini model is preferred
+The user must also be able to:
 
-Gemini is used in exactly two places in this system (see Section 2 rows "Query understanding" and "Mock A2A test agent"): (1) query understanding/planning inside the Search Orchestrator, and (2) generating the local test agent's responses. It must never be used for embeddings (those stay local/open-source) and never be used inside the sandbox for arbitrary/untrusted execution — only for the two named generation call sites, each wrapped in its own thin, mockable client module so the API key is never referenced directly from business logic.
+- inspect source/config/protocol metadata;
+- test an MCP tool through MCP;
+- test an A2A agent through A2A;
+- observe live execution logs/traces;
+- inspect agent → MCP dependency behavior;
+- reuse previously discovered results through warm search.
 
-If any additional credential, port, or external URL is needed at any point that is not listed above, stop and ask rather than inventing one.
+---
 
-ArcadeDB Image Policy — Fresh, Project-Specific Image (Mandatory)
+# 2. THE CORE PRODUCT LOOP
 
-Do not reuse any pre-existing ArcadeDB container, image, or volume already present on the host or belonging to any other project. This project must build and run its own dedicated ArcadeDB image, isolated to this repo, from Phase 0 onward.
+```text
+Natural-language query
+        |
+        v
+Search Orchestrator
+        |
+        +---------------------+
+        |                     |
+        v                     v
+ArcadeDB Catalog        Live Discovery
+                              |
+          +-------------------+-------------------+
+          |                   |                   |
+          v                   v                   v
+       GitHub             Registries          Web Search
+                                                  |
+                                           Targeted Extraction
+          |                   |                   |
+          +-------------------+-------------------+
+                              |
+                              v
+                       Candidate References
+                              |
+                              v
+                     Protocol Resolution
+                       /             \
+                      /               \
+                    MCP              A2A
+                     |                |
+             initialize/list       Agent Card
+                     |                |
+                     +-------+--------+
+                             |
+                             v
+                  Security + Validation
+                             |
+                             v
+                       Normalization
+                             |
+                             v
+                        Deduplication
+                             |
+                             v
+                     Reliability Engine
+                             |
+                     +-------+-------+
+                     |               |
+                  approved        rejected
+                     |               |
+                     v               v
+                  ArcadeDB      rejection evidence
+                     |
+                     v
+               Search / Ranking
+                     |
+                     v
+                      UI
+                     |
+          +----------+----------+
+          |                     |
+          v                     v
+     Test MCP Tool        Test A2A Agent
+          |                     |
+          v                     v
+    MCP Sandbox             A2A Sandbox
+          |                     |
+          +----------+----------+
+                     |
+                     v
+               TestRun + Logs
+```
 
-Rules:
+**Core principle:**
 
-Do not docker pull and run the stock arcadedata/arcadedb image directly as a service in docker-compose.yml. Instead, create platform/arcadedb/Dockerfile that uses the official ArcadeDB image as a base (FROM arcadedata/arcadedb:latest, or a pinned version — ask the user to confirm the version if not specified) and layers on project-specific setup:
-Any project-specific init scripts (e.g. database/schema bootstrap invoked on first start, matching Phase 1's schema).
-A clearly labeled LABEL project="agentic-discovery-platform" so docker ps / docker images unambiguously identifies it as belonging to this project.
-Build this image locally as part of docker-compose.yml (build: ./arcadedb for the arcadedb service), not image: arcadedata/arcadedb pulled generically. This guarantees the running container is always this project's own image, never a shared/system one.
-Credentials (ARCADEDB_ROOT_PASSWORD, ARCADEDB_USER, ARCADEDB_PASSWORD from the env vars above) must be injected at container runtime via docker-compose.yml's environment: block (sourced from a local .env file) — never baked into the Dockerfile itself, never committed. Use the same values already provided above (playwithdata / root / platform); do not silently generate different ones.
-Container/network naming must follow the Docker Environment Rules below: service name arcadedb, dedicated Compose project/network, hostname arcadedb (never localhost) for backend connectivity.
-Data volume: give this project's ArcadeDB container its own named, project-scoped volume (e.g. platform_arcadedb_data), distinct from any volume used by ArcadeDB containers from other projects on the same machine. Never mount or reuse another project's volume.
-Before the first build, Codex must run the inspection commands (docker ps -a, docker network ls, docker volume ls, docker images) and explicitly confirm/report: (a) whether any unrelated ArcadeDB container/image/volume already exists on the host, and (b) that the new build will not collide with or reuse any of them. If a same-named container/volume from a previous run of this same project exists, follow the stale-container cleanup rule in the Docker Environment Rules section (safe stop/remove only for this project's own resources — never another project's).
-SECTION 3 — PROPOSED REPOSITORY STRUCTURE
-platform/
-├── backend/
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── config.py
-│   │   ├── db/                  # ArcadeDB client + repositories
-│   │   ├── models/               # Pydantic models (Item, TestRun, etc.)
-│   │   ├── discovery/
-│   │   │   ├── mcp/              # MCP discovery adapter (mock + interface for live)
-│   │   │   └── a2a/              # A2A discovery adapter (mock + interface for live)
-│   │   ├── reliability/          # normalization, dedup, scoring engine
-│   │   ├── search/                # orchestrator, ranking, embeddings, indexing
-│   │   ├── sandbox/               # docker sandbox manager, allowlist enforcement
-│   │   ├── api/                   # FastAPI routers (search, items, artifacts, test, logs)
-│   │   └── tests/
-│   ├── requirements.txt
-│   └── Dockerfile
-├── arcadedb/
-│   ├── Dockerfile                 # project-specific ArcadeDB image (see ArcadeDB Image Policy)
-│   └── init/                      # project-specific bootstrap scripts, run on first container start
-├── frontend/
-│   ├── src/app/
-│   │   ├── search/                # search page, cards, filters
-│   │   ├── item-detail/
-│   │   ├── code-viewer/           # Monaco integration
-│   │   ├── tool-test/             # dynamic form + run panel
-│   │   ├── agent-test/            # task input + run panel
-│   │   └── shared/
-│   └── package.json
-├── docker-compose.yml             # ArcadeDB (built, not pulled) + backend + sandbox network
-├── .env                            # local-only, gitignored — holds credentials from Section 2
-└── README.md
+> Discovery is broad. Trust is evidence-based. Persistence is reusable. Execution is sandbox-only.
 
-Codex may adjust naming, but must keep the same separation of concerns (discovery/mcp vs discovery/a2a vs reliability vs search vs sandbox vs api), and must keep arcadedb/ as a first-class, project-owned build context — never a bare image: reference.
+---
 
-SECTION 4 — ARCHITECTURE DIAGRAMS
-4.1 Overall architecture
-┌─────────────────────────────────────────────┐
-│                 Angular UI                   │
-│ Search | Cards | Code Viewer | Test Panels   │
-└──────────────────────┬───────────────────────┘
-                        ▼
-┌─────────────────────────────────────────────┐
-│            FastAPI (API layer)               │
-└──────────────────────┬───────────────────────┘
-                        ▼
-┌─────────────────────────────────────────────┐
-│            Search Orchestrator                │
-└──────────────┬────────────────┬───────────────┘
-               ▼                ▼
-      ┌──────────────┐   ┌──────────────┐
-      │ MCP Discovery│   │ A2A Discovery│
-      │ Adapter(mock)│   │ Adapter(mock)│
-      └──────┬───────┘   └──────┬───────┘
-             ▼                  ▼
-        MCP Servers         Agent Cards
-             ▼                  ▼
-         tools/list           Skills
-             ▼                  ▼
-           Tools              Agents
-             └────────┬─────────┘
-                       ▼
-                Normalization
-                       ▼
-                 Deduplication
-                       ▼
-              Reliability Engine
-                       ▼
-                    Ranking
-                       ▼
-                   ArcadeDB
-                       ▼
-                       UI
-                       │
-               ┌───────┴───────┐
-               ▼               ▼
-         Tool Testing     Agent Testing
-               ▼               ▼
-            Sandbox         Sandbox
-                                │
-                                ▼
-                           A2A Agent
-                                │
-                           MCP Client
-                                │
-                            Allowlist
-                                ▼
-                           MCP Tools
-4.2 MCP tool discovery (never assume a registry returns tools directly)
-MCP Registry (mock in V1)
-       ↓
-MCP Servers
-       ↓
-Connect / Inspect (initialize)
-       ↓
-tools/list
-       ↓
-Tool Definitions
-4.3 A2A agent discovery (discovers Agent Cards, not tools/list)
-Discovery Source (registry / catalog / configured / .well-known)
-       ↓
-Agent Card
-       ↓
-Identity, Endpoint, Capabilities, Skills, Auth info
-4.4 Cold search vs warm search
-COLD SEARCH                          WARM SEARCH
-User Query                           User Query
-   ↓                                     ↓
-ArcadeDB (empty/insufficient)      ┌─────┴─────┐
-   ↓                               ▼           ▼
-MCP + A2A live discovery      ArcadeDB    Live Discovery
-   ↓                          (cached)    (MCP + A2A)
-Normalize → Dedup →                 └─────┬─────┘
-Reliability → Persist                     ▼
-   ↓                                 Merge + Dedup
-Rank                                       ↓
-   ↓                                 Reliability
-UI                                         ↓
-                                          Rank
-                                            ↓
-                                        ArcadeDB
-                                            ↓
-                                            UI
-4.5 "View Code" flow (inspection only — never executes anything)
-User clicks View Code
-        ↓
-Angular opens side panel (no navigation, search context preserved)
-        ↓
-GET /api/items/{item_id}/artifacts
-        ↓
-Backend → ArcadeDB → available artifacts
-        ↓
-Angular renders Monaco tabs: Source / Config / MCP Schema (or Agent Card)
-        ↓
-User can Copy to Clipboard per tab
+# 3. USER STORY
 
-If no source is available, show: "Source code is not available for this item" plus the repository/source URL if known, and still show schema/config/metadata that IS available.
+As an AI application developer, I want to search for agentic tools and skills through a central interface so that I can discover reliable implementations from the MCP/A2A ecosystem, inspect their source and protocol metadata, test them safely, and access them faster in future searches through ArcadeDB.
 
-4.6 "Test Tool" flow (MCP tool execution)
-User clicks Test Tool
-        ↓
-Open Test Panel
-        ↓
-Get MCP input schema (cached or GET /api/items/{item_id}/schema)
-        ↓
-Generate dynamic form from JSON Schema
-        ↓
-User fills parameters → clicks Run Tool
-        ↓
-POST /api/items/{item_id}/test  { "input": {...} }
-        ↓
-Validate input against schema
-        ↓
-Sandbox Manager creates ephemeral Docker container
-        ↓
-MCP Client inside sandbox connects to MCP server, calls the tool
-        ↓
-Logs streamed via SSE:  GET /api/items/{item_id}/test/{run_id}/logs
-        ↓
-Final result returned + status (success/failed/timeout/blocked/cancelled)
-        ↓
-TestRun persisted in ArcadeDB
-        ↓
-Sandbox destroyed
-4.7 "Test Agent" flow (A2A execution)
-User clicks Test Agent
-        ↓
-Task input (natural language textarea)
-        ↓
-POST /api/items/{agent_id}/test  { "input": { "task": "..." } }
-        ↓
-Agent Sandbox created
-        ↓
-A2A call to the agent's endpoint with the task
-        ↓
-If the agent needs MCP tools internally:
-    MCP Client inside sandbox → tools must be on the declared allowlist
-    Any undeclared/unknown tool call is BLOCKED and logged
-        ↓
-Final agent result + logs/trace streamed via SSE
-        ↓
-TestRun persisted (declared vs observed dependency diff recorded)
-        ↓
-Sandbox destroyed
-SECTION 5 — DATA MODELS
-5.1 Unified Item (Tool or Agent)
-json
+---
+
+# 4. ACCEPTANCE CRITERIA
+
+## 4.1 Cold Search
+
+Given the user is on the Discovery page.
+
+When the user searches for:
+
+```text
+Web scraping tool
+```
+
+the system must:
+
+1. Search ArcadeDB.
+2. Determine whether local results are sufficient/fresh.
+3. If necessary, perform live discovery.
+4. Search configured sources such as:
+   - GitHub;
+   - MCP registries;
+   - A2A/agent registries;
+   - web search;
+   - targeted web extraction;
+   - configured direct endpoints.
+5. Produce candidates.
+6. Resolve MCP candidates through MCP protocol.
+7. Resolve A2A candidates through Agent Cards/A2A metadata.
+8. Validate candidates.
+9. Deduplicate candidates.
+10. Calculate reliability.
+11. Persist approved items in ArcadeDB.
+12. Persist provenance/evidence.
+13. Rank results.
+14. Display interactive cards.
+
+## 4.2 Warm Search
+
+For a query already represented in the catalog:
+
+1. Query ArcadeDB first.
+2. Return useful cached results quickly.
+3. Run live discovery in parallel/asynchronously when configured.
+4. Merge cached and live results.
+5. Deduplicate.
+6. Revalidate changed candidates where necessary.
+7. Update freshness/reliability.
+8. Persist new approved discoveries.
+9. Update the UI without unnecessarily waiting for slow sources.
+10. Clearly distinguish cached/live/updated results.
+
+## 4.3 View Code
+
+When the user clicks `View Code`:
+
+- open modal/side panel;
+- preserve search state;
+- display source code when legitimately available;
+- display configuration files when available;
+- display MCP schema for tools;
+- display Agent Card for agents;
+- display provenance/source URLs;
+- syntax-highlight with Monaco;
+- provide Copy to Clipboard;
+- never execute the displayed code.
+
+If source code is unavailable, clearly say so rather than fabricating it.
+
+## 4.4 Test MCP Tool
+
+When the user clicks `Test Tool`:
+
+```text
+validated MCP schema
+      ↓
+dynamic input form
+      ↓
+user input
+      ↓
+backend validation
+      ↓
+ephemeral Docker sandbox
+      ↓
+MCP client
+      ↓
+MCP initialize
+      ↓
+MCP tools/list as required
+      ↓
+MCP tools/call
+      ↓
+live logs
+      ↓
+output
+      ↓
+TestRun persistence
+      ↓
+sandbox cleanup
+```
+
+## 4.5 Test A2A Agent
+
+When the user clicks `Test Agent`:
+
+```text
+natural-language task
+      ↓
+validated Agent Card
+      ↓
+ephemeral Docker sandbox
+      ↓
+A2A request/task
+      ↓
+agent response
+      ↓
+optional agent → MCP call
+      ↓
+MCP allowlist
+      ↓
+live trace/logs
+      ↓
+output
+      ↓
+dependency diff + TestRun
+      ↓
+sandbox cleanup
+```
+
+---
+
+# 5. NON-NEGOTIABLE RULES
+
+1. Execute phases in order.
+2. Do not implement future phases prematurely.
+3. Every phase requires tests and a Definition of Done.
+4. Backend is Python + FastAPI. Do not introduce Node.js as the backend.
+5. Angular/TypeScript is frontend.
+6. MCP and A2A remain separate protocol paths.
+7. A GitHub repository is a candidate, not automatically a trusted tool/agent.
+8. A web search result is a candidate, not trusted protocol metadata.
+9. Validate MCP candidates using MCP protocol semantics.
+10. Validate A2A candidates using Agent Cards/A2A semantics.
+11. Never fabricate schemas, Agent Cards, source code, registry responses, reliability scores, or execution results.
+12. Never execute discovered code in FastAPI.
+13. All untrusted execution occurs in Docker sandbox.
+14. Never expose host filesystem or Docker socket to the sandbox.
+15. Apply CPU, memory, timeout, process, filesystem, and network restrictions.
+16. Protect all outbound URL fetching against SSRF.
+17. Validate redirects.
+18. Apply response-size and timeout limits.
+19. Respect robots.txt and applicable provider terms for web extraction.
+20. Respect external API/search rate limits.
+21. One discovery-source failure must not fail the complete search.
+22. Every trusted item must retain provenance.
+23. Deduplicate by canonical identity, never by name alone.
+24. Rejected candidates must retain a rejection reason/evidence trail.
+25. Never persist secrets.
+26. Never put secrets in logs or frontend state.
+27. Never run destructive Docker volume/database commands automatically.
+28. Do not use `docker compose down -v` as routine cleanup.
+29. ArcadeDB must use the project's own image, network, and named volume.
+30. Gemini is restricted to explicitly approved application use.
+31. Gemini must not generate embeddings.
+32. Sandbox code must not directly call Gemini.
+33. Real integrations must be feature-flagged and independently testable.
+34. Mocks may be used for deterministic tests but must never be presented as live discovery.
+35. If a source cannot be validated safely, do not place it in the trusted executable catalog.
+
+---
+
+# 6. DISCOVERY STRATEGY
+
+## MCP discovery sources
+
+### Mandatory/core
+
+1. Official/supported MCP registry adapters.
+2. GitHub.
+3. Web search.
+4. Configured direct MCP endpoints.
+
+### Additional
+
+5. Targeted web extraction.
+6. MCP-compatible sub-registries/catalogs.
+7. Optional DNS discovery adapter.
+8. Future enterprise/private registries.
+
+## A2A discovery sources
+
+### Mandatory/core
+
+1. A2A/agent registries or catalogs.
+2. GitHub.
+3. Web search.
+4. `.well-known/agent-card.json` where applicable.
+5. Direct configured Agent Card URLs.
+
+### Additional
+
+6. Targeted web extraction.
+7. Private/enterprise agent registries.
+8. Future discovery adapters.
+
+---
+
+# 7. SOURCE ADAPTER ARCHITECTURE
+
+Do not put provider-specific logic into the Search Orchestrator.
+
+Use interfaces.
+
+```text
+DiscoveryOrchestrator
+        |
+        +--> MCPDiscoveryAdapter
+        |       +--> GitHub
+        |       +--> MCP Registry
+        |       +--> Web Search
+        |       +--> Web Extraction
+        |       +--> Direct Endpoint
+        |       +--> Optional DNS
+        |
+        +--> A2ADiscoveryAdapter
+                +--> GitHub
+                +--> Agent Registry
+                +--> Web Search
+                +--> Web Extraction
+                +--> Well-Known
+                +--> Direct Agent Card
+```
+
+Each adapter returns a common `CandidateReference`.
+
+---
+
+# 8. CANDIDATE MODEL
+
+```json
 {
-  "item_id": "UUID",
-  "type": "tool | agent",
-  "name": "String",
+  "candidate_id": "UUID",
+  "protocol": "mcp | a2a | unknown",
+  "source_type": "github | mcp_registry | agent_registry | web_search | web_page | well_known | configured",
+  "source_provider": "String",
+  "source_id": "String",
+  "url": "https://...",
+  "repository_url": "https://...",
+  "title": "String",
   "description": "String",
-  "source": {
-    "type": "mcp_registry | a2a_catalog | well_known | configured",
-    "id": "String",
-    "url": "String"
-  },
-  "version": "String",
-  "status": "active | deprecated | unavailable",
-  "reliability": {
-    "score": 0.91,
-    "confidence": 0.88,
-    "scoring_version": "v1",
-    "last_evaluated": "Timestamp"
-  },
-  "discovery": {
-    "first_seen": "Timestamp",
-    "last_seen": "Timestamp",
-    "last_synced": "Timestamp"
-  },
-  "tool": {
-    "server_id": "String",
-    "tool_name": "String",
-    "mcp_schema": {}
-  },
-  "agent": {
-    "endpoint": "String",
-    "agent_card": {},
-    "skills": [],
-    "capabilities": [],
-    "declared_dependencies": []
-  },
-  "artifacts": {
-    "source_available": false,
-    "source_url": "String",
-    "source_code": null,
-    "config_files": []
-  },
-  "embedding": [0.0, 0.0]
+  "discovered_at": "Timestamp",
+  "raw_metadata": {}
 }
-5.2 TestRun
-json
-{
-  "run_id": "UUID",
-  "item_id": "UUID",
-  "type": "tool | agent",
-  "started_at": "Timestamp",
-  "completed_at": "Timestamp",
-  "status": "running | success | failed | timeout | blocked | cancelled",
-  "input": {},
-  "output": {},
-  "duration_ms": 0,
-  "errors": [],
-  "logs": [],
-  "dependencies": {
-    "declared": [],
-    "observed": [],
-    "unexpected": []
-  }
-}
-5.3 ArcadeDB logical graph model
+```
+
+Candidate lifecycle:
+
+```text
+DISCOVERED
+    ↓
+CLASSIFIED
+    ↓
+RESOLVING
+    ↓
+PROTOCOL_VALIDATED
+    ↓
+NORMALIZED
+    ↓
+DEDUPLICATED
+    ↓
+RELIABILITY_EVALUATED
+    ↓
+APPROVED / REJECTED
+```
+
+---
+
+# 9. MCP RESOLUTION
+
+A candidate must be distinguished between:
+
+```text
+Repository
+    ↓
+MCP Server
+    ↓
+MCP Tool(s)
+```
+
+Resolution:
+
+```text
+candidate
+   ↓
+identify server
+   ↓
+resolve endpoint/startup configuration
+   ↓
+security validation
+   ↓
+MCP client connection
+   ↓
+protocol initialization
+   ↓
+capability/server metadata
+   ↓
+tools/list
+   ↓
+schema validation
+   ↓
+normalized Tool records
+```
+
+When supported by the selected MCP protocol version, use server discovery/capability metadata appropriately before normal initialization.
+
+Do not create trusted tool schemas from README text alone.
+
+---
+
+# 10. A2A RESOLUTION
+
+Resolution:
+
+```text
+candidate
+   ↓
+identify agent endpoint
+   ↓
+resolve Agent Card
+   ├── direct Agent Card URL
+   ├── /.well-known/agent-card.json
+   └── registry-provided Agent Card
+   ↓
+validate Agent Card
+   ↓
+normalize identity/capabilities/skills
+   ↓
+normalized Agent
+```
+
+Agent Card is metadata, not executable code.
+
+---
+
+# 11. NORMALIZED CATALOG
+
+## Tool
+
+```text
+item_id
+type = tool
+protocol = MCP
+name
+description
+server_identity
+tool_name
+mcp_schema
+version
+status
+provenance
+reliability
+freshness
+artifacts
+embedding
+```
+
+## Agent
+
+```text
+item_id
+type = agent
+protocol = A2A
+name
+description
+canonical_identity
+endpoint
+agent_card
+capabilities
+skills
+declared_dependencies
+version
+status
+provenance
+reliability
+freshness
+artifacts
+embedding
+```
+
+---
+
+# 12. DEDUPLICATION
+
+Never deduplicate by display name.
+
+## MCP
+
+Prefer:
+
+```text
+canonical server identity
++
+version where meaningful
++
+tool name
+```
+
+Fallback:
+
+```text
+normalized endpoint
++
+repository/provider identity
++
+tool name
+```
+
+## A2A
+
+Prefer:
+
+```text
+canonical agent identity
++
+canonical endpoint
+```
+
+## Multi-source merge
+
+```text
+GitHub       -> Tool X
+MCP Registry -> Tool X
+Web Search   -> Tool X
+
+              ↓
+
+          ONE Tool X
+          ├── GitHub provenance
+          ├── Registry provenance
+          ├── Web provenance
+          └── combined evidence
+```
+
+---
+
+# 13. PROVENANCE
+
+Persist:
+
+- source provider;
+- source URL;
+- provider ID;
+- first discovered;
+- last discovered;
+- last synced;
+- last validated;
+- evidence type;
+- validation status;
+- protocol response evidence where applicable.
+
+Every trusted result must be explainable.
+
+---
+
+# 14. RELIABILITY ENGINE
+
+Pipeline:
+
+```text
+Candidate
+   ↓
+Basic validation
+   ↓
+Protocol validation
+   ↓
+Security validation
+   ↓
+Reliability evaluation
+   ↓
+Approval threshold
+   ↓
+ArcadeDB
+```
+
+Default threshold:
+
+```text
+0.75
+```
+
+Configurable.
+
+## MCP signals
+
+- valid schema;
+- initialize success;
+- tools/list success;
+- endpoint availability;
+- execution success;
+- error rate;
+- latency;
+- maintenance/source evidence;
+- freshness;
+- security validation;
+- provenance quality.
+
+## A2A signals
+
+- valid Agent Card;
+- endpoint availability;
+- successful task execution;
+- response stability;
+- dependency behavior;
+- security validation;
+- freshness;
+- provenance quality.
+
+Reliability must be explainable and versioned.
+
+---
+
+# 15. ARCADEDB PERSISTENCE
+
+ArcadeDB is the persistent system of record for approved discoveries.
+
+Persist:
+
+```text
+Item
 Tool
 Agent
 Skill
 DiscoverySource
+DiscoveryEvidence
 Artifact
-TestRun
 ReliabilityEvaluation
+TestRun
+```
 
-Agent ──HAS_SKILL──> Skill
-Agent ──USES_TOOL──> Tool
-Tool  ──DISCOVERED_FROM──> DiscoverySource
-Agent ──DISCOVERED_FROM──> DiscoverySource
-Tool  ──HAS_TEST_RUN──> TestRun
-Agent ──HAS_TEST_RUN──> TestRun
+Use graph relationships where useful:
 
-Deduplication key: never dedupe on name alone. Use source.type + source.id + (server_id/tool_name) for tools, and source.type + canonical agent endpoint/identity for agents. Track version separately.
+```text
+Agent --HAS_SKILL--> Skill
+Agent --USES_TOOL--> Tool
+Item --DISCOVERED_FROM--> DiscoverySource
+Item --HAS_EVIDENCE--> DiscoveryEvidence
+Item --HAS_TEST_RUN--> TestRun
+```
 
-SECTION 6 — API CONTRACTS
+Use:
+
+- document fields;
+- full-text indexes;
+- vector embeddings;
+- graph relationships.
+
+---
+
+# 16. ARTIFACT STORAGE
+
+Artifact types:
+
+```text
+source
+config
+mcp_schema
+agent_card
+documentation
+```
+
+Store source code only when legitimately available/permitted.
+
+Track:
+
+```text
+source_available
+source_unavailable
+source_restricted
+source_not_retrieved
+```
+
+Never fabricate unavailable source code.
+
+---
+
+# 17. COLD SEARCH
+
+```text
+Query
+ ↓
+Query planner
+ ↓
+ArcadeDB lookup
+ ↓
+sufficient?
+ ├── yes → return/rank
+ └── no  → live discovery
+                ↓
+         protocol resolution
+                ↓
+            validation
+                ↓
+          normalization
+                ↓
+          deduplication
+                ↓
+           reliability
+                ↓
+             persist
+                ↓
+              rank
+                ↓
+               UI
+```
+
+---
+
+# 18. WARM SEARCH
+
+```text
+Query
+  |
+  +--------------------+
+  |                    |
+  v                    v
+ArcadeDB            Live Discovery
+  |                    |
+  +---------+----------+
+            |
+            v
+          Merge
+            |
+            v
+        Deduplicate
+            |
+            v
+        Revalidate
+            |
+            v
+      Reliability update
+            |
+            v
+          ArcadeDB
+            |
+            v
+           Rank
+            |
+            v
+            UI
+```
+
+Cached results must be useful immediately and live results should update them without requiring a complete page restart.
+
+---
+
+# 19. FRESHNESS
+
+Track:
+
+```text
+first_seen
+last_seen
+last_synced
+last_validated
+```
+
+Implement configurable:
+
+```text
+fresh → aging → stale → refresh
+```
+
+Refreshing may update:
+
+- metadata;
+- MCP schema;
+- Agent Card;
+- endpoint;
+- version;
+- reliability;
+- source status;
+- embedding.
+
+---
+
+# 20. SEARCH / QUERY UNDERSTANDING
+
+Gemini may be used for query understanding only.
+
+Input:
+
+```text
+raw query
+```
+
+Output:
+
+```json
+{
+  "keywords": [],
+  "preferred_type": "tool | agent | all",
+  "expanded_query": "",
+  "source_hints": []
+}
+```
+
+Strictly validate output.
+
+Fallback:
+
+```text
+Gemini unavailable
+      ↓
+keyword extraction
+      ↓
+search
+```
+
+Never allow arbitrary model output to become executable instructions.
+
+---
+
+# 21. EMBEDDINGS
+
+Use a local open-source embedding model.
+
+Do not use Gemini embeddings.
+
+Embed appropriate:
+
+```text
+name
+description
+tool metadata
+agent metadata
+skills
+capabilities
+selected source metadata
+```
+
+Use ArcadeDB vector search plus text/structured filters.
+
+---
+
+# 22. RANKING
+
+Default configurable formula:
+
+```text
+final_score =
+    0.45 * relevance
+  + 0.35 * reliability
+  + 0.10 * freshness
+  + 0.10 * evidence
+```
+
+Do not allow multiple copies of the same item to inflate evidence merely because it appeared in multiple sources.
+
+---
+
+# 23. WEB DISCOVERY SECURITY
+
+For every external URL:
+
+```text
+URL validation
+ ↓
+scheme validation
+ ↓
+hostname validation
+ ↓
+DNS/IP policy
+ ↓
+private/internal target blocking
+ ↓
+redirect validation
+ ↓
+timeout
+ ↓
+response-size limit
+ ↓
+content-type validation
+ ↓
+safe extraction
+```
+
+Protect against:
+
+- localhost;
+- loopback;
+- private IP ranges;
+- link-local;
+- cloud metadata endpoints;
+- internal hostnames;
+- malicious redirects;
+- unsupported protocols.
+
+Never execute downloaded JavaScript or source code.
+
+---
+
+# 24. SANDBOX SECURITY
+
+Every test run gets an ephemeral sandbox.
+
+Required:
+
+- non-root;
+- CPU limit;
+- memory limit;
+- hard timeout;
+- process termination;
+- ephemeral filesystem;
+- no host mounts;
+- no Docker socket;
+- restricted outbound network;
+- destination allowlist;
+- scoped credentials;
+- secret redaction;
+- output-size limit;
+- log-size limit;
+- audit events;
+- guaranteed cleanup.
+
+Lifecycle:
+
+```text
+create
+ ↓
+configure
+ ↓
+execute
+ ↓
+collect
+ ↓
+persist
+ ↓
+destroy
+```
+
+Cleanup must work on:
+
+- success;
+- failure;
+- timeout;
+- cancellation.
+
+---
+
+# 25. MCP TOOL TESTING
+
+The user must be able to genuinely test an MCP tool.
+
+```text
+Test Tool
+   ↓
+Load validated schema
+   ↓
+Generate dynamic form
+   ↓
+User input
+   ↓
+Validate input
+   ↓
+Create TestRun
+   ↓
+Create Docker sandbox
+   ↓
+Apply security policy
+   ↓
+Inject approved configuration
+   ↓
+Start MCP client
+   ↓
+Connect to approved server
+   ↓
+MCP initialize
+   ↓
+Verify expected tool
+   ↓
+MCP tools/call
+   ↓
+Capture logs/output
+   ↓
+SSE to UI
+   ↓
+Persist TestRun
+   ↓
+Destroy sandbox
+```
+
+The backend must not directly import or execute arbitrary discovered source code.
+
+---
+
+# 26. A2A AGENT TESTING
+
+The user must be able to genuinely test an A2A agent.
+
+```text
+Test Agent
+   ↓
+Natural-language task
+   ↓
+Validate Agent Card/endpoint
+   ↓
+Create TestRun
+   ↓
+Create Docker sandbox
+   ↓
+Apply security policy
+   ↓
+A2A request/task
+   ↓
+Agent execution
+   ↓
+Optional MCP dependency call
+   ↓
+Allowlist enforcement
+   ↓
+A2A response
+   ↓
+SSE trace
+   ↓
+Persist dependencies/TestRun
+   ↓
+Destroy sandbox
+```
+
+---
+
+# 27. AGENT → MCP ALLOWLIST
+
+For each agent:
+
+```text
+Declared MCP dependencies
+          ↓
+     Test execution
+          ↓
+     Observed calls
+          ↓
+        Compare
+```
+
+Example:
+
+```text
+declared  = [search_web, fetch_page]
+observed  = [search_web]
+unexpected = []
+```
+
+Violation:
+
+```text
+declared  = [search_web]
+observed  = [search_web, execute_shell]
+unexpected = [execute_shell]
+```
+
+The unexpected call must be blocked and logged unless explicitly allowed by the configured policy.
+
+Persist:
+
+```text
+declared
+observed
+unexpected
+```
+
+---
+
+# 28. REST API
+
+Minimum API:
+
+```text
 GET  /api/search?q={query}&type={all|tool|agent}
+
 GET  /api/items/{item_id}
+
 GET  /api/items/{item_id}/artifacts
+
 GET  /api/items/{item_id}/schema
-POST /api/items/{item_id}/test          { "input": {...} }  →  { "run_id", "status": "running" }
-GET  /api/items/{item_id}/test/{run_id}/logs      (SSE stream)
-GET  /api/items/{item_id}/test/{run_id}           (final status/result, polled fallback if SSE unavailable)
 
-Final test response shape:
+GET  /api/items/{item_id}/provenance
+
+POST /api/items/{item_id}/test
+
+POST /api/items/{item_id}/agent-test
+
+GET  /api/items/{item_id}/test/{run_id}
+
+GET  /api/items/{item_id}/test/{run_id}/logs
+```
+
+Search response:
+
+```json
+{
+  "results": [],
+  "metadata": {
+    "mode": "cached | live | merged",
+    "sources_attempted": [],
+    "sources_succeeded": [],
+    "sources_failed": [],
+    "cached_results": 0,
+    "live_candidates": 0,
+    "approved_count": 0,
+    "rejected_count": 0
+  }
+}
+```
+
+---
 
-json
-{ "run_id": "run-123", "status": "success", "duration_ms": 1240, "output": {} }
-SECTION 7 — RELIABILITY & RANKING RULES
+# 29. SSE
 
-Pipeline: External Discovery → Basic Validation → Security Validation → Reliability Scoring → Approval Decision → ArcadeDB. Only items scoring ≥ RELIABILITY_THRESHOLD (config, default 0.75) are treated as part of the trusted, persisted catalog.
+Use Server-Sent Events for test logs/traces.
 
-Tool signals: valid MCP schema, server availability, execution success rate, error rate, latency, security scan result, deprecated status, version/maintenance info.
+MCP example:
+
+```text
+Sandbox created
+MCP client started
+initialize ✓
+tools/list ✓
+tools/call: web_scrape
+response received
+test completed
+sandbox destroyed
+```
 
-Agent signals (measured at task level, not just "request returned"): valid Agent Card, endpoint availability, task completion rate, execution stability, security validation, dependency reliability, unexpected tool usage, deprecated status.
+A2A example:
 
-Ranking formula (weights configurable, not hardcoded):
+```text
+Agent sandbox created
+A2A task submitted
+Agent requested MCP tool: search_web
+allowlist: ALLOWED
+agent response received
+sandbox destroyed
+```
 
-score = 0.45 * relevance + 0.35 * reliability + 0.10 * freshness + 0.10 * popularity/evidence
-SECTION 8 — SECURITY & SANDBOX REQUIREMENTS (mandatory from Phase 9 onward)
-Container isolation, non-root execution inside the container.
-CPU and memory limits per container.
-Hard execution timeout with automatic kill.
-Ephemeral, isolated filesystem — no host filesystem mounts.
-Restricted/no outbound network by default; only the specific MCP server / A2A endpoint under test is reachable.
-No credentials baked into images; injected per-run and scoped to that run.
-Process isolation between concurrent test runs.
-Audit log of every sandbox creation/destruction and every tool call made inside it.
-MCP allowlist is mandatory for agent execution: an agent may only call MCP tools it declared; any other tool call attempt is blocked and recorded, and the diff between declared vs observed dependencies is stored on the TestRun.
-No code from a discovered tool/agent is ever executed on the main backend process — sandbox only.
-SECTION 9 — PHASE-BY-PHASE EXECUTION PLAN
+---
 
-Execute exactly one phase at a time, in order. Do not begin a phase until the previous phase's Definition of Done is fully satisfied and reported.
+# 30. FRONTEND
 
-PHASE 0 — Repository Bootstrap & Tooling
+Use Angular + TypeScript.
 
-Objective: A working skeleton that runs, with nothing faked yet.
+## Search
 
-Tasks:
+```text
+Search input
+Tool / Agent / All filter
+Result cards
+Reliability
+Freshness
+Source badges
+Cached/Live state
+```
 
-Initialize monorepo per Section 3 structure.
-Before writing any Docker config, run docker ps -a, docker network ls, docker volume ls, docker images and report findings — specifically flag any pre-existing ArcadeDB container/image/volume on the host that does not belong to this project, per the ArcadeDB Image Policy in Section 2.
-Create platform/arcadedb/Dockerfile per the ArcadeDB Image Policy (Section 2): based on the official ArcadeDB image, adds a project label, and wires in a project-scoped init-script location — this is a fresh, project-owned image, not a bare pull of the public image.
-docker-compose.yml bringing up ArcadeDB (built via build: ./arcadedb, using the provided env vars from a local .env file) + backend + a placeholder frontend dev server. The arcadedb service must use a project-scoped named volume (e.g. platform_arcadedb_data), never a shared/host-level one.
-FastAPI app with a /health endpoint that actually checks ArcadeDB connectivity (via the arcadedb Compose hostname, never localhost).
-Angular app scaffold with a placeholder home route that calls /health and displays status.
-Config loading from environment variables (Section 2) with validation — fail fast with a clear error if a required var is missing.
-Linting/formatting setup (ruff/black for Python, ESLint/Prettier for Angular). CI config optional but recommended.
+## Tool card
 
-Definition of Done: docker-compose up builds and starts this project's own ArcadeDB image (confirmed via docker images showing the project label, distinct from any other ArcadeDB image on the host) + backend; GET /health returns {"status":"ok","arcadedb":"connected"}; Angular dev server loads and shows that status. Phase 0 report must explicitly confirm the fresh-image build and the absence of collision with any pre-existing ArcadeDB resources. Commit phase-0: bootstrap.
+```text
+Name
+Description
+MCP
+Reliability
+Sources
+Freshness
+[View Code]
+[Test Tool]
+```
 
-PHASE 1 — ArcadeDB Foundation & Data Layer
+## Agent card
 
-Objective: Persistence layer for everything downstream.
+```text
+Name
+Description
+A2A
+Skills
+Capabilities
+Reliability
+Sources
+[View Code]
+[Test Agent]
+```
 
-Tasks:
+## View Code
 
-Create ArcadeDB database/schema for: Tool, Agent, Skill, DiscoverySource, Artifact, TestRun, ReliabilityEvaluation, and the graph edges in Section 5.3. Schema/bootstrap logic should live in platform/arcadedb/init/ so it runs automatically the first time this project's ArcadeDB image starts (per the ArcadeDB Image Policy).
-Implement the unified Item Pydantic model (Section 5.1) and TestRun model (Section 5.2).
-Build a repository layer (CRUD) for items and test runs — no HTTP endpoints yet, just internal Python API + unit tests.
-Set up indexes for full-text fields (name, description, tool/agent-specific fields) and a vector index field for embeddings (even if embeddings aren't generated yet — schema must support them).
-Seed script that inserts a handful of hand-written sample tools/agents for testing later phases.
+Tabs:
 
-Definition of Done: Unit tests cover create/read/update/delete for Item and TestRun, including graph edge creation. Seed script runs and data is visible via ArcadeDB Studio/API, on this project's own ArcadeDB container. Commit phase-1: arcadedb-foundation.
+```text
+Source
+Config
+MCP Schema
+Agent Card
+Metadata
+Provenance
+```
 
-PHASE 2 — MCP Discovery Adapter (Mock-Backed)
+## Test Tool
 
-Objective: A pluggable interface for MCP discovery, backed by realistic mock data, ready to be swapped for a live registry later without changing callers.
+Schema-generated form.
 
-Tasks:
+## Test Agent
 
-Define an abstract MCPDiscoveryAdapter interface: list_servers(query) -> [MCPServerRef], inspect_server(server_ref) -> [ToolDefinition] (this should call real initialize + tools/list semantics against whatever server implementation is behind it).
-Implement MockMCPDiscoveryAdapter: a small set of fake MCP servers (e.g. "Spotify MCP Server A/B/C") each exposing a couple of realistic tools with valid JSON Schema inputSchemas (mirror the search_tracks example in Section 1's flow).
-Implement a genuine local MCP server (even a trivial one, e.g. a calculator or file-search tool) so that Phase 9's sandboxed execution has something real to call over the MCP protocol, not just fabricated JSON.
-Config flag DISCOVERY_MODE=mock selects this adapter; leave a documented seam (DISCOVERY_MODE=live → not implemented yet, raises NotImplementedError with a clear message) for future real integration.
-Normalize discovered tools into the Item model (type: "tool") — do not persist yet, this phase only discovers and returns in-memory objects.
+Natural-language task input.
 
-Definition of Done: Given a query like "spotify", the adapter returns candidate mock servers, and inspecting one returns real tool definitions with valid schemas, using actual MCP client/server messages (not hardcoded JSON pretending to be a protocol response) for at least one real local MCP server. Unit + integration tests included. Commit phase-2: mcp-discovery-mock.
+---
 
-PHASE 3 — A2A Discovery Adapter (Mock-Backed)
+# 31. FAILURE ISOLATION
 
-Objective: Same pattern as Phase 2, for A2A agents.
+Example:
 
-Tasks:
+```text
+GitHub        → success
+MCP Registry  → timeout
+A2A Registry  → success
+Web Search    → success
+```
 
-Define an abstract A2ADiscoveryAdapter interface: list_sources(query) -> [AgentSourceRef], resolve_agent_card(source_ref) -> AgentCard.
-Implement MockA2ADiscoveryAdapter with a few fake agents (e.g. a "Financial Research Agent") each with a realistic Agent Card (identity, endpoint, capabilities, skills, auth info, supported interfaces).
-Implement one genuine trivial local A2A agent (an HTTP service that serves a real .well-known/agent-card.json and can accept a natural-language task) so Phase 10 has something real to test against. Instead of a canned/hardcoded response, this agent calls the Gemini API (via a small dedicated gemini_client module, using GEMINI_API_KEY/GEMINI_MODEL from config) to actually generate its reply to the given task — this is a real generation call, not a stub, so Phase 10's end-to-end test exercises genuine agent "thinking."
-If GEMINI_API_KEY is not set when this phase starts, stop and ask rather than falling back to a canned response silently — a silent fallback would undermine Phase 10's test of real generation.
-Normalize discovered agents into the Item model (type: "agent"), extracting skills as searchable metadata (not independently executable).
-Same DISCOVERY_MODE seam as Phase 2 for future live integration.
+Return successful results and expose source failure metadata.
 
-Definition of Done: Query returns candidate agent sources; resolving one returns a parsed, valid Agent Card from a real .well-known/agent-card.json endpoint (served locally). Tests included. Commit phase-3: a2a-discovery-mock.
+If all live sources fail but ArcadeDB has valid results:
 
-PHASE 4 — Normalization, Deduplication, Reliability Engine
+```text
+return cached results
++
+show live discovery unavailable
+```
 
-Objective: Turn raw discovery output into trusted, persisted catalog entries.
+Never fabricate live results.
 
-Tasks:
+---
 
-Normalization layer: map MCP tool definitions and A2A Agent Cards into the unified Item shape consistently.
-Deduplication using the composite keys defined in Section 5.3 (never name-only).
-Reliability Engine implementing the pipeline in Section 7: basic validation (schema/Agent Card validity) → security validation (basic checks: no obviously malicious patterns, valid endpoint scheme, etc.) → scoring → threshold decision using RELIABILITY_THRESHOLD from config.
-Persist only approved items to ArcadeDB (Phase 1's repository layer); rejected items are logged with the reason, not silently dropped.
+# 32. CONFIGURATION
 
-Definition of Done: Feeding Phase 2/3 mock discovery output through this pipeline results in correctly deduplicated, scored items in ArcadeDB, with rejected items logged and explained. Unit tests cover dedup edge cases (same name, different source) and threshold behavior. Commit phase-4: reliability-engine.
+Example:
 
-PHASE 5 — Search Orchestrator, Local Embeddings & Ranking
-
-Objective: Unified search across cache + live discovery, semantically aware, using local embeddings only.
-
-Tasks:
-
-Integrate a local embedding model (sentence-transformers/all-MiniLM-L6-v2 or equivalent small CPU model) running inside the backend process/container — confirm no network call is required at inference time (model downloaded once at build/setup time). Embeddings remain 100% local; do not route embedding generation through Gemini.
-Generate and store embeddings for each persisted Item (name + description + tool/agent-specific text).
-Implement the query planner as a Gemini API call: send the raw user query to Gemini (via the same shared gemini_client module used in Phase 3) and have it return structured JSON — extracted keywords, inferred preferred_type (tool/agent/all), and an optional expanded/rewritten query string for better recall. Enforce a strict response schema (e.g. via a JSON-mode prompt) and validate the returned JSON before using it; if Gemini is unreachable or returns invalid JSON, fall back to a simple keyword-split of the raw query and log the fallback (never let a Gemini outage break search entirely).
-Implement the Search Orchestrator: cold search vs warm search behavior exactly as diagrammed in Section 4.4 — ArcadeDB results returned immediately where available, live discovery (Phase 2+3 adapters) triggered in parallel/async, merged, deduped, re-scored, re-persisted.
-Implement ranking per Section 7's formula, with weights in config (not hardcoded).
-Failure isolation: if one source (ArcadeDB, MCP discovery, or A2A discovery) fails/times out, still return whatever succeeded and flag which source failed in the response metadata.
-
-Definition of Done: GET /api/search?q=spotify (still no HTTP layer required yet — test this at the orchestrator/service level first) returns ranked, deduped results combining cached + freshly discovered mock data, with embeddings actually used for at least one semantic-match test case (e.g. "audio track search" matching a "search_tracks" tool). At least one integration test hits the real Gemini API for query understanding (requires GEMINI_API_KEY to be set locally); the rest of the automated/CI test suite mocks the gemini_client module so tests don't depend on network access or burn API quota. The Gemini-outage fallback path (invalid JSON / unreachable API → keyword-split) is also covered by a test. Commit phase-5: search-orchestrator.
-
-PHASE 6 — Backend API Layer (REST + SSE)
-
-Objective: Expose everything built so far over HTTP, matching Section 6 exactly.
-
-Tasks:
-
-Implement all endpoints listed in Section 6 using FastAPI routers.
-POST /api/items/{item_id}/test at this phase should only validate input against schema and return a run_id with status: "running" — actual sandboxed execution comes in Phase 9/10; for now, wire it to a stub executor that just marks the run as completed with a placeholder result so the contract can be tested end-to-end.
-Implement SSE log streaming plumbing generically (works with the stub executor now, will carry real logs from Phase 9 onward without changing the endpoint contract).
-OpenAPI docs auto-generated and reviewed for accuracy.
-Integration tests hitting the real HTTP endpoints (via FastAPI's TestClient) covering search, item detail, artifacts, schema, test-run creation, and log streaming.
-
-Definition of Done: Full REST/SSE surface is callable via curl/HTTPie against a running backend, backed by real Phase 1–5 logic (not further stubs) except execution, which is intentionally stubbed and clearly marked as such. Commit phase-6: api-layer.
-
-PHASE 7 — Angular UI: Search, Cards, Filters
-
-Objective: The primary discovery UI, wired to the real API from Phase 6.
-
-Tasks:
-
-Search page with query input, type filter (all/tool/agent), and result list.
-Tool card and Agent card components matching Section 4's card layout (name, description, source/server, reliability score, View Code / Test Tool or Test Agent buttons).
-Loading states: show cached results immediately, then update as live discovery results stream in (reflect the warm-search behavior visually, e.g. a subtle "refreshing…" indicator).
-Error/empty states, including "one source failed" messaging from Phase 5/6.
-Basic responsive layout; no execution logic yet — buttons exist but next two phases wire their targets.
-
-Definition of Done: Searching for a seeded/mocked term (e.g. "spotify", "financial") returns visually correct cards with real reliability scores and correct tool/agent distinction. Component tests included. Commit phase-7: search-ui.
-
-PHASE 8 — "View Code" Feature (Artifacts + Monaco)
-
-Objective: Read-only inspection panel — implement exactly the flow in Section 4.5.
-
-Tasks:
-
-Side panel/modal opened without navigation, preserving search state.
-Fetch /api/items/{item_id}/artifacts.
-Monaco Editor integration in read-only mode, one tab per artifact (source file(s), config file(s), MCP schema or Agent Card as formatted JSON).
-Language detection from filename extension (.py, .js, .ts, .json, .yaml/.yml, .env).
-Per-tab "Copy to Clipboard" button.
-Explicit "source code is not available" state showing the repository/source URL (if known) plus whatever metadata/schema IS available — this must be tested with at least one seeded item that has no source, and one that does.
-
-Definition of Done: Both the "source available" and "source unavailable" paths render correctly and are covered by component tests; clicking View Code never triggers any execution or network call to a live tool/agent. Commit phase-8: view-code.
-
-PHASE 9 — Sandbox Manager & Tool Testing (Real Execution Begins Here)
-
-Objective: Replace the Phase 6 stub executor with real, sandboxed MCP tool execution. This is a security-critical phase — follow Section 8 exactly.
-
-Tasks:
-
-Sandbox Manager: creates an ephemeral Docker container per test run, applies CPU/memory limits, execution timeout, restricted network (only the target MCP server/endpoint reachable), no host filesystem mounts, non-root user inside the container.
-"Test Tool" panel in Angular: dynamic form generated from the tool's inputSchema (JSON Schema → form fields, required/optional handling, basic type validation client-side).
-Backend: on POST /api/items/{item_id}/test, validate input against the stored schema, spin up the sandbox, run an MCP client inside it that connects to the real local MCP server built in Phase 2 and calls the tool with the given input.
-Stream real logs via SSE (connection established, calling tool, parameters, completion).
-Persist the resulting TestRun (status, duration, output, errors, logs) and destroy the sandbox afterward — verify destruction actually happens (no orphaned containers) even on failure/timeout paths.
-Distinguish and correctly surface all statuses: running, success, failed, timeout, blocked, cancelled.
-
-Definition of Done: Running the tool test end-to-end (UI → API → sandbox → real local MCP server → response) against the real MCP tool built in Phase 2 works, is logged live, produces a persisted TestRun, and the container is confirmed destroyed after each run (test this explicitly, including a forced-timeout case). Commit phase-9: sandbox-tool-testing.
-
-PHASE 10 — Agent Testing (A2A + Sandbox + Allowlist)
-
-Objective: Same execution rigor as Phase 9, for A2A agents, plus the MCP-allowlist security requirement.
-
-Tasks:
-
-"Test Agent" panel in Angular: natural-language task textarea, "Run Agent" button (no schema-driven form — agents take free text tasks).
-Backend: on test request, create an Agent Sandbox, call the real local A2A agent built in Phase 3 with the task.
-If the agent uses MCP tools internally, enforce the allowlist from the agent's declared_dependencies: any tool call outside that list must be blocked and logged, not silently allowed.
-Track and persist declared vs observed dependencies, and compute/store the "unexpected" diff on the TestRun (Section 5.2).
-Stream logs/trace via SSE; persist TestRun; destroy sandbox afterward.
-Explicitly test the security boundary: build a test case where the local agent attempts to call a tool NOT on its allowlist, and confirm it is blocked and recorded — this test is mandatory, not optional.
-
-Definition of Done: End-to-end agent test works against the real local A2A agent, whose reply is genuinely generated via the Gemini API (Phase 3); the allowlist violation test case passes (blocked + logged, not executed); TestRun correctly stores declared/observed/unexpected dependency lists. At least one manual/integration run exercises the real Gemini call; CI/automated tests mock the gemini_client so the suite doesn't depend on network access or quota. Commit phase-10: agent-testing.
-
-PHASE 11 — Warm Search, Caching, and Final Hardening
-
-Objective: Polish and harden what already exists — do not introduce first-time security here (that was Phase 9/10).
-
-Tasks:
-
-Confirm/optimize warm-search behavior end-to-end in the UI: cached ArcadeDB results appear instantly, live discovery results merge in asynchronously without a jarring full-page reload.
-Background/periodic re-sync job (even a simple scheduled task) that refreshes last_seen/last_synced and re-scores reliability for existing items.
-Review and tighten sandbox resource limits and timeouts based on real numbers observed in Phase 9/10 testing.
-Secrets/credential handling review: confirm nothing from Section 2's env vars or any per-run credential ever appears in logs, TestRun records, or the frontend.
-Audit logging review: confirm sandbox create/destroy and every allowlist decision (Phase 10) is captured in a queryable audit trail.
-ArcadeDB image/volume review: re-confirm the project is still running its own fresh ArcadeDB image and project-scoped volume (per the ArcadeDB Image Policy in Section 2), with no drift toward a shared/host-level container.
-Full regression pass: re-run the full test suite from all prior phases together, plus a manual end-to-end walkthrough matching Section 4's complete user journey (search → view code → test tool, and search → test agent).
-Write the top-level README.md: how to run everything (docker-compose up), how the project-specific ArcadeDB image is built and why, how to switch DISCOVERY_MODE from mock to live in the future, and a summary of what is genuinely live vs mocked in this V1.
-
-Definition of Done: Full regression suite passes; README accurately describes current state; a fresh reviewer can docker-compose up and walk through the entire Section 4 user journey without hitting an unhandled error. Commit phase-11: hardening-and-docs.
-
-SECTION 10 — PHASE COMPLETION REPORT TEMPLATE
-
-At the end of every phase, produce a short report in this format before asking to proceed:
-
-### Phase N complete: <phase name>
-
-Built:
-- ...
-
-Tests run (and result):
-- ...
-
-Mocked/stubbed vs real:
-- ...
-
-Open questions / things I need confirmation on:
-- ...
-
-Ready to proceed to Phase N+1? (yes/no — waiting for confirmation)
-SECTION 11 — FINAL REMINDERS TO CODEX
-If at any point a requirement is ambiguous (e.g. exact ranking weight, a missing field, how a real registry's API will look later), ask a specific, answerable question rather than guessing silently. Prefer asking one focused question over pausing all work indefinitely.
-Never merge MCP and A2A discovery logic into a shared code path beyond the top-level orchestrator and UI.
-Never treat "source code available" as a precondition for a tool/agent being discoverable, searchable, or persisted — only reliability matters for persistence; source availability only affects the View Code panel.
-Never execute untrusted code outside the sandbox, at any phase, for any reason, including "just to test something quickly."
-Keep MCP tool execution and A2A agent execution as two distinct code paths in the sandbox layer, even though both use "the sandbox."
-Never run ArcadeDB from anything other than this project's own built image and project-scoped volume — no shared/system ArcadeDB, ever.
-One phase at a time. Full stop.
-SECTION 12 — DOCKER ENVIRONMENT RULES
-
-This project must have ONE authoritative Docker Compose stack.
-
-Before creating or starting any Docker service, inspect the existing Docker environment:
-
-docker ps -a
-docker network ls
-docker volume ls
-docker images
-
-Identify whether containers/images from this project already exist.
-
-Use the project's docker-compose.yml as the SINGLE source of truth.
-Do NOT create duplicate backend, frontend, or ArcadeDB containers outside Docker Compose.
-All project services must be created and managed by the same docker-compose.yml.
-Use explicit service names: arcadedb, backend, frontend.
-Use a dedicated Compose project/network for this application.
-Before starting the stack, detect existing containers with conflicting names, ports, networks, or images.
-If old containers belong to this same project and are stale, stop/remove the containers safely and recreate them through Docker Compose.
-
-ArcadeDB-specific rule (see Section 2's ArcadeDB Image Policy for full detail): the arcadedb service is always built from this project's own platform/arcadedb/Dockerfile, never run from a bare pulled image, and never pointed at a container/volume belonging to another project on the same host. If docker ps -a / docker volume ls shows an ArcadeDB resource not created by this project's Compose file, it must be left untouched and reported to the user, not adopted or deleted.
-
-IMPORTANT:
-
-Never delete Docker volumes automatically.
-Never run docker compose down -v.
-Never run docker volume rm.
-Never delete or reset ArcadeDB data without explicit user approval.
-Preserve the existing ArcadeDB data volume.
-
-The database container must be managed by Docker Compose. The backend must connect to ArcadeDB using the Compose service hostname:
-
+```text
 ARCADEDB_HOST=arcadedb
 ARCADEDB_PORT=2480
+ARCADEDB_DATABASE=platform
+ARCADEDB_USER=root
+ARCADEDB_PASSWORD=<runtime secret>
 
-Never use localhost for backend → ArcadeDB communication.
+RELIABILITY_THRESHOLD=0.75
 
-After creating the stack, verify:
+ENABLE_GITHUB_DISCOVERY=false
+ENABLE_MCP_REGISTRY_DISCOVERY=false
+ENABLE_A2A_REGISTRY_DISCOVERY=false
+ENABLE_WEB_SEARCH_DISCOVERY=false
+ENABLE_WEB_EXTRACTION=false
+ENABLE_WELL_KNOWN_A2A=true
 
-docker compose ps
+GITHUB_TOKEN=<runtime secret>
 
-All expected services must appear under the same Compose project, and the arcadedb image must show this project's label (confirming it was built fresh, not pulled or reused).
+GEMINI_API_KEY=<runtime secret>
+GEMINI_MODEL=gemini-2.5-flash
+```
 
-Then verify:
+Provider URLs, credentials, limits and concurrency must be configuration-driven.
 
-docker compose exec backend ...
-docker compose logs backend
-docker compose logs arcadedb
+---
 
-Finally verify:
+# 33. DISCOVERY MODES
 
-curl http://localhost:8000/health
+## Mock
 
-Expected:
+Deterministic local testing.
 
-{"status":"ok","arcadedb":"connected"}
+```text
+DISCOVERY_MODE=mock
+```
 
-Do not proceed to the next phase until the complete Compose stack is verified.
+## Live
+
+Configured real providers.
+
+```text
+DISCOVERY_MODE=live
+```
+
+## Mixed
+
+Recommended architecture:
+
+```text
+ArcadeDB
++
+enabled live sources
++
+optional mock source
+```
+
+Each source must be independently enabled/disabled.
+
+---
+
+# 34. CACHING
+
+Cache:
+
+1. trusted ArcadeDB catalog;
+2. appropriate discovery-source responses;
+3. validated protocol metadata;
+4. artifacts;
+5. embeddings.
+
+Never cache secrets.
+
+Cache keys should include relevant provider/source/protocol/query/identity information.
+
+---
+
+# 35. RATE LIMITS AND RETRIES
+
+Do not confuse provider protection with user-facing product rate limiting.
+
+For external sources implement:
+
+- bounded retries;
+- exponential backoff where appropriate;
+- Retry-After handling;
+- per-provider concurrency;
+- timeouts;
+- source health tracking;
+- temporary suppression after repeated failures.
+
+---
+
+# 36. OBSERVABILITY
+
+Track:
+
+## Discovery
+
+- query;
+- source;
+- latency;
+- candidates;
+- validated;
+- approved;
+- rejected;
+- source errors;
+- rate limits.
+
+## Persistence
+
+- inserted;
+- updated;
+- deduplicated;
+- rejected.
+
+## Execution
+
+- run ID;
+- item;
+- duration;
+- status;
+- sandbox lifecycle;
+- tool-call decisions;
+- dependency diff.
+
+Never log secret values.
+
+---
+
+# 37. REPOSITORY TARGET STRUCTURE
+
+```text
+backend/
+├── app/
+│   ├── api/
+│   ├── db/
+│   ├── models/
+│   ├── discovery/
+│   │   ├── common/
+│   │   ├── mcp/
+│   │   └── a2a/
+│   ├── normalization/
+│   ├── deduplication/
+│   ├── search/
+│   ├── reliability/
+│   ├── artifacts/
+│   ├── sandbox/
+│   ├── security/
+│   ├── gemini/
+│   └── tests/
+├── Dockerfile
+└── requirements.txt
+
+frontend/
+└── src/app/
+    ├── search/
+    ├── item-detail/
+    ├── code-viewer/
+    ├── tool-test/
+    ├── agent-test/
+    └── shared/
+
+arcadedb/
+docker-compose.yml
+.env.example
+README.md
+```
+
+If the existing repository has a different structure, preserve its valid conventions rather than blindly replacing it.
+
+---
+
+# 38. PHASE ORDER
+
+Detailed phase specifications should live in separate files when this master plan is split.
+
+The authoritative implementation order is:
+
+```text
+PHASE 00  Docker/repository baseline
+PHASE 01  ArcadeDB schema/persistence
+PHASE 02  MCP protocol core
+PHASE 03  A2A protocol core
+PHASE 04  GitHub discovery
+PHASE 05  MCP registry discovery
+PHASE 06  A2A registry + Well-Known discovery
+PHASE 07  Web search discovery
+PHASE 08  Safe web extraction
+PHASE 09  Multi-source orchestrator
+PHASE 10  Normalization/dedup/reliability/persistence
+PHASE 11  Query planning/embeddings/ranking
+PHASE 12  REST + SSE
+PHASE 13  Angular discovery UI
+PHASE 14  View Code/artifact inspection
+PHASE 15  Secure MCP testing
+PHASE 16  Secure A2A testing
+PHASE 17  Warm search/refresh/final hardening
+```
+
+---
+
+# 39. PHASE DEFINITIONS OF DONE
+
+## Phase 00
+
+- project Docker stack starts;
+- project-owned ArcadeDB image works;
+- backend connects to ArcadeDB;
+- frontend reaches backend;
+- no unrelated Docker resource is destroyed.
+
+## Phase 01
+
+- catalog models exist;
+- provenance exists;
+- evidence exists;
+- TestRun exists;
+- graph/text/vector foundation works.
+
+## Phase 02
+
+- real local MCP server works;
+- MCP client works;
+- initialize works;
+- tools/list works;
+- schemas are normalized.
+
+## Phase 03
+
+- real local A2A agent works;
+- Agent Card works;
+- `.well-known` works;
+- A2A task works.
+
+## Phase 04
+
+- GitHub adapter works;
+- MCP/A2A candidate classification works;
+- provenance works;
+- rate-limit/error handling works.
+
+## Phase 05
+
+- supported MCP registry adapter works;
+- registry candidates enter MCP validation.
+
+## Phase 06
+
+- A2A registry works;
+- Well-Known Agent Card resolution works;
+- Agent Cards validate.
+
+## Phase 07
+
+- web search returns candidates;
+- candidates enter protocol resolution;
+- web failures are isolated.
+
+## Phase 08
+
+- targeted extraction works;
+- SSRF protections work;
+- robots/terms-aware behavior exists;
+- unsafe URLs are blocked.
+
+## Phase 09
+
+- sources execute concurrently;
+- one source can fail without breaking search;
+- candidates aggregate correctly.
+
+## Phase 10
+
+- tools/agents normalize;
+- duplicates merge;
+- reliability works;
+- approved records persist.
+
+## Phase 11
+
+- Gemini planner works;
+- fallback works;
+- local embeddings work;
+- semantic + structured ranking works.
+
+## Phase 12
+
+- API contracts work;
+- SSE works;
+- integration tests pass.
+
+## Phase 13
+
+- search UI works;
+- result cards show source/reliability/freshness;
+- partial source failures are understandable.
+
+## Phase 14
+
+- View Code works;
+- Monaco works;
+- source/schema/Agent Card/config display works;
+- no execution occurs.
+
+## Phase 15
+
+- user can test an MCP tool;
+- actual MCP protocol is used;
+- Docker sandbox is used;
+- logs/output stream;
+- TestRun persists;
+- cleanup works.
+
+## Phase 16
+
+- user can test an A2A agent;
+- actual A2A protocol is used;
+- Docker sandbox is used;
+- Agent Card is validated;
+- MCP allowlist works;
+- dependency diff persists;
+- cleanup works.
+
+## Phase 17
+
+- warm search works;
+- stale refresh works;
+- cached/live merge works;
+- full regression passes;
+- documentation is accurate.
+
+---
+
+# 40. REQUIRED TEST MATRIX
+
+## Discovery
+
+- GitHub success/failure/rate-limit.
+- MCP registry success/failure.
+- A2A registry success/failure.
+- Web search success/failure.
+- Web extraction timeout.
+- Web extraction oversized response.
+- Well-Known missing/invalid/valid.
+- Direct Agent Card valid/invalid.
+- MCP initialize failure.
+- MCP tools/list failure.
+- Invalid MCP schema.
+- Duplicate candidates.
+- False-positive repository.
+
+## Search
+
+- cold search;
+- warm search;
+- cached-only;
+- live-only;
+- cached + live;
+- semantic query;
+- Gemini failure;
+- keyword fallback;
+- one source failure;
+- all live sources failure;
+- stale refresh.
+
+## Persistence
+
+- CRUD;
+- provenance;
+- evidence;
+- artifact;
+- reliability;
+- TestRun;
+- graph edges;
+- vector search;
+- deduplication;
+- freshness update.
+
+## MCP execution
+
+- valid input;
+- invalid input;
+- initialize failure;
+- tools/list failure;
+- tools/call success;
+- tools/call error;
+- timeout;
+- blocked network;
+- secret redaction;
+- cleanup.
+
+## A2A execution
+
+- valid Agent Card;
+- invalid Agent Card;
+- task success;
+- task failure;
+- timeout;
+- declared MCP call;
+- undeclared MCP call;
+- blocked call;
+- dependency diff;
+- cleanup.
+
+## Security
+
+- localhost SSRF;
+- private IP SSRF;
+- metadata endpoint SSRF;
+- malicious redirect;
+- invalid URL scheme;
+- oversized response;
+- secret leakage;
+- host filesystem access;
+- Docker socket access;
+- unrestricted network;
+- orphan container;
+- timeout cleanup.
+
+---
+
+# 41. COMPLETE MCP END-TO-END ACCEPTANCE TEST
+
+```text
+"web scraping tool"
+        ↓
+ArcadeDB lookup
+        ↓
+GitHub + MCP Registry + Web
+        ↓
+candidate
+        ↓
+MCP resolution
+        ↓
+initialize
+        ↓
+tools/list
+        ↓
+schema
+        ↓
+validation/reliability
+        ↓
+ArcadeDB persistence
+        ↓
+UI card
+        ↓
+View Code
+        ↓
+Test Tool
+        ↓
+dynamic form
+        ↓
+Docker sandbox
+        ↓
+MCP tools/call
+        ↓
+SSE logs
+        ↓
+output
+        ↓
+TestRun
+        ↓
+cleanup
+        ↓
+second search
+        ↓
+cached + live refresh
+```
+
+---
+
+# 42. COMPLETE A2A END-TO-END ACCEPTANCE TEST
+
+```text
+"research agent"
+        ↓
+ArcadeDB lookup
+        ↓
+GitHub + Agent Registry + Web
+        ↓
+candidate
+        ↓
+Agent Card
+        ↓
+validation/reliability
+        ↓
+ArcadeDB persistence
+        ↓
+UI card
+        ↓
+View Code / Agent Card
+        ↓
+Test Agent
+        ↓
+natural-language task
+        ↓
+Docker sandbox
+        ↓
+A2A task
+        ↓
+agent response
+        ↓
+optional MCP call
+        ↓
+allowlist
+        ↓
+SSE trace
+        ↓
+dependency diff
+        ↓
+TestRun
+        ↓
+cleanup
+        ↓
+future warm search
+```
+
+---
+
+# 43. OUT OF SCOPE
+
+- Publishing modified tools back to public registries.
+- Building a public registry.
+- Billing.
+- User-facing sandbox billing/rate limiting.
+- Unrestricted whole-web crawling.
+- Automatic modification of discovered source code.
+- Automatic deployment of arbitrary discovered code.
+- Treating skills as independently executable entities.
+- Executing arbitrary discovered code directly in FastAPI.
+
+---
+
+# 44. CODEX EXECUTION PROTOCOL
+
+Before starting:
+
+1. Read this master plan.
+2. Inspect the existing repository.
+3. Inspect current Docker resources without destroying anything.
+4. Identify existing implementations that satisfy requirements.
+5. Do not duplicate existing functionality unnecessarily.
+6. Determine the current phase from repository state.
+7. Read the detailed phase specification if present.
+8. Implement only that phase.
+9. Run tests.
+10. Verify Definition of Done.
+11. Produce a phase completion report.
+12. Only then continue.
+
+For every implementation decision:
+
+```text
+Requirement
+   ↓
+Existing code
+   ↓
+Smallest correct change
+   ↓
+Tests
+   ↓
+Verification
+```
+
+Do not create placeholder classes/endpoints merely to make a phase appear complete.
+
+---
+
+# 45. FINAL ACCEPTANCE
+
+The project is complete only when:
+
+- natural-language discovery works;
+- user does not need prior knowledge of item names;
+- GitHub discovery works;
+- configured MCP registry discovery works;
+- configured A2A registry discovery works;
+- web search discovery works;
+- safe targeted extraction works;
+- A2A Well-Known discovery works;
+- MCP candidates are actually protocol-validated;
+- A2A candidates are actually Agent-Card-validated;
+- sources are merged and deduplicated;
+- provenance is retained;
+- reliability is explainable;
+- approved tools persist in ArcadeDB;
+- approved agents persist in ArcadeDB;
+- source artifacts are handled honestly;
+- semantic search works;
+- warm search works;
+- stale refresh works;
+- View Code is read-only;
+- MCP Tool testing uses MCP;
+- A2A Agent testing uses A2A;
+- both execute only in sandbox;
+- A2A MCP dependencies are allowlisted;
+- unexpected MCP calls are blocked;
+- live logs/traces work;
+- TestRuns persist;
+- cleanup works on success/failure/timeout;
+- secrets remain protected;
+- SSRF protections are tested;
+- external-source failures are isolated;
+- full regression passes.
+
+---
+
+# 46. FINAL ARCHITECTURAL CONTRACT
+
+```text
+                  ┌────────────────────┐
+                  │    Angular UI      │
+                  └─────────┬──────────┘
+                            │
+                            ▼
+                  ┌────────────────────┐
+                  │ Python + FastAPI   │
+                  └─────────┬──────────┘
+                            │
+                            ▼
+                  ┌────────────────────┐
+                  │ Search Orchestrator│
+                  └─────────┬──────────┘
+                            │
+            ┌───────────────┼────────────────┐
+            │               │                │
+            ▼               ▼                ▼
+        ArcadeDB        MCP Discovery     A2A Discovery
+                            │                │
+                      ┌─────┼─────┐    ┌────┼─────┐
+                      │     │     │    │    │     │
+                   GitHub Registry Web GitHub Registry Web
+                                             +
+                                         Well-Known
+                            │                │
+                            ▼                ▼
+                       MCP Resolver      A2A Resolver
+                            │                │
+                      initialize/list     Agent Card
+                            │                │
+                            └───────┬────────┘
+                                    ▼
+                            Security Validation
+                                    ▼
+                               Normalization
+                                    ▼
+                                Deduplication
+                                    ▼
+                              Reliability
+                                    ▼
+                                 ArcadeDB
+                                    ▼
+                            Vector/Text Search
+                                    ▼
+                                  Ranking
+                                    ▼
+                                    UI
+                             ┌──────┴──────┐
+                             │             │
+                             ▼             ▼
+                        Test Tool      Test Agent
+                             │             │
+                             ▼             ▼
+                        MCP Sandbox    A2A Sandbox
+                             │             │
+                             ▼             ▼
+                        tools/call      A2A task
+                                           │
+                                      optional MCP
+                                           │
+                                       allowlist
+                                           │
+                             └──────┬──────┘
+                                    ▼
+                              TestRun + SSE
+```
+
+**Implementation target:** a real, testable discovery platform—not a mock catalog, not a single-registry search, and not a backend that executes untrusted code.
+
