@@ -22,6 +22,7 @@ class SourceType(str, Enum):
     A2A_CATALOG = "a2a_catalog"
     WELL_KNOWN = "well_known"
     CONFIGURED = "configured"
+    GITHUB = "github"
 
 
 class Reliability(BaseModel):
