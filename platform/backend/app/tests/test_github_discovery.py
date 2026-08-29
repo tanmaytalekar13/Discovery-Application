@@ -1,3 +1,5 @@
+import base64
+
 import httpx
 import pytest
 
@@ -7,7 +9,7 @@ from app.discovery.github.client import (
     GitHubDiscoveryAdapter,
     GitHubRateLimitError,
 )
-from app.models import ItemType, SourceType
+from app.models import DiscoverySource, ItemType, SourceType
 
 
 def _repo(**overrides):
@@ -20,6 +22,7 @@ def _repo(**overrides):
         "description": "A Model Context Protocol server",
         "topics": ["mcp"],
     }
+
     repo.update(overrides)
     return repo
 
@@ -32,7 +35,9 @@ def test_classifies_mcp_repository():
     )
 
     assert result is not None
+
     item_type, evidence = result
+
     assert item_type is ItemType.TOOL
     assert evidence
 
@@ -52,26 +57,28 @@ def test_classifies_a2a_repository():
     )
 
     assert result is not None
+
     item_type, evidence = result
+
     assert item_type is ItemType.AGENT
     assert evidence
 
 
 def test_rejects_false_positive_repository():
     repo = _repo(
+        full_name="example/mcp-related-article",
         name="mcp-related-article",
         description="An article about MCP history",
         topics=[],
     )
 
-    assert (
-        GitHubDiscoveryAdapter.classify_repository(
-            repo,
-            "This is a blog post about Model Context Protocol.",
-            [],
-        )
-        is None
+    result = GitHubDiscoveryAdapter.classify_repository(
+        repo,
+        "This is a blog post about Model Context Protocol.",
+        [],
     )
+
+    assert result is None
 
 
 def test_candidate_contains_github_provenance():
@@ -82,6 +89,7 @@ def test_candidate_contains_github_provenance():
         "MCP server using tools/call.",
         [],
     )
+
     assert result is not None
 
     candidate = GitHubCandidate(
@@ -93,6 +101,11 @@ def test_candidate_contains_github_provenance():
         description=repo["description"],
         item_type=result[0],
         evidence=tuple(result[1]),
+        source=DiscoverySource(
+            type=SourceType.GITHUB,
+            id=repo["full_name"],
+            url=repo["html_url"],
+        ),
     )
 
     assert candidate.source.type is SourceType.GITHUB
@@ -115,32 +128,56 @@ async def test_discovery_uses_search_and_repository_evidence():
                 )
 
             if request.url.path.endswith("/readme"):
-                import base64
-
                 content = base64.b64encode(
                     b"Model Context Protocol server using tools/call"
                 ).decode()
-                return httpx.Response(200, json={"content": content})
+
+                return httpx.Response(
+                    200,
+                    json={"content": content},
+                )
 
             if request.url.path.endswith("/contents"):
                 return httpx.Response(
                     200,
-                    json=[{"path": "mcp.json", "type": "file"}],
+                    json=[
+                        {
+                            "path": "mcp.json",
+                            "type": "file",
+                        }
+                    ],
                 )
 
-            return httpx.Response(404, json={})
+            return httpx.Response(
+                404,
+                json={},
+            )
 
     client = httpx.AsyncClient(
         transport=MockTransport(),
         base_url="https://api.github.test",
     )
 
-    async with GitHubDiscoveryAdapter(httpx_client=client) as adapter:
-        results = await adapter.discover("mcp", max_results=5)
+    async with GitHubDiscoveryAdapter(
+        httpx_client=client
+    ) as adapter:
+        results = await adapter.discover(
+            "mcp",
+            max_results=5,
+        )
 
     assert len(results) == 1
     assert results[0].item_type is ItemType.TOOL
-    assert any("/search/repositories" in call for call in calls)
+    assert results[0].source.type is SourceType.GITHUB
+    assert (
+        results[0].source.id
+        == "example/mcp-server"
+    )
+
+    assert any(
+        "/search/repositories" in call
+        for call in calls
+    )
 
 
 @pytest.mark.asyncio
@@ -149,8 +186,12 @@ async def test_rate_limit_is_explicit():
         async def handle_async_request(self, request):
             return httpx.Response(
                 403,
-                headers={"X-RateLimit-Remaining": "0"},
-                json={"message": "API rate limit exceeded"},
+                headers={
+                    "X-RateLimit-Remaining": "0",
+                },
+                json={
+                    "message": "API rate limit exceeded"
+                },
             )
 
     client = httpx.AsyncClient(
@@ -158,9 +199,14 @@ async def test_rate_limit_is_explicit():
         base_url="https://api.github.test",
     )
 
-    async with GitHubDiscoveryAdapter(httpx_client=client) as adapter:
+    async with GitHubDiscoveryAdapter(
+        httpx_client=client
+    ) as adapter:
         with pytest.raises(GitHubRateLimitError):
-            await adapter.discover("mcp", max_results=1)
+            await adapter.discover(
+                "mcp",
+                max_results=1,
+            )
 
 
 @pytest.mark.asyncio
@@ -169,7 +215,9 @@ async def test_api_error_is_explicit():
         async def handle_async_request(self, request):
             return httpx.Response(
                 500,
-                json={"message": "server error"},
+                json={
+                    "message": "server error"
+                },
             )
 
     client = httpx.AsyncClient(
@@ -177,6 +225,11 @@ async def test_api_error_is_explicit():
         base_url="https://api.github.test",
     )
 
-    async with GitHubDiscoveryAdapter(httpx_client=client) as adapter:
+    async with GitHubDiscoveryAdapter(
+        httpx_client=client
+    ) as adapter:
         with pytest.raises(GitHubAPIError):
-            await adapter.discover("mcp", max_results=1)
+            await adapter.discover(
+                "mcp",
+                max_results=1,
+            )

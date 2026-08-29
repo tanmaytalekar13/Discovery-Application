@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -45,13 +45,8 @@ class GitHubCandidate:
     default_branch: str | None
     description: str
     item_type: ItemType
-    evidence: tuple[str, ...] = ()
-    source: DiscoverySource = field(
-        default_factory=lambda: DiscoverySource(
-            type=SourceType.GITHUB,
-            id="github",
-        )
-    )
+    evidence: tuple[str, ...]
+    source: DiscoverySource
 
 
 class GitHubDiscoveryAdapter:
@@ -86,8 +81,10 @@ class GitHubDiscoveryAdapter:
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "agentic-discovery-platform",
         }
+
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
+
         return headers
 
     async def discover(
@@ -98,6 +95,7 @@ class GitHubDiscoveryAdapter:
         """Search repositories and return positively classified candidates."""
         if not query.strip():
             raise ValueError("GitHub discovery query must not be empty")
+
         if max_results < 1:
             raise ValueError("max_results must be at least 1")
 
@@ -112,6 +110,7 @@ class GitHubDiscoveryAdapter:
         )
 
         repositories = payload.get("items", [])
+
         if not isinstance(repositories, list):
             raise GitHubAPIError(
                 "GitHub search response has an invalid 'items' field"
@@ -119,14 +118,21 @@ class GitHubDiscoveryAdapter:
 
         semaphore = asyncio.Semaphore(self._max_concurrent)
 
-        async def classify(repo: dict[str, Any]) -> GitHubCandidate | None:
+        async def classify(
+            repo: dict[str, Any],
+        ) -> GitHubCandidate | None:
             async with semaphore:
                 return await self._classify_repository(repo)
 
         results = await asyncio.gather(
             *(classify(repo) for repo in repositories[:max_results])
         )
-        return [candidate for candidate in results if candidate is not None]
+
+        return [
+            candidate
+            for candidate in results
+            if candidate is not None
+        ]
 
     async def discover_mcp(
         self,
@@ -151,6 +157,7 @@ class GitHubDiscoveryAdapter:
         repo: dict[str, Any],
     ) -> GitHubCandidate | None:
         full_name = repo.get("full_name")
+
         if not isinstance(full_name, str) or "/" not in full_name:
             return None
 
@@ -162,6 +169,7 @@ class GitHubDiscoveryAdapter:
             readme,
             root_entries,
         )
+
         if classification is None:
             return None
 
@@ -169,7 +177,10 @@ class GitHubDiscoveryAdapter:
 
         return GitHubCandidate(
             repository=full_name,
-            name=str(repo.get("name") or full_name.rsplit("/", 1)[-1]),
+            name=str(
+                repo.get("name")
+                or full_name.rsplit("/", 1)[-1]
+            ),
             html_url=str(repo.get("html_url") or ""),
             clone_url=str(repo.get("clone_url") or ""),
             default_branch=repo.get("default_branch"),
@@ -189,16 +200,29 @@ class GitHubDiscoveryAdapter:
         readme: str = "",
         root_entries: list[dict[str, Any]] | None = None,
     ) -> tuple[ItemType, list[str]] | None:
-        """Classify with protocol evidence; reject weak false positives."""
+        """Classify with protocol evidence and reject weak false positives."""
+
         root_entries = root_entries or []
 
         name = str(repo.get("name") or "").lower()
-        description = str(repo.get("description") or "").lower()
+        description = str(
+            repo.get("description") or ""
+        ).lower()
+
         topics = " ".join(
             str(topic).lower()
             for topic in repo.get("topics", []) or []
         )
-        text = " ".join((name, description, topics, readme.lower()))
+
+        text = " ".join(
+            (
+                name,
+                description,
+                topics,
+                readme.lower(),
+            )
+        )
+
         paths = [
             str(entry.get("path") or "").lower()
             for entry in root_entries
@@ -207,18 +231,28 @@ class GitHubDiscoveryAdapter:
         mcp_evidence: list[str] = []
         a2a_evidence: list[str] = []
 
-        if "model context protocol" in text or "mcp server" in text:
+        # ---------------------------------------------------------
+        # MCP evidence
+        # ---------------------------------------------------------
+
+        if "mcp server" in text:
             mcp_evidence.append(
-                "repository metadata/documentation mentions MCP"
+                "repository metadata/documentation "
+                "explicitly identifies an MCP server"
             )
+
         if any(
             "mcp" in path
-            and path.endswith((".json", ".yaml", ".yml", ".toml", ".md"))
+            and path.endswith(
+                (".json", ".yaml", ".yml", ".toml", ".md")
+            )
             for path in paths
         ):
             mcp_evidence.append(
-                "repository contains an MCP-related configuration/documentation file"
+                "repository contains an MCP-related "
+                "configuration/documentation file"
             )
+
         if any(
             marker in text
             for marker in (
@@ -232,14 +266,20 @@ class GitHubDiscoveryAdapter:
                 "documentation contains MCP protocol/tool evidence"
             )
 
+        # ---------------------------------------------------------
+        # A2A evidence
+        # ---------------------------------------------------------
+
         if (
             "agent card" in text
             or "a2a agent" in text
             or "agent2agent" in text
         ):
             a2a_evidence.append(
-                "repository metadata/documentation mentions A2A/Agent Card"
+                "repository metadata/documentation "
+                "mentions A2A/Agent Card"
             )
+
         if any(
             "agent-card" in path
             or "agent_card" in path
@@ -249,6 +289,7 @@ class GitHubDiscoveryAdapter:
             a2a_evidence.append(
                 "repository contains Agent Card/.well-known evidence"
             )
+
         if any(
             marker in text
             for marker in (
@@ -261,18 +302,29 @@ class GitHubDiscoveryAdapter:
                 "documentation contains A2A protocol evidence"
             )
 
+        # ---------------------------------------------------------
+        # Final classification
+        # ---------------------------------------------------------
+
         if mcp_evidence and not a2a_evidence:
             return ItemType.TOOL, mcp_evidence
+
         if a2a_evidence and not mcp_evidence:
             return ItemType.AGENT, a2a_evidence
+
         if mcp_evidence and a2a_evidence:
             return (
                 ItemType.TOOL,
-                mcp_evidence + ["repository also contains A2A evidence"],
+                mcp_evidence
+                + ["repository also contains A2A evidence"],
             )
+
         return None
 
-    async def _fetch_readme(self, full_name: str) -> str:
+    async def _fetch_readme(
+        self,
+        full_name: str,
+    ) -> str:
         try:
             payload = await self._request(
                 "GET",
@@ -281,9 +333,11 @@ class GitHubDiscoveryAdapter:
         except GitHubAPIError as exc:
             if "HTTP 404" in str(exc):
                 return ""
+
             raise
 
         content = payload.get("content", "")
+
         if not content:
             return ""
 
@@ -303,6 +357,7 @@ class GitHubDiscoveryAdapter:
             "GET",
             f"/repos/{full_name}/contents",
         )
+
         if not isinstance(payload, list):
             return []
 
@@ -334,17 +389,25 @@ class GitHubDiscoveryAdapter:
             ) from exc
 
         if response.status_code in (403, 429):
-            remaining = response.headers.get("X-RateLimit-Remaining")
-            if response.status_code == 429 or remaining == "0":
+            remaining = response.headers.get(
+                "X-RateLimit-Remaining"
+            )
+
+            if (
+                response.status_code == 429
+                or remaining == "0"
+            ):
                 retry_after = (
                     response.headers.get("Retry-After")
                     or response.headers.get("X-RateLimit-Reset")
                 )
+
                 suffix = (
                     f" Retry after: {retry_after}."
                     if retry_after
                     else ""
                 )
+
                 raise GitHubRateLimitError(
                     "GitHub API rate limit reached "
                     f"(HTTP {response.status_code}).{suffix}"
@@ -352,6 +415,7 @@ class GitHubDiscoveryAdapter:
 
         if response.status_code >= 400:
             message = response.text[:500]
+
             raise GitHubAPIError(
                 "GitHub API request failed with "
                 f"HTTP {response.status_code}: {message}"
