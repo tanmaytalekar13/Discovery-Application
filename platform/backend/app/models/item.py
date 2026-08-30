@@ -23,6 +23,7 @@ class SourceType(str, Enum):
     WELL_KNOWN = "well_known"
     CONFIGURED = "configured"
     GITHUB = "github"
+    WEB_SEARCH = "web_search"
 
 
 class Reliability(BaseModel):
