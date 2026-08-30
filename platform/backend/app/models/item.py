@@ -24,6 +24,7 @@ class SourceType(str, Enum):
     CONFIGURED = "configured"
     GITHUB = "github"
     WEB_SEARCH = "web_search"
+    WEB_PAGE = "web_page"
 
 
 class Reliability(BaseModel):
