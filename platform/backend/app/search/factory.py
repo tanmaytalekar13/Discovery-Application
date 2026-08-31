@@ -158,3 +158,14 @@ def build_orchestrator(
         return None
 
     return DiscoveryOrchestrator(mcp_adapter=mcp_adapter, a2a_adapter=a2a_adapter)
+
+
+def build_phase10_pipeline(settings: Settings, db_client):
+    """Construct the Phase 10 persistence pipeline without changing Phase 09 source wiring."""
+    from app.db.repositories import ItemRepository
+    from app.normalization.pipeline import Phase10Pipeline
+
+    return Phase10Pipeline(
+        repository=ItemRepository(db_client),
+        settings=settings,
+    )

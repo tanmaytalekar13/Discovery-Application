@@ -84,6 +84,24 @@ class DiscoveryOrchestrator:
         self._mcp_adapter = mcp_adapter
         self._a2a_adapter = a2a_adapter
 
+    async def discover_and_catalog(
+        self,
+        query: str,
+        *,
+        phase10_pipeline,
+        item_type: str = "all",
+        max_results: int = DEFAULT_MAX_RESULTS,
+    ):
+        """Run Phase 09 discovery and immediately pass candidates through Phase 10.
+
+        The existing ``discover`` contract is intentionally unchanged, so Phase 09
+        callers remain source-aggregation-only. This method is the explicit Phase 10
+        integration boundary and returns both the discovery metadata and catalog result.
+        """
+        discovery = await self.discover(query, item_type=item_type, max_results=max_results)
+        catalog = await phase10_pipeline.process(discovery.candidates)
+        return discovery, catalog
+
     async def discover(
         self,
         query: str,

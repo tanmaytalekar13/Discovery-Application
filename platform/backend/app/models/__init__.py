@@ -1,12 +1,14 @@
 from .item import (
     AgentMetadata,
     ArtifactMetadata,
+    DiscoveryEvidence,
     DiscoveryMetadata,
     DiscoverySource,
     Item,
     ItemStatus,
     ItemType,
     Reliability,
+    ReliabilityEvaluation,
     SourceType,
     ToolMetadata,
 )
@@ -24,6 +26,8 @@ __all__ = [
     "SourceType",
     "Reliability",
     "DiscoverySource",
+    "DiscoveryEvidence",
+    "ReliabilityEvaluation",
     "DiscoveryMetadata",
     "ToolMetadata",
     "AgentMetadata",

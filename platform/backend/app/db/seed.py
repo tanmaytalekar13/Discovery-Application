@@ -1,12 +1,13 @@
 import asyncio
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from app.config import get_settings
 from app.db.client import ArcadeDBClient
 from app.db.repositories import ItemRepository, TestRunRepository
 from app.models import (
     AgentMetadata,
+    DiscoveryEvidence,
     ArtifactMetadata,
     DiscoveryMetadata,
     DiscoverySource,
@@ -39,11 +40,15 @@ async def seed() -> None:
         type=ItemType.TOOL,
         name="search_tracks",
         description="Search Spotify tracks by query.",
+        canonical_id=uuid5(NAMESPACE_URL, "seed:mcp:spotify-mcp-server:search_tracks").hex,
         source=DiscoverySource(
             type=SourceType.MCP_REGISTRY,
             id="spotify-mcp-server",
             url="https://example.com/spotify-mcp",
+            provider="seed",
         ),
+        provenance=[],
+        evidence=[],
         version="1.0.0",
         status=ItemStatus.ACTIVE,
         reliability=Reliability(
@@ -94,11 +99,15 @@ async def seed() -> None:
             "Researches financial information "
             "and produces summaries."
         ),
+        canonical_id=uuid5(NAMESPACE_URL, "seed:a2a:financial-research-agent:https://financial-agent:9000").hex,
         source=DiscoverySource(
             type=SourceType.A2A_CATALOG,
             id="financial-research-agent",
             url="https://example.com/a2a",
+            provider="seed",
         ),
+        provenance=[],
+        evidence=[],
         version="1.0.0",
         status=ItemStatus.ACTIVE,
         reliability=Reliability(

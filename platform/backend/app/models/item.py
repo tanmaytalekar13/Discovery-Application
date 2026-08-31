@@ -38,6 +38,9 @@ class Reliability(BaseModel):
     )
     scoring_version: str = "v1"
     last_evaluated: datetime | None = None
+    security_validation: float = Field(default=0.0, ge=0.0, le=1.0)
+    signals: dict[str, float] = Field(default_factory=dict)
+    reasons: list[str] = Field(default_factory=list)
 
 
 class DiscoveryMetadata(BaseModel):
@@ -50,6 +53,28 @@ class DiscoverySource(BaseModel):
     type: SourceType
     id: str
     url: HttpUrl | None = None
+    provider: str | None = None
+
+
+class DiscoveryEvidence(BaseModel):
+    evidence_id: UUID
+    kind: str
+    statement: str
+    source: DiscoverySource
+    observed_at: datetime
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReliabilityEvaluation(BaseModel):
+    evaluation_id: UUID
+    score: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    scoring_version: str = "v1"
+    approved: bool = False
+    signals: dict[str, float] = Field(default_factory=dict)
+    reasons: list[str] = Field(default_factory=list)
+    security_validation: float = Field(default=0.0, ge=0.0, le=1.0)
+    evaluated_at: datetime
 
 
 class ToolMetadata(BaseModel):
@@ -87,12 +112,15 @@ class ArtifactMetadata(BaseModel):
 
 class Item(BaseModel):
     item_id: UUID
+    canonical_id: str | None = None
 
     type: ItemType
     name: str
     description: str
 
     source: DiscoverySource
+    provenance: list[DiscoverySource] = Field(default_factory=list)
+    evidence: list[DiscoveryEvidence] = Field(default_factory=list)
 
     version: str | None = None
     status: ItemStatus = ItemStatus.ACTIVE
