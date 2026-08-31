@@ -181,6 +181,62 @@ class ItemRepository:
 
         return response.get("count", 0) > 0
 
+    async def search_rankable(
+        self,
+        *,
+        item_type: str = "all",
+        limit: int = 100,
+        keywords: list[str] | tuple[str, ...] = (),
+    ) -> list[Item]:
+        """Fetch active catalog items for Phase 11 semantic/structured ranking."""
+        if item_type not in {"all", "tool", "agent"}:
+            raise ValueError("item_type must be 'all', 'tool', or 'agent'")
+
+        where_clauses = ["status = :status"]
+        params: dict[str, Any] = {
+            "status": "active",
+            "limit": limit,
+        }
+
+        if item_type != "all":
+            where_clauses.append("type = :type")
+            params["type"] = item_type
+
+        cleaned_keywords = [
+            keyword.strip().lower() for keyword in keywords if keyword.strip()
+        ]
+        if cleaned_keywords:
+            keyword_clauses: list[str] = []
+            for index, keyword in enumerate(cleaned_keywords[:10]):
+                key = f"keyword_{index}"
+                params[key] = f"%{keyword}%"
+                keyword_clauses.extend(
+                    [
+                        f"name.toLowerCase() LIKE :{key}",
+                        f"description.toLowerCase() LIKE :{key}",
+                        f"source_id.toLowerCase() LIKE :{key}",
+                    ]
+                )
+            where_clauses.append(f"({' OR '.join(keyword_clauses)})")
+
+        response = await self._db.command(
+            "sql",
+            f"""
+            SELECT FROM Item
+            WHERE {' AND '.join(where_clauses)}
+            LIMIT :limit
+            """,
+            params,
+        )
+
+        return [self._to_item(row) for row in response.get("result", [])]
+
+    async def update_embedding(
+        self, item_id: UUID, embedding: list[float]
+    ) -> Item | None:
+        """Persist a locally generated embedding for an Item."""
+        return await self.update(item_id, {"embedding": embedding})
+
     async def upsert_catalog_item(self, item: Item, evaluation: Any) -> Item:
         """Persist an approved canonical Item and all Phase 10 provenance/evidence."""
         existing = await self.get(item.item_id)

@@ -1,5 +1,10 @@
 from app.config import Settings
-from app.search.factory import build_a2a_adapter, build_mcp_adapter, build_orchestrator
+from app.search.factory import (
+    build_a2a_adapter,
+    build_mcp_adapter,
+    build_orchestrator,
+    build_phase11_search_service,
+)
 
 
 def _settings(**overrides) -> Settings:
@@ -83,3 +88,9 @@ def test_build_orchestrator_combines_both_adapters_when_configured():
     assert orchestrator is not None
     assert orchestrator._mcp_adapter is not None
     assert orchestrator._a2a_adapter is not None
+
+
+def test_build_phase11_search_service_uses_local_embedding_dimensions():
+    service = build_phase11_search_service(_settings(embedding_dimensions=32), object())
+
+    assert service._embedder.dimensions == 32

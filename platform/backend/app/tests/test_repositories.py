@@ -191,6 +191,20 @@ class FakeArcadeDB:
 
         if "SELECT FROM ITEM" in normalized:
             assert params is not None
+            if "item_id" not in params:
+                records = list(self.item_records.values())
+                if "type" in params:
+                    records = [
+                        record for record in records if record["type"] == params["type"]
+                    ]
+                records = [
+                    record
+                    for record in records
+                    if record.get("status", "active") == params["status"]
+                ]
+                return {
+                    "result": records[: params["limit"]],
+                }
 
             record = self.item_records.get(str(params["item_id"]))
 

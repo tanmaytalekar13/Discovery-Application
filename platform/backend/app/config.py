@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     discovery_mode: str = Field(default="mock", pattern="^(mock|live|mixed)$")
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+    query_planner_timeout_seconds: float = Field(default=5.0, gt=0)
+    embedding_dimensions: int = Field(default=64, ge=8, le=2048)
+    ranking_relevance_weight: float = Field(default=0.45, ge=0)
+    ranking_reliability_weight: float = Field(default=0.35, ge=0)
+    ranking_freshness_weight: float = Field(default=0.10, ge=0)
+    ranking_evidence_weight: float = Field(default=0.10, ge=0)
+    ranking_candidate_limit: int = Field(default=100, ge=1, le=500)
 
     # Phase 09: each discovery source is independently enabled/disabled
     # (Section 32/33). A source with no credentials/targets configured

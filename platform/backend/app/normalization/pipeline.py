@@ -21,6 +21,7 @@ from app.models import (
     Reliability,
     ToolMetadata,
 )
+from app.query.embeddings import LocalEmbeddingModel
 from app.reliability.engine import apply_evaluation, evaluate
 
 
@@ -56,12 +57,14 @@ class Phase10Pipeline:
         *,
         mcp_resolver: MCPResolver | None = None,
         a2a_resolver: A2AResolver | None = None,
+        embedder: LocalEmbeddingModel | None = None,
         persist_rejections: bool = True,
     ) -> None:
         self.repository = repository
         self.settings = settings
         self.mcp_resolver = mcp_resolver
         self.a2a_resolver = a2a_resolver
+        self.embedder = embedder or LocalEmbeddingModel(settings.embedding_dimensions)
         self.persist_rejections = persist_rejections
 
     async def process(
@@ -108,6 +111,8 @@ class Phase10Pipeline:
                 if self.persist_rejections:
                     await self.repository.persist_rejection(rejection)
                 continue
+            if item.embedding is None:
+                item.embedding = self.embedder.embed_item(item)
             await self.repository.upsert_catalog_item(item, evaluation)
             persisted.append(item)
 

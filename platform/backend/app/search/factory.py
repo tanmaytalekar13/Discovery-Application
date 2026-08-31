@@ -164,8 +164,23 @@ def build_phase10_pipeline(settings: Settings, db_client):
     """Construct the Phase 10 persistence pipeline without changing Phase 09 source wiring."""
     from app.db.repositories import ItemRepository
     from app.normalization.pipeline import Phase10Pipeline
+    from app.query.embeddings import LocalEmbeddingModel
 
     return Phase10Pipeline(
         repository=ItemRepository(db_client),
         settings=settings,
+        embedder=LocalEmbeddingModel(settings.embedding_dimensions),
+    )
+
+
+def build_phase11_search_service(settings: Settings, db_client):
+    """Construct the Phase 11 planner/embedding/ranking service."""
+    from app.db.repositories import ItemRepository
+    from app.query.embeddings import LocalEmbeddingModel
+    from app.query.service import Phase11SearchService
+
+    return Phase11SearchService(
+        repository=ItemRepository(db_client),
+        settings=settings,
+        embedder=LocalEmbeddingModel(settings.embedding_dimensions),
     )
