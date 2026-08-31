@@ -32,6 +32,10 @@ class FakeArcadeDB:
         self.commands: list[dict] = []
         self.item_records: dict[str, dict] = {}
         self.test_run_records: dict[str, dict] = {}
+        self.discovery_source_records: dict[str, dict] = {}
+        self.discovery_evidence_records: dict[str, dict] = {}
+        self.reliability_evaluation_records: dict[str, dict] = {}
+        self.discovery_rejection_records: dict[str, dict] = {}
         self.edges: list[dict] = []
 
     async def command(
@@ -107,6 +111,45 @@ class FakeArcadeDB:
                 "result": [],
             }
 
+        if normalized.startswith("SELECT @RID FROM DISCOVERYSOURCE"):
+            assert params is not None
+
+            source_key = str(params["value"])
+            if source_key in self.discovery_source_records:
+                return {
+                    "result": [{"@rid": f"#3:{source_key}"}],
+                }
+
+            return {
+                "result": [],
+            }
+
+        if normalized.startswith("SELECT @RID FROM DISCOVERYEVIDENCE"):
+            assert params is not None
+
+            evidence_id = str(params["value"])
+            if evidence_id in self.discovery_evidence_records:
+                return {
+                    "result": [{"@rid": f"#4:{evidence_id}"}],
+                }
+
+            return {
+                "result": [],
+            }
+
+        if normalized.startswith("SELECT @RID FROM RELIABILITYEVALUATION"):
+            assert params is not None
+
+            evaluation_id = str(params["value"])
+            if evaluation_id in self.reliability_evaluation_records:
+                return {
+                    "result": [{"@rid": f"#5:{evaluation_id}"}],
+                }
+
+            return {
+                "result": [],
+            }
+
         # ----------------------------------------------------
         # Item
         # ----------------------------------------------------
@@ -127,18 +170,10 @@ class FakeArcadeDB:
                 "source_url": payload["source_url"],
                 "version": payload["version"],
                 "status": payload["status"],
-                "reliability_score": payload[
-                    "reliability_score"
-                ],
-                "reliability_confidence": payload[
-                    "reliability_confidence"
-                ],
-                "scoring_version": payload[
-                    "scoring_version"
-                ],
-                "last_evaluated": payload[
-                    "last_evaluated"
-                ],
+                "reliability_score": payload["reliability_score"],
+                "reliability_confidence": payload["reliability_confidence"],
+                "scoring_version": payload["scoring_version"],
+                "last_evaluated": payload["last_evaluated"],
                 "first_seen": payload["first_seen"],
                 "last_seen": payload["last_seen"],
                 "last_synced": payload["last_synced"],
@@ -157,9 +192,7 @@ class FakeArcadeDB:
         if "SELECT FROM ITEM" in normalized:
             assert params is not None
 
-            record = self.item_records.get(
-                str(params["item_id"])
-            )
+            record = self.item_records.get(str(params["item_id"]))
 
             return {
                 "result": [record] if record else [],
@@ -201,6 +234,101 @@ class FakeArcadeDB:
             }
 
         # ----------------------------------------------------
+        # Phase 10 provenance/evidence vertices
+        # ----------------------------------------------------
+
+        if "CREATE VERTEX DISCOVERYSOURCE" in normalized:
+            assert params is not None
+
+            payload = params["payload"]
+            record = dict(payload)
+            self.discovery_source_records[str(payload["source_key"])] = record
+
+            return {
+                "result": [record],
+            }
+
+        if "SELECT FROM DISCOVERYSOURCE" in normalized:
+            assert params is not None
+
+            record = self.discovery_source_records.get(str(params["source_key"]))
+            if record is None:
+                return {
+                    "result": [],
+                }
+
+            return {
+                "result": [
+                    {
+                        **record,
+                        "@rid": f"#3:{record['source_key']}",
+                    }
+                ],
+            }
+
+        if "UPDATE DISCOVERYSOURCE" in normalized:
+            assert params is not None
+
+            record = self.discovery_source_records.get(str(params["source_key"]))
+            if record is not None:
+                record["last_seen"] = params["last_seen"]
+
+            return {
+                "result": [record] if record else [],
+            }
+
+        if "CREATE VERTEX DISCOVERYEVIDENCE" in normalized:
+            assert params is not None
+
+            payload = params["payload"]
+            record = dict(payload)
+            self.discovery_evidence_records[str(payload["evidence_id"])] = record
+
+            return {
+                "result": [record],
+            }
+
+        if "SELECT FROM DISCOVERYEVIDENCE" in normalized:
+            assert params is not None
+
+            record = self.discovery_evidence_records.get(str(params["evidence_id"]))
+            if record is None:
+                return {
+                    "result": [],
+                }
+
+            return {
+                "result": [
+                    {
+                        **record,
+                        "@rid": f"#4:{record['evidence_id']}",
+                    }
+                ],
+            }
+
+        if "CREATE VERTEX RELIABILITYEVALUATION" in normalized:
+            assert params is not None
+
+            payload = params["payload"]
+            record = dict(payload)
+            self.reliability_evaluation_records[str(payload["evaluation_id"])] = record
+
+            return {
+                "result": [record],
+            }
+
+        if "CREATE VERTEX DISCOVERYREJECTION" in normalized:
+            assert params is not None
+
+            payload = params["payload"]
+            record = dict(payload)
+            self.discovery_rejection_records[str(payload["rejection_id"])] = record
+
+            return {
+                "result": [record],
+            }
+
+        # ----------------------------------------------------
         # TestRun
         # ----------------------------------------------------
 
@@ -216,9 +344,7 @@ class FakeArcadeDB:
             output_data = dict(payload["output"])
             output_data.pop("@type", None)
 
-            dependencies_data = dict(
-                payload["dependencies"]
-            )
+            dependencies_data = dict(payload["dependencies"])
             dependencies_data.pop("@type", None)
 
             record = {
@@ -245,9 +371,7 @@ class FakeArcadeDB:
         if "SELECT FROM TESTRUN" in normalized:
             assert params is not None
 
-            record = self.test_run_records.get(
-                str(params["run_id"])
-            )
+            record = self.test_run_records.get(str(params["run_id"]))
 
             return {
                 "result": [record] if record else [],
@@ -288,9 +412,7 @@ class FakeArcadeDB:
                 "count": 0,
             }
 
-        raise AssertionError(
-            f"Unexpected ArcadeDB command:\n{command}"
-        )
+        raise AssertionError(f"Unexpected ArcadeDB command:\n{command}")
 
 
 @pytest.fixture
@@ -342,12 +464,9 @@ def tool_item() -> Item:
         ),
         artifacts=ArtifactMetadata(
             source_available=True,
-            source_url=(
-                "https://example.com/spotify-mcp/source"
-            ),
+            source_url=("https://example.com/spotify-mcp/source"),
             source_code=(
-                "def search_tracks(query: str):\n"
-                "    return search_spotify(query)\n"
+                "def search_tracks(query: str):\n" "    return search_spotify(query)\n"
             ),
         ),
     )
@@ -361,10 +480,7 @@ def agent_item() -> Item:
         item_id=uuid4(),
         type=ItemType.AGENT,
         name="Financial Research Agent",
-        description=(
-            "Researches financial information "
-            "and produces summaries."
-        ),
+        description=("Researches financial information " "and produces summaries."),
         source=DiscoverySource(
             type=SourceType.A2A_CATALOG,
             id="financial-research-agent",
@@ -387,9 +503,7 @@ def agent_item() -> Item:
             endpoint="http://financial-agent:9000",
             agent_card={
                 "name": "Financial Research Agent",
-                "description": (
-                    "Researches financial information."
-                ),
+                "description": ("Researches financial information."),
             },
             skills=[
                 "financial-research",
@@ -438,9 +552,7 @@ async def test_create_item(
     assert result.item_id == tool_item.item_id
     assert result.name == "search_tracks"
 
-    stored = fake_db.item_records[
-        str(tool_item.item_id)
-    ]
+    stored = fake_db.item_records[str(tool_item.item_id)]
 
     assert stored["type"] == "tool"
     assert stored["name"] == "search_tracks"
@@ -458,9 +570,7 @@ async def test_get_item(
 
     await repository.create(tool_item)
 
-    result = await repository.get(
-        tool_item.item_id
-    )
+    result = await repository.get(tool_item.item_id)
 
     assert result is not None
     assert result.item_id == tool_item.item_id
@@ -552,15 +662,11 @@ async def test_delete_item(
 
     await repository.create(tool_item)
 
-    deleted = await repository.delete(
-        tool_item.item_id
-    )
+    deleted = await repository.delete(tool_item.item_id)
 
     assert deleted is True
 
-    result = await repository.get(
-        tool_item.item_id
-    )
+    result = await repository.get(tool_item.item_id)
 
     assert result is None
 
@@ -592,22 +698,50 @@ async def test_create_agent_item(
 
     assert result.type == ItemType.AGENT
 
-    stored = fake_db.item_records[
-        str(agent_item.item_id)
-    ]
+    stored = fake_db.item_records[str(agent_item.item_id)]
 
     assert stored["agent"] is not None
 
     # Pydantic HttpUrl normalizes the URL with a trailing slash.
-    assert (
-        stored["agent"]["endpoint"]
-        == "http://financial-agent:9000/"
-    )
+    assert stored["agent"]["endpoint"] == "http://financial-agent:9000/"
 
     assert stored["agent"]["skills"] == [
         "financial-research",
         "market-summary",
     ]
+
+
+@pytest.mark.asyncio
+async def test_upsert_catalog_item_persists_new_phase10_record(
+    fake_db: FakeArcadeDB,
+    tool_item: Item,
+) -> None:
+    repository = ItemRepository(fake_db)
+    tool_item.provenance = [tool_item.source]
+
+    class Evaluation:
+        score = 0.91
+        confidence = 0.88
+        approved = True
+        signals = {"protocol_validation": 1.0}
+        reasons = ["protocol validation succeeded"]
+        security_validation = 1.0
+
+    await repository.upsert_catalog_item(tool_item, Evaluation())
+
+    stored = fake_db.item_records[str(tool_item.item_id)]
+    assert stored["item_id"] == str(tool_item.item_id)
+    assert stored["name"] == "search_tracks"
+    assert fake_db.discovery_source_records
+    assert fake_db.reliability_evaluation_records
+
+    edge_commands = [edge["command"] for edge in fake_db.edges]
+    assert any(
+        "CREATE EDGE HAS_DISCOVERY_SOURCE" in command for command in edge_commands
+    )
+    assert any(
+        "CREATE EDGE HAS_RELIABILITY_EVALUATION" in command for command in edge_commands
+    )
 
 
 # ============================================================
@@ -638,19 +772,13 @@ async def test_create_uses_tool_edge(
 
     edge = fake_db.edges[0]
 
-    assert "CREATE EDGE USES_TOOL" in edge[
-        "command"
-    ]
+    assert "CREATE EDGE USES_TOOL" in edge["command"]
 
     # create_edge resolves logical ids to @rid values and
     # embeds them directly in the SQL text (no bind params).
-    assert f"#1:{agent_item.item_id}" in edge[
-        "command"
-    ]
+    assert f"#1:{agent_item.item_id}" in edge["command"]
 
-    assert f"#1:{tool_item.item_id}" in edge[
-        "command"
-    ]
+    assert f"#1:{tool_item.item_id}" in edge["command"]
 
 
 @pytest.mark.asyncio
@@ -663,9 +791,7 @@ async def test_create_test_run_edge(
 
     await repository.create(tool_item)
 
-    test_run_repository = TestRunRepo(
-        fake_db
-    )
+    test_run_repository = TestRunRepo(fake_db)
 
     await test_run_repository.create(test_run)
 
@@ -682,19 +808,13 @@ async def test_create_test_run_edge(
 
     edge = fake_db.edges[0]
 
-    assert "CREATE EDGE HAS_TEST_RUN" in edge[
-        "command"
-    ]
+    assert "CREATE EDGE HAS_TEST_RUN" in edge["command"]
 
     # create_edge resolves logical ids to @rid values and
     # embeds them directly in the SQL text (no bind params).
-    assert f"#1:{tool_item.item_id}" in edge[
-        "command"
-    ]
+    assert f"#1:{tool_item.item_id}" in edge["command"]
 
-    assert f"#2:{test_run.run_id}" in edge[
-        "command"
-    ]
+    assert f"#2:{test_run.run_id}" in edge["command"]
 
 
 @pytest.mark.asyncio
@@ -712,6 +832,39 @@ async def test_create_edge_rejects_unknown_edge(
             to_type="Item",
             to_id=uuid4(),
         )
+
+
+@pytest.mark.asyncio
+async def test_create_phase10_discovery_edge(
+    fake_db: FakeArcadeDB,
+    tool_item: Item,
+) -> None:
+    repository = ItemRepository(fake_db)
+
+    await repository.create(tool_item)
+
+    source_key = "mcp_registry|spotify-mcp-server|https://example.com/spotify-mcp|None"
+    fake_db.discovery_source_records[source_key] = {
+        "source_key": source_key,
+        "source_type": "mcp_registry",
+        "source_id": "spotify-mcp-server",
+        "source_url": "https://example.com/spotify-mcp",
+        "provider": None,
+        "first_seen": "2026-08-31T00:00:00+00:00",
+        "last_seen": "2026-08-31T00:00:00+00:00",
+    }
+
+    await repository.create_edge(
+        edge_type="HAS_DISCOVERY_SOURCE",
+        from_type="Item",
+        from_id=tool_item.item_id,
+        to_type="DiscoverySource",
+        to_id=source_key,
+        to_field="source_key",
+    )
+
+    assert len(fake_db.edges) == 1
+    assert "CREATE EDGE HAS_DISCOVERY_SOURCE" in fake_db.edges[0]["command"]
 
 
 @pytest.mark.asyncio
@@ -766,13 +919,9 @@ async def test_create_test_run(
     assert result.item_id == test_run.item_id
     assert result.status == TestRunStatusModel.RUNNING
 
-    stored = fake_db.test_run_records[
-        str(test_run.run_id)
-    ]
+    stored = fake_db.test_run_records[str(test_run.run_id)]
 
-    assert stored["item_id"] == str(
-        test_run.item_id
-    )
+    assert stored["item_id"] == str(test_run.item_id)
 
     assert stored["status"] == "running"
 
@@ -786,9 +935,7 @@ async def test_get_test_run(
 
     await repository.create(test_run)
 
-    result = await repository.get(
-        test_run.run_id
-    )
+    result = await repository.get(test_run.run_id)
 
     assert result is not None
     assert result.run_id == test_run.run_id
@@ -880,15 +1027,11 @@ async def test_delete_test_run(
 
     await repository.create(test_run)
 
-    deleted = await repository.delete(
-        test_run.run_id
-    )
+    deleted = await repository.delete(test_run.run_id)
 
     assert deleted is True
 
-    result = await repository.get(
-        test_run.run_id
-    )
+    result = await repository.get(test_run.run_id)
 
     assert result is None
 

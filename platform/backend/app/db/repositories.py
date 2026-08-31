@@ -5,11 +5,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from app.db.client import ArcadeDBClient
-from app.models import DiscoveryEvidence, DiscoverySource, Item, ReliabilityEvaluation, TestRun
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from app.normalization.pipeline import Rejection
+from app.models import DiscoveryEvidence, DiscoverySource, Item, TestRun
 
 
 def _prepare_value(value: Any) -> Any:
@@ -35,6 +31,9 @@ class ItemRepository:
     ALLOWED_EDGE_TYPES = {
         "USES_TOOL",
         "HAS_TEST_RUN",
+        "HAS_DISCOVERY_SOURCE",
+        "HAS_DISCOVERY_EVIDENCE",
+        "HAS_RELIABILITY_EVALUATION",
     }
 
     ALLOWED_VERTEX_TYPES = {
@@ -47,11 +46,32 @@ class ItemRepository:
     }
 
     ALLOWED_UPDATE_FIELDS = {
-        "canonical_id", "type", "name", "description", "source_type", "source_id",
-        "source_url", "source_provider", "provenance", "evidence_summary", "version", "status", "reliability_score",
-        "reliability_confidence", "security_validation", "reliability_signals", "reliability_reasons", "scoring_version", "last_evaluated",
-        "first_seen", "last_seen", "last_synced", "tool", "agent",
-        "artifacts", "embedding",
+        "canonical_id",
+        "type",
+        "name",
+        "description",
+        "source_type",
+        "source_id",
+        "source_url",
+        "source_provider",
+        "provenance",
+        "evidence_summary",
+        "version",
+        "status",
+        "reliability_score",
+        "reliability_confidence",
+        "security_validation",
+        "reliability_signals",
+        "reliability_reasons",
+        "scoring_version",
+        "last_evaluated",
+        "first_seen",
+        "last_seen",
+        "last_synced",
+        "tool",
+        "agent",
+        "artifacts",
+        "embedding",
     }
 
     def __init__(self, db: ArcadeDBClient) -> None:
@@ -65,17 +85,18 @@ class ItemRepository:
             "type": item.type.value,
             "name": item.name,
             "description": item.description,
-            
             "source_type": item.source.type.value,
             "source_id": item.source.id,
             "source_url": str(item.source.url) if item.source.url else None,
             "source_provider": item.source.provider,
-            "provenance": [source.model_dump(mode="json") for source in item.provenance],
-            "evidence_summary": [evidence.model_dump(mode="json") for evidence in item.evidence],
-            
+            "provenance": [
+                source.model_dump(mode="json") for source in item.provenance
+            ],
+            "evidence_summary": [
+                evidence.model_dump(mode="json") for evidence in item.evidence
+            ],
             "version": item.version,
             "status": item.status.value,
-            
             "reliability_score": item.reliability.score,
             "reliability_confidence": item.reliability.confidence,
             "security_validation": item.reliability.security_validation,
@@ -83,11 +104,9 @@ class ItemRepository:
             "reliability_reasons": item.reliability.reasons,
             "scoring_version": item.reliability.scoring_version,
             "last_evaluated": _prepare_value(item.reliability.last_evaluated),
-            
             "first_seen": _prepare_value(item.discovery.first_seen),
             "last_seen": _prepare_value(item.discovery.last_seen),
             "last_synced": _prepare_value(item.discovery.last_synced),
-            
             # IMPORTANT:
             # These are embedded maps, not ArcadeDB schema types.
             # Do NOT add @type here.
@@ -134,7 +153,7 @@ class ItemRepository:
         set_clauses = [f"{field} = :{field}" for field in updates]
         params = {
             "item_id": str(item_id),
-            **{key: _prepare_value(value) for key, value in updates.items()}
+            **{key: _prepare_value(value) for key, value in updates.items()},
         }
 
         await self._db.command(
@@ -162,11 +181,11 @@ class ItemRepository:
 
         return response.get("count", 0) > 0
 
-
     async def upsert_catalog_item(self, item: Item, evaluation: Any) -> Item:
         """Persist an approved canonical Item and all Phase 10 provenance/evidence."""
         existing = await self.get(item.item_id)
         payload = {
+            "item_id": str(item.item_id),
             "canonical_id": item.canonical_id,
             "type": item.type.value,
             "name": item.name,
@@ -195,48 +214,137 @@ class ItemRepository:
             "embedding": item.embedding,
         }
         if existing is None:
-            await self._db.command("sql", "CREATE VERTEX Item CONTENT :payload", {"payload": payload})
+            await self._db.command(
+                "sql", "CREATE VERTEX Item CONTENT :payload", {"payload": payload}
+            )
         else:
             updates = {key: value for key, value in payload.items()}
             await self.update(item.item_id, updates)
         item_rid = await self._get_record_rid("Item", "item_id", item.item_id)
         for source in item.provenance:
-            source_key = f"{source.type.value}|{source.id}|{source.url}|{source.provider}"
-            await self._upsert_source(item_rid, source_key, source, item.discovery.last_seen)
+            source_key = (
+                f"{source.type.value}|{source.id}|{source.url}|{source.provider}"
+            )
+            await self._upsert_source(
+                item_rid, source_key, source, item.discovery.last_seen
+            )
         for evidence in item.evidence:
             await self._upsert_evidence(item_rid, item.item_id, evidence)
         await self._upsert_reliability_evaluation(item_rid, item.item_id, evaluation)
         return item
 
-    async def _upsert_source(self, item_rid: str, source_key: str, source: DiscoverySource, observed_at: datetime) -> None:
-        found = await self._db.command("sql", "SELECT FROM DiscoverySource WHERE source_key = :source_key LIMIT 1", {"source_key": source_key})
+    async def _upsert_source(
+        self,
+        item_rid: str,
+        source_key: str,
+        source: DiscoverySource,
+        observed_at: datetime,
+    ) -> None:
+        found = await self._db.command(
+            "sql",
+            "SELECT FROM DiscoverySource WHERE source_key = :source_key LIMIT 1",
+            {"source_key": source_key},
+        )
         rows = found.get("result", [])
         if rows:
             source_rid = str(rows[0]["@rid"])
+            await self._db.command(
+                "sql",
+                "UPDATE DiscoverySource SET last_seen = :last_seen WHERE source_key = :source_key",
+                {
+                    "source_key": source_key,
+                    "last_seen": _prepare_value(observed_at),
+                },
+            )
         else:
-            payload = {"source_key": source_key, "source_type": source.type.value, "source_id": source.id, "source_url": str(source.url) if source.url else None, "provider": source.provider, "first_seen": _prepare_value(observed_at), "last_seen": _prepare_value(observed_at)}
-            await self._db.command("sql", "CREATE VERTEX DiscoverySource CONTENT :payload", {"payload": payload})
-            source_rid = await self._get_record_rid("DiscoverySource", "source_key", source_key)
-        await self._db.command("sql", f"CREATE EDGE HAS_DISCOVERY_SOURCE FROM {item_rid} TO {source_rid} IF NOT EXISTS")
+            payload = {
+                "source_key": source_key,
+                "source_type": source.type.value,
+                "source_id": source.id,
+                "source_url": str(source.url) if source.url else None,
+                "provider": source.provider,
+                "first_seen": _prepare_value(observed_at),
+                "last_seen": _prepare_value(observed_at),
+            }
+            await self._db.command(
+                "sql",
+                "CREATE VERTEX DiscoverySource CONTENT :payload",
+                {"payload": payload},
+            )
+            source_rid = await self._get_record_rid(
+                "DiscoverySource", "source_key", source_key
+            )
+        await self._db.command(
+            "sql",
+            f"CREATE EDGE HAS_DISCOVERY_SOURCE FROM {item_rid} TO {source_rid} IF NOT EXISTS",
+        )
 
-    async def _upsert_evidence(self, item_rid: str, item_id: UUID, evidence: DiscoveryEvidence) -> None:
+    async def _upsert_evidence(
+        self, item_rid: str, item_id: UUID, evidence: DiscoveryEvidence
+    ) -> None:
         evidence_id = str(evidence.evidence_id)
-        found = await self._db.command("sql", "SELECT FROM DiscoveryEvidence WHERE evidence_id = :evidence_id LIMIT 1", {"evidence_id": evidence_id})
+        found = await self._db.command(
+            "sql",
+            "SELECT FROM DiscoveryEvidence WHERE evidence_id = :evidence_id LIMIT 1",
+            {"evidence_id": evidence_id},
+        )
         rows = found.get("result", [])
         if rows:
             evidence_rid = str(rows[0]["@rid"])
         else:
-            payload = {"evidence_id": evidence_id, "item_id": str(item_id), "kind": evidence.kind, "statement": evidence.statement, "source_type": evidence.source.type.value, "source_id": evidence.source.id, "source_url": str(evidence.source.url) if evidence.source.url else None, "provider": evidence.source.provider, "observed_at": _prepare_value(evidence.observed_at), "details": evidence.details}
-            await self._db.command("sql", "CREATE VERTEX DiscoveryEvidence CONTENT :payload", {"payload": payload})
-            evidence_rid = await self._get_record_rid("DiscoveryEvidence", "evidence_id", evidence_id)
-        await self._db.command("sql", f"CREATE EDGE HAS_DISCOVERY_EVIDENCE FROM {item_rid} TO {evidence_rid} IF NOT EXISTS")
+            payload = {
+                "evidence_id": evidence_id,
+                "item_id": str(item_id),
+                "kind": evidence.kind,
+                "statement": evidence.statement,
+                "source_type": evidence.source.type.value,
+                "source_id": evidence.source.id,
+                "source_url": str(evidence.source.url) if evidence.source.url else None,
+                "provider": evidence.source.provider,
+                "observed_at": _prepare_value(evidence.observed_at),
+                "details": evidence.details,
+            }
+            await self._db.command(
+                "sql",
+                "CREATE VERTEX DiscoveryEvidence CONTENT :payload",
+                {"payload": payload},
+            )
+            evidence_rid = await self._get_record_rid(
+                "DiscoveryEvidence", "evidence_id", evidence_id
+            )
+        await self._db.command(
+            "sql",
+            f"CREATE EDGE HAS_DISCOVERY_EVIDENCE FROM {item_rid} TO {evidence_rid} IF NOT EXISTS",
+        )
 
-    async def _upsert_reliability_evaluation(self, item_rid: str, item_id: UUID, evaluation: Any) -> None:
+    async def _upsert_reliability_evaluation(
+        self, item_rid: str, item_id: UUID, evaluation: Any
+    ) -> None:
         evaluation_id = str(uuid4())
-        payload = {"evaluation_id": evaluation_id, "item_id": str(item_id), "score": evaluation.score, "confidence": evaluation.confidence, "scoring_version": "v1", "approved": evaluation.approved, "signals": evaluation.signals, "reasons": evaluation.reasons, "security_validation": evaluation.security_validation, "evaluated_at": datetime.now().isoformat()}
-        await self._db.command("sql", "CREATE VERTEX ReliabilityEvaluation CONTENT :payload", {"payload": payload})
-        evaluation_rid = await self._get_record_rid("ReliabilityEvaluation", "evaluation_id", evaluation_id)
-        await self._db.command("sql", f"CREATE EDGE HAS_RELIABILITY_EVALUATION FROM {item_rid} TO {evaluation_rid} IF NOT EXISTS")
+        payload = {
+            "evaluation_id": evaluation_id,
+            "item_id": str(item_id),
+            "score": evaluation.score,
+            "confidence": evaluation.confidence,
+            "scoring_version": "v1",
+            "approved": evaluation.approved,
+            "signals": evaluation.signals,
+            "reasons": evaluation.reasons,
+            "security_validation": evaluation.security_validation,
+            "evaluated_at": datetime.now().isoformat(),
+        }
+        await self._db.command(
+            "sql",
+            "CREATE VERTEX ReliabilityEvaluation CONTENT :payload",
+            {"payload": payload},
+        )
+        evaluation_rid = await self._get_record_rid(
+            "ReliabilityEvaluation", "evaluation_id", evaluation_id
+        )
+        await self._db.command(
+            "sql",
+            f"CREATE EDGE HAS_RELIABILITY_EVALUATION FROM {item_rid} TO {evaluation_rid} IF NOT EXISTS",
+        )
 
     async def persist_rejection(self, rejection: Any) -> None:
         payload = {
@@ -253,9 +361,15 @@ class ItemRepository:
             "details": rejection.details,
             "observed_at": _prepare_value(rejection.observed_at),
         }
-        await self._db.command("sql", "CREATE VERTEX DiscoveryRejection CONTENT :payload", {"payload": payload})
+        await self._db.command(
+            "sql",
+            "CREATE VERTEX DiscoveryRejection CONTENT :payload",
+            {"payload": payload},
+        )
 
-    async def _get_record_rid(self, record_type: str, field: str, value: UUID | str) -> str:
+    async def _get_record_rid(
+        self, record_type: str, field: str, value: UUID | str
+    ) -> str:
         """Resolve a logical identifier to an ArcadeDB @rid."""
         if record_type not in self.ALLOWED_VERTEX_TYPES:
             raise ValueError(f"Unsupported vertex type: {record_type}")
@@ -277,7 +391,9 @@ class ItemRepository:
 
         rid = rows[0].get("@rid")
         if not rid:
-            raise ValueError(f"ArcadeDB did not return @rid for {record_type}.{field}={value}")
+            raise ValueError(
+                f"ArcadeDB did not return @rid for {record_type}.{field}={value}"
+            )
 
         return str(rid)
 
@@ -320,49 +436,60 @@ class ItemRepository:
     @staticmethod
     def _to_item(row: dict[str, Any]) -> Item:
         """Map an ArcadeDB Item record to the Pydantic model."""
-        return Item.model_validate({
-            "item_id": row["item_id"],
-            "canonical_id": row.get("canonical_id"),
-            "type": row["type"],
-            "name": row["name"],
-            "description": row["description"],
-            "source": {
-                "type": row["source_type"],
-                "id": row["source_id"],
-                "url": row.get("source_url"),
-                "provider": row.get("source_provider"),
-            },
-            "version": row.get("version"),
-            "status": row.get("status", "active"),
-            "reliability": {
-                "score": row.get("reliability_score", 0.0),
-                "confidence": row.get("reliability_confidence", 0.0),
-                "scoring_version": row.get("scoring_version", "v1"),
-                "last_evaluated": row.get("last_evaluated"),
-                "security_validation": row.get("security_validation", 0.0),
-                "signals": row.get("reliability_signals", {}),
-                "reasons": row.get("reliability_reasons", []),
-            },
-            "discovery": {
-                "first_seen": row["first_seen"],
-                "last_seen": row["last_seen"],
-                "last_synced": row["last_synced"],
-            },
-            "tool": row.get("tool"),
-            "agent": row.get("agent"),
-            "artifacts": row.get("artifacts", {}),
-            "provenance": row.get("provenance", []),
-            "evidence": row.get("evidence_summary", []),
-            "embedding": row.get("embedding"),
-        })
+        return Item.model_validate(
+            {
+                "item_id": row["item_id"],
+                "canonical_id": row.get("canonical_id"),
+                "type": row["type"],
+                "name": row["name"],
+                "description": row["description"],
+                "source": {
+                    "type": row["source_type"],
+                    "id": row["source_id"],
+                    "url": row.get("source_url"),
+                    "provider": row.get("source_provider"),
+                },
+                "version": row.get("version"),
+                "status": row.get("status", "active"),
+                "reliability": {
+                    "score": row.get("reliability_score", 0.0),
+                    "confidence": row.get("reliability_confidence", 0.0),
+                    "scoring_version": row.get("scoring_version", "v1"),
+                    "last_evaluated": row.get("last_evaluated"),
+                    "security_validation": row.get("security_validation", 0.0),
+                    "signals": row.get("reliability_signals", {}),
+                    "reasons": row.get("reliability_reasons", []),
+                },
+                "discovery": {
+                    "first_seen": row["first_seen"],
+                    "last_seen": row["last_seen"],
+                    "last_synced": row["last_synced"],
+                },
+                "tool": row.get("tool"),
+                "agent": row.get("agent"),
+                "artifacts": row.get("artifacts", {}),
+                "provenance": row.get("provenance", []),
+                "evidence": row.get("evidence_summary", []),
+                "embedding": row.get("embedding"),
+            }
+        )
 
 
 class TestRunRepository:
     """Repository for managing TestRun vertices."""
 
     ALLOWED_UPDATE_FIELDS = {
-        "item_id", "type", "started_at", "completed_at", "status",
-        "input", "output", "duration_ms", "errors", "logs", "dependencies",
+        "item_id",
+        "type",
+        "started_at",
+        "completed_at",
+        "status",
+        "input",
+        "output",
+        "duration_ms",
+        "errors",
+        "logs",
+        "dependencies",
     }
 
     def __init__(self, db: ArcadeDBClient) -> None:
@@ -374,16 +501,13 @@ class TestRunRepository:
             "run_id": str(test_run.run_id),
             "item_id": str(test_run.item_id),
             "type": test_run.type,
-            
             "started_at": _prepare_value(test_run.started_at),
             "completed_at": _prepare_value(test_run.completed_at),
-            
             "status": (
                 test_run.status.value
                 if hasattr(test_run.status, "value")
                 else test_run.status
             ),
-            
             "input": test_run.input,
             "output": test_run.output,
             "duration_ms": test_run.duration_ms,
@@ -391,7 +515,8 @@ class TestRunRepository:
             "logs": test_run.logs,
             "dependencies": (
                 test_run.dependencies.model_dump(mode="json")
-                if test_run.dependencies else {}
+                if test_run.dependencies
+                else {}
             ),
         }
 
@@ -432,7 +557,7 @@ class TestRunRepository:
         set_clauses = [f"{field} = :{field}" for field in updates]
         params = {
             "run_id": str(run_id),
-            **{key: _prepare_value(value) for key, value in updates.items()}
+            **{key: _prepare_value(value) for key, value in updates.items()},
         }
 
         await self._db.command(
@@ -463,18 +588,20 @@ class TestRunRepository:
     @staticmethod
     def _to_test_run(row: dict[str, Any]) -> TestRun:
         """Map an ArcadeDB TestRun record to the Pydantic model."""
-        return TestRun.model_validate({
-            "run_id": row["run_id"],
-            "item_id": row["item_id"],
-            "canonical_id": row.get("canonical_id"),
-            "type": row["type"],
-            "started_at": row["started_at"],
-            "completed_at": row.get("completed_at"),
-            "status": row.get("status", "running"),
-            "input": row.get("input", {}),
-            "output": row.get("output", {}),
-            "duration_ms": row.get("duration_ms"),
-            "errors": row.get("errors", []),
-            "logs": row.get("logs", []),
-            "dependencies": row.get("dependencies", {}),
-        })
+        return TestRun.model_validate(
+            {
+                "run_id": row["run_id"],
+                "item_id": row["item_id"],
+                "canonical_id": row.get("canonical_id"),
+                "type": row["type"],
+                "started_at": row["started_at"],
+                "completed_at": row.get("completed_at"),
+                "status": row.get("status", "running"),
+                "input": row.get("input", {}),
+                "output": row.get("output", {}),
+                "duration_ms": row.get("duration_ms"),
+                "errors": row.get("errors", []),
+                "logs": row.get("logs", []),
+                "dependencies": row.get("dependencies", {}),
+            }
+        )

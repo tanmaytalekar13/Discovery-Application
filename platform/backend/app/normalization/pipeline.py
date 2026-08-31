@@ -19,13 +19,18 @@ from app.models import (
     ItemStatus,
     ItemType,
     Reliability,
-    SourceType,
     ToolMetadata,
 )
-from app.reliability.engine import ReliabilityEvaluationResult, apply_evaluation, evaluate
+from app.reliability.engine import apply_evaluation, evaluate
 
 
-MCPResolver = Callable[[CandidateReference], Awaitable[dict[str, Any] | list[dict[str, Any]] | None] | dict[str, Any] | list[dict[str, Any]] | None]
+MCPResolver = Callable[
+    [CandidateReference],
+    Awaitable[dict[str, Any] | list[dict[str, Any]] | None]
+    | dict[str, Any]
+    | list[dict[str, Any]]
+    | None,
+]
 A2AResolver = Callable[[CandidateReference], Awaitable[dict[str, Any]] | dict[str, Any]]
 
 
@@ -59,7 +64,9 @@ class Phase10Pipeline:
         self.a2a_resolver = a2a_resolver
         self.persist_rejections = persist_rejections
 
-    async def process(self, candidates: list[CandidateReference] | tuple[CandidateReference, ...]) -> "Phase10Result":
+    async def process(
+        self, candidates: list[CandidateReference] | tuple[CandidateReference, ...]
+    ) -> "Phase10Result":
         approved: list[Item] = []
         rejected: list[Rejection] = []
         resolved = 0
@@ -70,12 +77,16 @@ class Phase10Pipeline:
                 resolved += 1
                 approved.extend(items)
             except CandidateRejected as exc:
-                rejection = Rejection.from_candidate(candidate, exc.reason, exc.evidence)
+                rejection = Rejection.from_candidate(
+                    candidate, exc.reason, exc.evidence
+                )
                 rejected.append(rejection)
                 if self.persist_rejections:
                     await self.repository.persist_rejection(rejection)
             except Exception as exc:
-                rejection = Rejection.from_candidate(candidate, "unexpected normalization/resolution failure", [str(exc)])
+                rejection = Rejection.from_candidate(
+                    candidate, "unexpected normalization/resolution failure", [str(exc)]
+                )
                 rejected.append(rejection)
                 if self.persist_rejections:
                     await self.repository.persist_rejection(rejection)
@@ -83,10 +94,16 @@ class Phase10Pipeline:
         deduplicated = self._deduplicate(approved)
         persisted: list[Item] = []
         for item in deduplicated:
-            evaluation = evaluate(item, self.settings, protocol_validated=True, available=True)
+            evaluation = evaluate(
+                item, self.settings, protocol_validated=True, available=True
+            )
             apply_evaluation(item, evaluation)
             if not evaluation.approved:
-                rejection = Rejection.from_item(item, "reliability score below approval threshold", evaluation.reasons)
+                rejection = Rejection.from_item(
+                    item,
+                    "reliability score below approval threshold",
+                    evaluation.reasons,
+                )
                 rejected.append(rejection)
                 if self.persist_rejections:
                     await self.repository.persist_rejection(rejection)
@@ -107,7 +124,9 @@ class Phase10Pipeline:
             return [await self._normalize_a2a(candidate)]
         if candidate.protocol == "mcp":
             return await self._normalize_mcp(candidate)
-        raise CandidateRejected("unsupported protocol", [f"protocol={candidate.protocol}"])
+        raise CandidateRejected(
+            "unsupported protocol", [f"protocol={candidate.protocol}"]
+        )
 
     async def _normalize_a2a(self, candidate: CandidateReference) -> Item:
         resolution = self._extract_a2a_resolution(candidate)
@@ -116,20 +135,42 @@ class Phase10Pipeline:
         if resolution is None:
             resolution = await self._resolve_a2a_with_existing_client(candidate)
         if not resolution:
-            raise CandidateRejected("A2A Agent Card could not be resolved and validated", list(candidate.evidence) or ["no Agent Card resolution available"])
+            raise CandidateRejected(
+                "A2A Agent Card could not be resolved and validated",
+                list(candidate.evidence) or ["no Agent Card resolution available"],
+            )
 
         agent = resolution.get("agent") or {}
-        endpoint = resolution.get("endpoint") or agent.get("endpoint") or str(candidate.url or "")
+        endpoint = (
+            resolution.get("endpoint")
+            or agent.get("endpoint")
+            or str(candidate.url or "")
+        )
         if not endpoint:
-            raise CandidateRejected("validated A2A Agent Card did not declare an endpoint")
+            raise CandidateRejected(
+                "validated A2A Agent Card did not declare an endpoint"
+            )
         card = resolution.get("raw_agent_card") or resolution.get("agent_card") or {}
         identity = str(card.get("name") or candidate.source_id)
         version = card.get("version") or resolution.get("protocol_version")
         now = datetime.now(timezone.utc)
         source = _source(candidate)
-        evidence = _evidence(candidate, source, now, "discovery", list(candidate.evidence))
-        evidence.append(_new_evidence(candidate, source, now, "protocol_validation", "A2A Agent Card fetched and schema-validated", {"protocol_version": resolution.get("protocol_version")}))
-        canonical = canonical_identity(candidate, {"agent_identity": identity, "endpoint": endpoint})
+        evidence = _evidence(
+            candidate, source, now, "discovery", list(candidate.evidence)
+        )
+        evidence.append(
+            _new_evidence(
+                candidate,
+                source,
+                now,
+                "protocol_validation",
+                "A2A Agent Card fetched and schema-validated",
+                {"protocol_version": resolution.get("protocol_version")},
+            )
+        )
+        canonical = canonical_identity(
+            candidate, {"agent_identity": identity, "endpoint": endpoint}
+        )
         item = Item(
             item_id=uuid5(NAMESPACE_URL, f"phase10:{canonical}"),
             canonical_id=canonical,
@@ -150,7 +191,10 @@ class Phase10Pipeline:
                 capabilities=list(agent.get("capabilities") or []),
                 declared_dependencies=list(agent.get("declared_dependencies") or []),
             ),
-            artifacts=ArtifactMetadata(source_available=bool(candidate.repository_url), source_url=candidate.repository_url),
+            artifacts=ArtifactMetadata(
+                source_available=bool(candidate.repository_url),
+                source_url=candidate.repository_url,
+            ),
         )
         return item
 
@@ -163,7 +207,8 @@ class Phase10Pipeline:
         if resolution is None:
             raise CandidateRejected(
                 "MCP candidate could not be protocol-validated; initialize/tools/list requires a resolvable stdio transport",
-                list(candidate.evidence) + ["MCP Registry metadata alone is not proof of an executable server"],
+                list(candidate.evidence)
+                + ["MCP Registry metadata alone is not proof of an executable server"],
             )
         if isinstance(resolution, dict):
             tools = resolution.get("tools")
@@ -186,52 +231,111 @@ class Phase10Pipeline:
             version = server_info.get("version") or _candidate_version(candidate)
             schema = tool.get("mcp_schema") or tool.get("inputSchema") or {}
             if not isinstance(schema, dict):
-                raise CandidateRejected(f"MCP tool '{tool_name}' has invalid input schema")
-            evidence = _evidence(candidate, source, now, "discovery", list(candidate.evidence))
-            evidence.append(_new_evidence(candidate, source, now, "protocol_validation", f"MCP initialize and tools/list validated tool '{tool_name}'", {"server": server_id}))
-            canonical = canonical_identity(candidate, {"server_id": server_id, "version": version, "tool_name": tool_name, "endpoint": candidate.url})
-            result.append(Item(
-                item_id=uuid5(NAMESPACE_URL, f"phase10:{canonical}"),
-                canonical_id=canonical,
-                type=ItemType.TOOL,
-                name=tool_name,
-                description=str(tool.get("description") or candidate.description or ""),
-                source=source,
-                provenance=[source],
-                evidence=evidence,
-                version=version,
-                status=ItemStatus.ACTIVE,
-                reliability=Reliability(score=0.0, confidence=0.0),
-                discovery=DiscoveryMetadata(first_seen=now, last_seen=now, last_synced=now),
-                tool=ToolMetadata(server_id=server_id, tool_name=tool_name, mcp_schema=schema),
-                artifacts=ArtifactMetadata(source_available=bool(candidate.repository_url), source_url=candidate.repository_url),
-            ))
+                raise CandidateRejected(
+                    f"MCP tool '{tool_name}' has invalid input schema"
+                )
+            evidence = _evidence(
+                candidate, source, now, "discovery", list(candidate.evidence)
+            )
+            evidence.append(
+                _new_evidence(
+                    candidate,
+                    source,
+                    now,
+                    "protocol_validation",
+                    f"MCP initialize and tools/list validated tool '{tool_name}'",
+                    {"server": server_id},
+                )
+            )
+            canonical = canonical_identity(
+                candidate,
+                {
+                    "server_id": server_id,
+                    "version": version,
+                    "tool_name": tool_name,
+                    "endpoint": candidate.url,
+                },
+            )
+            result.append(
+                Item(
+                    item_id=uuid5(NAMESPACE_URL, f"phase10:{canonical}"),
+                    canonical_id=canonical,
+                    type=ItemType.TOOL,
+                    name=tool_name,
+                    description=str(
+                        tool.get("description") or candidate.description or ""
+                    ),
+                    source=source,
+                    provenance=[source],
+                    evidence=evidence,
+                    version=version,
+                    status=ItemStatus.ACTIVE,
+                    reliability=Reliability(score=0.0, confidence=0.0),
+                    discovery=DiscoveryMetadata(
+                        first_seen=now, last_seen=now, last_synced=now
+                    ),
+                    tool=ToolMetadata(
+                        server_id=server_id, tool_name=tool_name, mcp_schema=schema
+                    ),
+                    artifacts=ArtifactMetadata(
+                        source_available=bool(candidate.repository_url),
+                        source_url=candidate.repository_url,
+                    ),
+                )
+            )
         if not result:
-            raise CandidateRejected("MCP tools/list contained no valid tool definitions")
+            raise CandidateRejected(
+                "MCP tools/list contained no valid tool definitions"
+            )
         return result
 
-    async def _resolve_a2a_with_existing_client(self, candidate: CandidateReference) -> dict[str, Any] | None:
+    async def _resolve_a2a_with_existing_client(
+        self, candidate: CandidateReference
+    ) -> dict[str, Any] | None:
         raw = candidate.raw_metadata.get("source_candidate")
         target = None
         card_path = "/.well-known/agent-card.json"
-        if raw is not None and hasattr(raw, "agent_card_url") and getattr(raw, "agent_card_url"):
+        if (
+            raw is not None
+            and hasattr(raw, "agent_card_url")
+            and getattr(raw, "agent_card_url")
+        ):
             target = getattr(raw, "agent_card_url")
             card_path = ""
-        elif raw is not None and hasattr(raw, "resolution") and getattr(raw, "resolution"):
+        elif (
+            raw is not None
+            and hasattr(raw, "resolution")
+            and getattr(raw, "resolution")
+        ):
             resolution = getattr(raw, "resolution")
-            return {"endpoint": resolution.endpoint, "protocol_version": resolution.protocol_version, "raw_agent_card": resolution.raw_agent_card, "agent": resolution.agent.model_dump(mode="json")}
+            return {
+                "endpoint": resolution.endpoint,
+                "protocol_version": resolution.protocol_version,
+                "raw_agent_card": resolution.raw_agent_card,
+                "agent": resolution.agent.model_dump(mode="json"),
+            }
         else:
             target = str(candidate.url or "")
         if not target:
             return None
         from app.discovery.a2a.client import resolve_a2a_agent
+
         try:
             resolution = await resolve_a2a_agent(target, card_path=card_path)
         except Exception as exc:
-            raise CandidateRejected("A2A Agent Card resolution failed", [str(exc)]) from exc
-        return {"endpoint": resolution.endpoint, "protocol_version": resolution.protocol_version, "raw_agent_card": resolution.raw_agent_card, "agent": resolution.agent.model_dump(mode="json")}
+            raise CandidateRejected(
+                "A2A Agent Card resolution failed", [str(exc)]
+            ) from exc
+        return {
+            "endpoint": resolution.endpoint,
+            "protocol_version": resolution.protocol_version,
+            "raw_agent_card": resolution.raw_agent_card,
+            "agent": resolution.agent.model_dump(mode="json"),
+        }
 
-    async def _resolve_mcp_with_existing_client(self, candidate: CandidateReference) -> dict[str, Any] | None:
+    async def _resolve_mcp_with_existing_client(
+        self, candidate: CandidateReference
+    ) -> dict[str, Any] | None:
         raw = candidate.raw_metadata.get("source_candidate")
         command = None
         args: list[str] = []
@@ -245,9 +349,13 @@ class Phase10Pipeline:
             return None
         from mcp import StdioServerParameters
         from app.discovery.mcp.client import resolve_mcp_server
+
         params = StdioServerParameters(command=command, args=args)
         resolved = await resolve_mcp_server(candidate.source_id, params)
-        return {"server_info": resolved.server_info.__dict__, "tools": [tool.model_dump(mode="json") for tool in resolved.tools]}
+        return {
+            "server_info": resolved.server_info.__dict__,
+            "tools": [tool.model_dump(mode="json") for tool in resolved.tools],
+        }
 
     @staticmethod
     def _extract_a2a_resolution(candidate: CandidateReference) -> dict[str, Any] | None:
@@ -257,7 +365,12 @@ class Phase10Pipeline:
         resolution = getattr(raw, "resolution")
         if resolution is None:
             return None
-        return {"endpoint": resolution.endpoint, "protocol_version": resolution.protocol_version, "raw_agent_card": resolution.raw_agent_card, "agent": resolution.agent.model_dump(mode="json")}
+        return {
+            "endpoint": resolution.endpoint,
+            "protocol_version": resolution.protocol_version,
+            "raw_agent_card": resolution.raw_agent_card,
+            "agent": resolution.agent.model_dump(mode="json"),
+        }
 
     @staticmethod
     def _deduplicate(items: list[Item]) -> list[Item]:
@@ -275,7 +388,17 @@ class Phase10Pipeline:
 
 
 class Rejection:
-    def __init__(self, candidate_id: UUID, protocol: str, source: DiscoverySource, reason: str, evidence: list[str], observed_at: datetime, details: dict[str, Any] | None = None, item_id: UUID | None = None) -> None:
+    def __init__(
+        self,
+        candidate_id: UUID,
+        protocol: str,
+        source: DiscoverySource,
+        reason: str,
+        evidence: list[str],
+        observed_at: datetime,
+        details: dict[str, Any] | None = None,
+        item_id: UUID | None = None,
+    ) -> None:
         self.candidate_id = candidate_id
         self.protocol = protocol
         self.source = source
@@ -286,16 +409,43 @@ class Rejection:
         self.item_id = item_id
 
     @classmethod
-    def from_candidate(cls, candidate: CandidateReference, reason: str, evidence: list[str]) -> "Rejection":
-        return cls(candidate.candidate_id, candidate.protocol, _source(candidate), reason, evidence, datetime.now(timezone.utc), candidate.raw_metadata)
+    def from_candidate(
+        cls, candidate: CandidateReference, reason: str, evidence: list[str]
+    ) -> "Rejection":
+        return cls(
+            candidate.candidate_id,
+            candidate.protocol,
+            _source(candidate),
+            reason,
+            evidence,
+            datetime.now(timezone.utc),
+            candidate.raw_metadata,
+        )
 
     @classmethod
     def from_item(cls, item: Item, reason: str, evidence: list[str]) -> "Rejection":
-        return cls(item.item_id, item.type.value, item.source, reason, evidence, datetime.now(timezone.utc), {"canonical_id": item.canonical_id}, item.item_id)
+        return cls(
+            item.item_id,
+            item.type.value,
+            item.source,
+            reason,
+            evidence,
+            datetime.now(timezone.utc),
+            {"canonical_id": item.canonical_id},
+            item.item_id,
+        )
 
 
 class Phase10Result:
-    def __init__(self, *, candidates_seen: int, resolved: int, deduplicated: int, approved: tuple[Item, ...], rejected: tuple[Rejection, ...]) -> None:
+    def __init__(
+        self,
+        *,
+        candidates_seen: int,
+        resolved: int,
+        deduplicated: int,
+        approved: tuple[Item, ...],
+        rejected: tuple[Rejection, ...],
+    ) -> None:
         self.candidates_seen = candidates_seen
         self.resolved = resolved
         self.deduplicated = deduplicated
@@ -304,19 +454,52 @@ class Phase10Result:
 
 
 def _source(candidate: CandidateReference) -> DiscoverySource:
-    return DiscoverySource(type=candidate.source_type, id=candidate.source_id, url=candidate.url, provider=candidate.source_provider)
+    return DiscoverySource(
+        type=candidate.source_type,
+        id=candidate.source_id,
+        url=candidate.url,
+        provider=candidate.source_provider,
+    )
 
 
-def _evidence(candidate: CandidateReference, source: DiscoverySource, now: datetime, kind: str, statements: list[str]) -> list[DiscoveryEvidence]:
-    return [_new_evidence(candidate, source, now, kind, statement, {}) for statement in statements]
+def _evidence(
+    candidate: CandidateReference,
+    source: DiscoverySource,
+    now: datetime,
+    kind: str,
+    statements: list[str],
+) -> list[DiscoveryEvidence]:
+    return [
+        _new_evidence(candidate, source, now, kind, statement, {})
+        for statement in statements
+    ]
 
 
-def _new_evidence(candidate: CandidateReference, source: DiscoverySource, now: datetime, kind: str, statement: str, details: dict[str, Any]) -> DiscoveryEvidence:
-    evidence_id = uuid5(NAMESPACE_URL, f"{candidate.candidate_id}|{source.type.value}|{source.id}|{kind}|{statement}")
-    return DiscoveryEvidence(evidence_id=evidence_id, kind=kind, statement=statement, source=source, observed_at=now, details=details)
+def _new_evidence(
+    candidate: CandidateReference,
+    source: DiscoverySource,
+    now: datetime,
+    kind: str,
+    statement: str,
+    details: dict[str, Any],
+) -> DiscoveryEvidence:
+    evidence_id = uuid5(
+        NAMESPACE_URL,
+        f"{candidate.candidate_id}|{source.type.value}|{source.id}|{kind}|{statement}",
+    )
+    return DiscoveryEvidence(
+        evidence_id=evidence_id,
+        kind=kind,
+        statement=statement,
+        source=source,
+        observed_at=now,
+        details=details,
+    )
 
 
-def _merge_sources(left: list[DiscoverySource], right: list[DiscoverySource]) -> list[DiscoverySource]:
+def _merge_sources(
+    left: list[DiscoverySource], right: list[DiscoverySource]
+) -> list[DiscoverySource]:
     result: list[DiscoverySource] = []
     seen: set[str] = set()
     for source in [*left, *right]:
@@ -327,7 +510,9 @@ def _merge_sources(left: list[DiscoverySource], right: list[DiscoverySource]) ->
     return result
 
 
-def _merge_evidence(left: list[DiscoveryEvidence], right: list[DiscoveryEvidence]) -> list[DiscoveryEvidence]:
+def _merge_evidence(
+    left: list[DiscoveryEvidence], right: list[DiscoveryEvidence]
+) -> list[DiscoveryEvidence]:
     result: list[DiscoveryEvidence] = []
     seen: set[UUID] = set()
     for evidence in [*left, *right]:
