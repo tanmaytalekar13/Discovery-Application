@@ -402,27 +402,27 @@ class ItemRepository:
             f"CREATE EDGE HAS_RELIABILITY_EVALUATION FROM {item_rid} TO {evaluation_rid} IF NOT EXISTS",
         )
 
-    async def persist_rejection(self, rejection: Any) -> None:
-        payload = {
-            "rejection_id": str(uuid4()),
-            "candidate_id": str(rejection.candidate_id),
-            "item_id": str(rejection.item_id) if rejection.item_id else None,
-            "protocol": rejection.protocol,
-            "source_type": rejection.source.type.value,
-            "source_id": rejection.source.id,
-            "source_url": str(rejection.source.url) if rejection.source.url else None,
-            "provider": rejection.source.provider,
-            "reason": rejection.reason,
-            "evidence": rejection.evidence,
-            "details": rejection.details,
-            "observed_at": _prepare_value(rejection.observed_at),
-        }
-        await self._db.command(
-            "sql",
-            "CREATE VERTEX DiscoveryRejection CONTENT :payload",
-            {"payload": payload},
-        )
+async def persist_rejection(self, rejection: Any) -> None:
+    payload = {
+        "rejection_id": str(uuid4()),
+        "candidate_id": str(rejection.candidate_id),
+        "item_id": str(rejection.item_id) if rejection.item_id else None,
+        "protocol": rejection.protocol,
+        "source_type": rejection.source.type.value,
+        "source_id": rejection.source.id,
+        "source_url": str(rejection.source.url) if rejection.source.url else None,
+        "provider": rejection.source.provider,
+        "reason": rejection.reason,
+        "evidence": _prepare_value(rejection.evidence),
+        "details": _prepare_value(rejection.details),
+        "observed_at": _prepare_value(rejection.observed_at),
+    }
 
+    await self._db.command(
+        "sql",
+        "CREATE VERTEX DiscoveryRejection CONTENT :payload",
+        {"payload": payload},
+    )
     async def _get_record_rid(
         self, record_type: str, field: str, value: UUID | str
     ) -> str:

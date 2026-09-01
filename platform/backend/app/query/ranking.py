@@ -64,9 +64,23 @@ def rank_items(
 
 def _freshness_score(item: Item, now: datetime | None = None) -> float:
     current = now or datetime.now(timezone.utc)
-    age_days = max(0.0, (current - item.discovery.last_seen).total_seconds() / 86400)
-    return max(0.0, min(1.0, 1.0 - age_days / 90.0))
+    last_seen = item.discovery.last_seen
 
+    # Normalize naive timestamps to UTC-aware timestamps.
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    else:
+        last_seen = last_seen.astimezone(timezone.utc)
+
+    age_days = max(
+        0.0,
+        (current - last_seen).total_seconds() / 86400,
+    )
+
+    return max(
+        0.0,
+        min(1.0, 1.0 - age_days / 90.0),
+    )
 
 def _evidence_score(item: Item) -> float:
     evidence_keys = {

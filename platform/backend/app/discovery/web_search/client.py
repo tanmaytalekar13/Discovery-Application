@@ -19,11 +19,11 @@ official registry, so this adapter is split into:
 
     WebSearchProvider   - a small interface any search backend can
                            implement (`search(query, max_results)`).
-    BraveWebSearchProvider
+    FirecrawlWebSearchProvider
                         - one concrete, real implementation against
-                           the Brave Search API
-                           (https://api.search.brave.com/res/v1/web/search),
-                           the documented default.
+                           the Firecrawl Search API
+                           (https://api.firecrawl.dev/v2/search),
+                           the configured default.
     WebSearchDiscoveryAdapter
                         - provider-agnostic classification/discovery,
                            mirroring `GitHubDiscoveryAdapter`
@@ -42,7 +42,7 @@ import httpx
 
 from app.models import DiscoverySource, ItemType, SourceType
 
-DEFAULT_BRAVE_SEARCH_API = "https://api.search.brave.com"
+DEFAULT_FIRECRAWL_SEARCH_API = "https://api.firecrawl.dev"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_RESULTS = 20
 
@@ -97,19 +97,24 @@ class WebSearchProvider(ABC):
         return None
 
 
-class BraveWebSearchProvider(WebSearchProvider):
-    """Real `WebSearchProvider` backed by the Brave Search API.
+class FirecrawlWebSearchProvider(WebSearchProvider):
+    """Real `WebSearchProvider` backed by the Firecrawl Search API.
 
-    Documented contract used here:
-        GET {base_url}/res/v1/web/search?q={query}&count={n}
-        Header: X-Subscription-Token: {api_key}
-        Response: {"web": {"results": [{"title", "url", "description"}, ...]}}
+    Documented contract used here (https://docs.firecrawl.dev/api-reference/endpoint/search):
+        POST {base_url}/v2/search
+        Header: Authorization: Bearer {api_key}
+        Body: {"query": "...", "limit": n}
+        Response: {"success": true, "data": [{"title", "url", "description"}, ...]}
+
+    Note this is a POST with a JSON body (unlike Brave's GET+querystring),
+    and the api_key goes in an `Authorization: Bearer` header, not
+    `X-Subscription-Token`.
     """
 
     def __init__(
         self,
         api_key: str,
-        base_url: str = DEFAULT_BRAVE_SEARCH_API,
+        base_url: str = DEFAULT_FIRECRAWL_SEARCH_API,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         httpx_client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -128,7 +133,7 @@ class BraveWebSearchProvider(WebSearchProvider):
 
     @property
     def endpoint(self) -> str:
-        return f"{self._base_url}/res/v1/web/search"
+        return f"{self._base_url}/v2/search"
 
     async def search(
         self,
@@ -141,15 +146,16 @@ class BraveWebSearchProvider(WebSearchProvider):
             raise ValueError("max_results must be at least 1")
 
         try:
-            response = await self._client.get(
+            response = await self._client.post(
                 self.endpoint,
-                params={
-                    "q": query,
-                    "count": min(max_results, 20),
+                json={
+                    "query": query,
+                    "limit": min(max_results, 20),
                 },
                 headers={
                     "Accept": "application/json",
-                    "X-Subscription-Token": self._api_key,
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._api_key}",
                 },
                 timeout=self._timeout,
             )
@@ -176,12 +182,16 @@ class BraveWebSearchProvider(WebSearchProvider):
                 "Web search provider returned invalid JSON"
             ) from exc
 
-        web = payload.get("web") if isinstance(payload, dict) else None
-        entries = web.get("results") if isinstance(web, dict) else None
+        if isinstance(payload, dict) and payload.get("success") is False:
+            raise WebSearchAPIError(
+                f"Web search provider reported failure: {payload.get('error') or payload}"
+            )
+
+        entries = payload.get("data") if isinstance(payload, dict) else None
 
         if not isinstance(entries, list):
             raise WebSearchAPIError(
-                "Web search response has an invalid 'web.results' field"
+                "Web search response has an invalid 'data' field"
             )
 
         results: list[RawSearchResult] = []

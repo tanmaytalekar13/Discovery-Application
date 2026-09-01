@@ -8,7 +8,7 @@ knowledge of environment variables or which concrete provider backs
 into the Search Orchestrator."
 
 A source flag left on without the configuration it needs (e.g.
-`ENABLE_WEB_SEARCH_DISCOVERY=true` but no `BRAVE_SEARCH_API_KEY`) is
+`ENABLE_WEB_SEARCH_DISCOVERY=true` but no `FIRECRAWL_API_KEY`) is
 treated as not configured rather than attempted and left to fail on
 every request - this keeps `sources_failed` meaningful (an actual
 provider failure) instead of permanently noisy.
@@ -24,7 +24,7 @@ from app.discovery.github.client import GitHubDiscoveryAdapter
 from app.discovery.mcp_registry.client import MCPRegistryClient
 from app.discovery.web_extraction.client import WebExtractionAdapter
 from app.discovery.web_search.client import (
-    BraveWebSearchProvider,
+    FirecrawlWebSearchProvider,
     WebSearchDiscoveryAdapter,
 )
 from app.search.a2a_adapter import A2ADiscoveryAdapter
@@ -53,9 +53,9 @@ def build_mcp_adapter(
     )
 
     web_search = None
-    if settings.enable_web_search_discovery and settings.brave_search_api_key:
-        provider = BraveWebSearchProvider(
-            api_key=settings.brave_search_api_key,
+    if settings.enable_web_search_discovery and settings.firecrawl_api_key:
+        provider = FirecrawlWebSearchProvider(
+            api_key=settings.firecrawl_api_key,
             httpx_client=httpx_client,
         )
         web_search = WebSearchDiscoveryAdapter(provider)
@@ -104,9 +104,9 @@ def build_a2a_adapter(
         )
 
     web_search = None
-    if settings.enable_web_search_discovery and settings.brave_search_api_key:
-        provider = BraveWebSearchProvider(
-            api_key=settings.brave_search_api_key,
+    if settings.enable_web_search_discovery and settings.firecrawl_api_key:
+        provider = FirecrawlWebSearchProvider(
+            api_key=settings.firecrawl_api_key,
             httpx_client=httpx_client,
         )
         web_search = WebSearchDiscoveryAdapter(provider)

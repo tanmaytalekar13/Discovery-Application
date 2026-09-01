@@ -1,8 +1,8 @@
 from .client import (
     DEFAULT_A2A_SEARCH_QUERY,
-    DEFAULT_BRAVE_SEARCH_API,
+    DEFAULT_FIRECRAWL_SEARCH_API,
     DEFAULT_MCP_SEARCH_QUERY,
-    BraveWebSearchProvider,
+    FirecrawlWebSearchProvider,
     RawSearchResult,
     WebSearchAPIError,
     WebSearchCandidate,
@@ -14,9 +14,9 @@ from .client import (
 
 __all__ = [
     "DEFAULT_A2A_SEARCH_QUERY",
-    "DEFAULT_BRAVE_SEARCH_API",
+    "DEFAULT_FIRECRAWL_SEARCH_API",
     "DEFAULT_MCP_SEARCH_QUERY",
-    "BraveWebSearchProvider",
+    "FirecrawlWebSearchProvider",
     "RawSearchResult",
     "WebSearchAPIError",
     "WebSearchCandidate",

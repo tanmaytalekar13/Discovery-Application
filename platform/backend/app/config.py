@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     enable_well_known_a2a: bool = True
 
     github_token: str = ""
-    brave_search_api_key: str = ""
+    firecrawl_api_key: str = ""
 
     # Comma-separated lists (kept as plain strings so `.env` stays
     # simple - Section 32: "Provider URLs, credentials, limits and
