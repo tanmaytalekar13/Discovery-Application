@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from app.discovery.web_search.client import (
-    BraveWebSearchProvider,
+    FirecrawlWebSearchProvider,
     RawSearchResult,
     WebSearchAPIError,
     WebSearchCandidate,
@@ -158,43 +158,43 @@ def test_candidate_provenance_is_web_search():
 
 
 # ============================================================
-# BraveWebSearchProvider (real documented contract, mocked transport)
+# FirecrawlWebSearchProvider (real documented contract, mocked transport)
 # ============================================================
 
 
 def test_empty_api_key_is_rejected():
     with pytest.raises(ValueError):
-        BraveWebSearchProvider(api_key="  ")
+        FirecrawlWebSearchProvider(api_key="  ")
 
 
 @pytest.mark.asyncio
-async def test_brave_provider_parses_results():
+async def test_firecrawl_provider_parses_results():
     class MockTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
-            assert request.headers["X-Subscription-Token"] == "test-key"
+            assert request.headers["Authorization"] == "Bearer test-key"
+            assert request.url.path == "/v2/search"
             return httpx.Response(
                 200,
                 json={
-                    "web": {
-                        "results": [
-                            {
-                                "title": "weather-mcp",
-                                "url": "https://github.com/example/weather-mcp",
-                                "description": "An MCP server for weather.",
-                            },
-                            {"title": "no url here"},
-                        ]
-                    }
+                    "success": True,
+                    "data": [
+                        {
+                            "title": "weather-mcp",
+                            "url": "https://github.com/example/weather-mcp",
+                            "description": "An MCP server for weather.",
+                        },
+                        {"title": "no url here"},
+                    ],
                 },
             )
 
     client = httpx.AsyncClient(
-        transport=MockTransport(), base_url="https://api.search.brave.test"
+        transport=MockTransport(), base_url="https://api.firecrawl.test"
     )
 
-    async with BraveWebSearchProvider(
+    async with FirecrawlWebSearchProvider(
         api_key="test-key",
-        base_url="https://api.search.brave.test",
+        base_url="https://api.firecrawl.test",
         httpx_client=client,
     ) as provider:
         results = await provider.search("weather mcp", max_results=5)
@@ -205,7 +205,45 @@ async def test_brave_provider_parses_results():
 
 
 @pytest.mark.asyncio
-async def test_brave_provider_rate_limit_is_explicit():
+async def test_firecrawl_provider_parses_nested_web_results():
+    class MockTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            assert request.headers["Authorization"] == "Bearer test-key"
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "web": [
+                            {
+                                "title": "weather-mcp",
+                                "url": "https://github.com/example/weather-mcp",
+                                "description": "An MCP server for weather.",
+                            },
+                            {"title": "no url here"},
+                        ]
+                    },
+                },
+            )
+
+    client = httpx.AsyncClient(
+        transport=MockTransport(), base_url="https://api.firecrawl.test"
+    )
+
+    async with FirecrawlWebSearchProvider(
+        api_key="test-key",
+        base_url="https://api.firecrawl.test",
+        httpx_client=client,
+    ) as provider:
+        results = await provider.search("weather mcp", max_results=5)
+
+    assert len(results) == 1
+    assert results[0].title == "weather-mcp"
+    assert results[0].url == "https://github.com/example/weather-mcp"
+
+
+@pytest.mark.asyncio
+async def test_firecrawl_provider_rate_limit_is_explicit():
     class MockTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
             return httpx.Response(
@@ -213,12 +251,12 @@ async def test_brave_provider_rate_limit_is_explicit():
             )
 
     client = httpx.AsyncClient(
-        transport=MockTransport(), base_url="https://api.search.brave.test"
+        transport=MockTransport(), base_url="https://api.firecrawl.test"
     )
 
-    async with BraveWebSearchProvider(
+    async with FirecrawlWebSearchProvider(
         api_key="test-key",
-        base_url="https://api.search.brave.test",
+        base_url="https://api.firecrawl.test",
         httpx_client=client,
     ) as provider:
         with pytest.raises(WebSearchRateLimitError):
@@ -226,18 +264,18 @@ async def test_brave_provider_rate_limit_is_explicit():
 
 
 @pytest.mark.asyncio
-async def test_brave_provider_api_error_is_explicit():
+async def test_firecrawl_provider_api_error_is_explicit():
     class MockTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
             return httpx.Response(500, json={"error": "unavailable"})
 
     client = httpx.AsyncClient(
-        transport=MockTransport(), base_url="https://api.search.brave.test"
+        transport=MockTransport(), base_url="https://api.firecrawl.test"
     )
 
-    async with BraveWebSearchProvider(
+    async with FirecrawlWebSearchProvider(
         api_key="test-key",
-        base_url="https://api.search.brave.test",
+        base_url="https://api.firecrawl.test",
         httpx_client=client,
     ) as provider:
         with pytest.raises(WebSearchAPIError):
@@ -245,18 +283,18 @@ async def test_brave_provider_api_error_is_explicit():
 
 
 @pytest.mark.asyncio
-async def test_brave_provider_invalid_shape_is_explicit():
+async def test_firecrawl_provider_invalid_shape_is_explicit():
     class MockTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
-            return httpx.Response(200, json={"web": {"results": "not-a-list"}})
+            return httpx.Response(200, json={"success": True, "data": "not-a-list"})
 
     client = httpx.AsyncClient(
-        transport=MockTransport(), base_url="https://api.search.brave.test"
+        transport=MockTransport(), base_url="https://api.firecrawl.test"
     )
 
-    async with BraveWebSearchProvider(
+    async with FirecrawlWebSearchProvider(
         api_key="test-key",
-        base_url="https://api.search.brave.test",
+        base_url="https://api.firecrawl.test",
         httpx_client=client,
     ) as provider:
         with pytest.raises(WebSearchAPIError):

@@ -22,6 +22,8 @@ services:
   backend:
     build:
       context: ./platform/backend
+    env_file:
+      - ./platform/backend/.env
     hostname: backend
     environment:
       ARCADEDB_ROOT_PASSWORD: ${ARCADEDB_ROOT_PASSWORD}

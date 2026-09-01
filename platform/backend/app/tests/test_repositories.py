@@ -598,6 +598,44 @@ async def test_get_item(
     assert result.artifacts.source_code is not None
 
 
+def test_to_item_backfills_missing_discovery_timestamps(tool_item: Item) -> None:
+    row = {
+        "item_id": str(tool_item.item_id),
+        "canonical_id": tool_item.canonical_id,
+        "type": tool_item.type.value,
+        "name": tool_item.name,
+        "description": tool_item.description,
+        "source_type": tool_item.source.type.value,
+        "source_id": tool_item.source.id,
+        "source_url": str(tool_item.source.url),
+        "source_provider": tool_item.source.provider,
+        "version": tool_item.version,
+        "status": tool_item.status.value,
+        "reliability_score": tool_item.reliability.score,
+        "reliability_confidence": tool_item.reliability.confidence,
+        "scoring_version": tool_item.reliability.scoring_version,
+        "last_evaluated": tool_item.reliability.last_evaluated.isoformat(),
+        "security_validation": tool_item.reliability.security_validation,
+        "reliability_signals": tool_item.reliability.signals,
+        "reliability_reasons": tool_item.reliability.reasons,
+        "first_seen": None,
+        "last_seen": None,
+        "last_synced": None,
+        "tool": tool_item.tool.model_dump(mode="json"),
+        "agent": None,
+        "artifacts": tool_item.artifacts.model_dump(mode="json"),
+        "provenance": [],
+        "evidence_summary": [],
+        "embedding": None,
+    }
+
+    result = ItemRepository._to_item(row)
+
+    assert result.discovery.first_seen == tool_item.reliability.last_evaluated
+    assert result.discovery.last_seen == tool_item.reliability.last_evaluated
+    assert result.discovery.last_synced == tool_item.reliability.last_evaluated
+
+
 @pytest.mark.asyncio
 async def test_get_missing_item(
     fake_db: FakeArcadeDB,
@@ -755,6 +793,35 @@ async def test_upsert_catalog_item_persists_new_phase10_record(
     )
     assert any(
         "CREATE EDGE HAS_RELIABILITY_EVALUATION" in command for command in edge_commands
+    )
+
+
+@pytest.mark.asyncio
+async def test_upsert_catalog_item_refreshes_existing_phase10_record(
+    fake_db: FakeArcadeDB,
+    tool_item: Item,
+) -> None:
+    repository = ItemRepository(fake_db)
+
+    class Evaluation:
+        score = 0.93
+        confidence = 0.89
+        approved = True
+        signals = {"protocol_validation": 1.0}
+        reasons = ["protocol validation refreshed"]
+        security_validation = 1.0
+
+    await repository.create(tool_item)
+    tool_item.description = "Updated Spotify search tool"
+
+    await repository.upsert_catalog_item(tool_item, Evaluation())
+
+    stored = fake_db.item_records[str(tool_item.item_id)]
+    assert stored["description"] == "Updated Spotify search tool"
+    assert not any(
+        "SET item_id" in " ".join(command["command"].split())
+        for command in fake_db.commands
+        if "UPDATE Item" in command["command"]
     )
 
 

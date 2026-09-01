@@ -187,18 +187,23 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 f"Web search provider reported failure: {payload.get('error') or payload}"
             )
 
-        entries = payload.get("data") if isinstance(payload, dict) else None
+        data = payload.get("data") if isinstance(payload, dict) else None
 
-        if not isinstance(entries, list):
+        entries: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            entries = [entry for entry in data if isinstance(entry, dict)]
+        elif isinstance(data, dict):
+            nested = data.get("web") if isinstance(data.get("web"), list) else None
+            if nested is not None:
+                entries = [entry for entry in nested if isinstance(entry, dict)]
+
+        if not entries:
             raise WebSearchAPIError(
                 "Web search response has an invalid 'data' field"
             )
 
         results: list[RawSearchResult] = []
         for entry in entries[:max_results]:
-            if not isinstance(entry, dict):
-                continue
-
             url = entry.get("url")
             title = entry.get("title")
             if not isinstance(url, str) or not url:

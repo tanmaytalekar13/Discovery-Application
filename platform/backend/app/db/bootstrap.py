@@ -8,6 +8,7 @@ from app.db.client import ArcadeDBClient, ArcadeDBError
 # Configure basic logging for the bootstrap script
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Path to the initial schema file
 SCHEMA_PATH = Path(

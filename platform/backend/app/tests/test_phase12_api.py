@@ -165,6 +165,9 @@ def test_search_contract_returns_ranked_results_and_cached_metadata():
     payload = response.json()
     assert payload["results"][0]["item"]["item_id"] == str(result_item.item_id)
     assert payload["results"][0]["final_score"] == 0.92
+    assert payload["tools"][0]["item_id"] == str(result_item.item_id)
+    assert payload["tools"][0]["tool_name"] == "weather_search"
+    assert payload["tools"][0]["schema"]["properties"]["city"]["type"] == "string"
     assert payload["metadata"]["mode"] == "cached"
     assert payload["metadata"]["sources_attempted"] == ["arcadedb"]
     assert payload["metadata"]["cached_results"] == 1

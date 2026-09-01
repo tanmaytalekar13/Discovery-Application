@@ -14,6 +14,18 @@ def _settings(**overrides) -> Settings:
         "arcadedb_database": "platform",
         "arcadedb_user": "root",
         "arcadedb_password": "secret",
+        "enable_github_discovery": False,
+        "enable_mcp_registry_discovery": False,
+        "enable_a2a_registry_discovery": False,
+        "enable_web_search_discovery": False,
+        "enable_web_extraction": False,
+        "github_token": "",
+        "firecrawl_api_key": "",
+        "a2a_registry_base_urls": "",
+        "well_known_agent_hosts": "",
+        "configured_mcp_endpoints": "",
+        "configured_agent_card_urls": "",
+        "web_extraction_urls": "",
     }
     base.update(overrides)
     return Settings(**base)
@@ -39,12 +51,12 @@ def test_enabling_github_builds_an_mcp_adapter():
 
 
 def test_web_search_requires_an_api_key_even_if_enabled():
-    settings = _settings(enable_web_search_discovery=True, brave_search_api_key="")
+    settings = _settings(enable_web_search_discovery=True, firecrawl_api_key="")
 
     assert build_mcp_adapter(settings) is None
 
     settings_with_key = _settings(
-        enable_web_search_discovery=True, brave_search_api_key="secret-key"
+        enable_web_search_discovery=True, firecrawl_api_key="secret-key"
     )
     adapter = build_mcp_adapter(settings_with_key)
 

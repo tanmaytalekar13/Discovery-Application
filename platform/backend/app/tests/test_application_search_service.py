@@ -232,8 +232,29 @@ async def test_mixed_mode_merges_cached_and_live_before_phase11_ranking():
     assert result.metadata.sources_attempted == ("arcadedb", "mcp:mcp_registry")
     assert result.metadata.cached_results == 1
     assert result.metadata.approved_count == 1
-    assert phase11.rank_calls[0][1] == [cached_item, live_item]
+    assert phase11.rank_calls[0][1] == [live_item, cached_item]
     assert [ranked.item for ranked in result.ranked.results] == [
-        cached_item,
         live_item,
+        cached_item,
     ]
+
+
+@pytest.mark.asyncio
+async def test_mixed_mode_skips_seed_results_when_live_discovery_succeeds_but_approves_nothing():
+    cached_item = item("cached_weather")
+    phase11 = FakePhase11([cached_item])
+    orchestrator = FakeOrchestrator()
+    phase10 = FakePhase10([])
+    service = ApplicationSearchService(
+        settings=settings("mixed"),
+        phase11=phase11,
+        orchestrator=orchestrator,
+        phase10_pipeline=phase10,
+    )
+
+    result = await service.search("weather", item_type="tool", limit=10)
+
+    assert result.metadata.mode == "merged"
+    assert result.metadata.cached_results == 0
+    assert result.metadata.approved_count == 0
+    assert result.ranked.results == ()

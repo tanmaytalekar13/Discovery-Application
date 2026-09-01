@@ -79,10 +79,25 @@ class ApplicationSearchService:
 
         cached = await self._phase11.search(query, item_type=item_type, limit=limit)
         discovery, catalog = await self._run_live_discovery(query, item_type, limit)
-        merged_items = _merge_items(
-            [ranked.item for ranked in cached.results],
-            list(catalog.approved if catalog is not None else ()),
-        )
+        live_metadata = self._live_metadata(discovery, catalog, mode="merged")
+
+        # A successful live discovery pass should not be masked by stale seed/demo
+        # catalog rows. When live sources ran and produced no approved catalog
+        # entries, the cached seed fallback is treated as stale for this query and
+        # explicitly excluded from the merged response.
+        cached_items = [ranked.item for ranked in cached.results]
+        if discovery is not None and discovery.sources_succeeded and (
+            catalog is None or not catalog.approved
+        ):
+            merged_items: list[Item] = []
+            cached_result_count = 0
+        else:
+            merged_items = _merge_items(
+                cached_items,
+                list(catalog.approved if catalog is not None else ()),
+            )
+            cached_result_count = len(cached.results)
+
         ranked = await self._rank_items(
             query,
             merged_items,
@@ -90,7 +105,6 @@ class ApplicationSearchService:
             limit=limit,
             plan=cached.plan,
         )
-        live_metadata = self._live_metadata(discovery, catalog, mode="merged")
         return ApplicationSearchResult(
             ranked=ranked,
             metadata=ApplicationSearchMetadata(
@@ -98,7 +112,7 @@ class ApplicationSearchService:
                 sources_attempted=("arcadedb", *live_metadata.sources_attempted),
                 sources_succeeded=("arcadedb", *live_metadata.sources_succeeded),
                 sources_failed=live_metadata.sources_failed,
-                cached_results=len(cached.results),
+                cached_results=cached_result_count,
                 live_candidates=live_metadata.live_candidates,
                 approved_count=live_metadata.approved_count,
                 rejected_count=live_metadata.rejected_count,
@@ -157,7 +171,18 @@ class ApplicationSearchService:
 
 def _merge_items(cached: list[Item], live: list[Item]) -> list[Item]:
     merged: dict[str, Item] = {}
-    for item in [*cached, *live]:
+    for item in cached:
+        key = item.canonical_id or str(item.item_id)
+        merged.setdefault(key, item)
+    for item in live:
         key = item.canonical_id or str(item.item_id)
         merged[key] = item
-    return list(merged.values())
+    # Prefer live-approved results when discovery succeeded for the active query.
+    # This keeps seeded demo entries in the system while preventing them from
+    # dominating a real provider-backed search result set.
+    ordered = list(live)
+    for item in cached:
+        key = item.canonical_id or str(item.item_id)
+        if key not in {entry.canonical_id or str(entry.item_id) for entry in live}:
+            ordered.append(item)
+    return ordered

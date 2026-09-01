@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -8,21 +8,63 @@ from app.db.client import ArcadeDBClient
 from app.models import DiscoveryEvidence, DiscoverySource, Item, TestRun
 
 
+def _make_serializable(obj: Any, max_depth: int = 10, current_depth: int = 0) -> Any:
+    """
+    Make any Python object JSON serializable by recursively converting all nested objects.
+    """
+    if current_depth > max_depth:
+        return str(obj)
+    
+    # Handle None and primitive types
+    if obj is None:
+        return None
+    
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    
+    # Handle datetime and UUID
+    if isinstance(obj, (datetime, UUID)):
+        return str(obj)
+    
+    # Handle dicts
+    if isinstance(obj, dict):
+        return {
+            str(k): _make_serializable(v, max_depth, current_depth + 1)
+            for k, v in obj.items()
+        }
+    
+    # Handle lists and tuples
+    if isinstance(obj, (list, tuple)):
+        return [_make_serializable(item, max_depth, current_depth + 1) for item in obj]
+    
+    # Handle Pydantic models
+    if hasattr(obj, "model_dump"):
+        try:
+            return _make_serializable(obj.model_dump(mode="json"), max_depth, current_depth + 1)
+        except Exception:
+            pass
+    
+    # Handle enums
+    if hasattr(obj, "value"):
+        return _make_serializable(obj.value, max_depth, current_depth + 1)
+    
+    # Handle objects with __dict__
+    if hasattr(obj, "__dict__"):
+        try:
+            return _make_serializable(vars(obj), max_depth, current_depth + 1)
+        except Exception:
+            pass
+    
+    # Fallback: convert to string
+    return str(obj)
+
+
+
 def _prepare_value(value: Any) -> Any:
     """
     Convert Python values into JSON-serializable values for ArcadeDB.
     """
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, UUID):
-        return str(value)
-    if hasattr(value, "value"):
-        return value.value
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
-    return value
+    return _make_serializable(value)
 
 
 class ItemRepository:
@@ -274,7 +316,11 @@ class ItemRepository:
                 "sql", "CREATE VERTEX Item CONTENT :payload", {"payload": payload}
             )
         else:
-            updates = {key: value for key, value in payload.items()}
+            updates = {
+                key: value
+                for key, value in payload.items()
+                if key in self.ALLOWED_UPDATE_FIELDS
+            }
             await self.update(item.item_id, updates)
         item_rid = await self._get_record_rid("Item", "item_id", item.item_id)
         for source in item.provenance:
@@ -402,27 +448,31 @@ class ItemRepository:
             f"CREATE EDGE HAS_RELIABILITY_EVALUATION FROM {item_rid} TO {evaluation_rid} IF NOT EXISTS",
         )
 
-async def persist_rejection(self, rejection: Any) -> None:
-    payload = {
-        "rejection_id": str(uuid4()),
-        "candidate_id": str(rejection.candidate_id),
-        "item_id": str(rejection.item_id) if rejection.item_id else None,
-        "protocol": rejection.protocol,
-        "source_type": rejection.source.type.value,
-        "source_id": rejection.source.id,
-        "source_url": str(rejection.source.url) if rejection.source.url else None,
-        "provider": rejection.source.provider,
-        "reason": rejection.reason,
-        "evidence": _prepare_value(rejection.evidence),
-        "details": _prepare_value(rejection.details),
-        "observed_at": _prepare_value(rejection.observed_at),
-    }
+    async def persist_rejection(self, rejection: Any) -> None:
+        """Persist a DiscoveryRejection vertex for an item/candidate that failed discovery."""
+        payload = {
+            "rejection_id": str(uuid4()),
+            "candidate_id": str(rejection.candidate_id),
+            "item_id": str(rejection.item_id) if rejection.item_id else None,
+            "protocol": rejection.protocol,
+            "source_type": rejection.source.type.value,
+            "source_id": rejection.source.id,
+            "source_url": str(rejection.source.url) if rejection.source.url else None,
+            "provider": rejection.source.provider,
+            "reason": rejection.reason,
+            "evidence": rejection.evidence if isinstance(rejection.evidence, list) else [],
+            "details": _make_serializable(rejection.details) if rejection.details else {},
+            "observed_at": _prepare_value(rejection.observed_at),
+        }
+        # Ensure the entire payload is JSON serializable
+        payload = _make_serializable(payload)
 
-    await self._db.command(
-        "sql",
-        "CREATE VERTEX DiscoveryRejection CONTENT :payload",
-        {"payload": payload},
-    )
+        await self._db.command(
+            "sql",
+            "CREATE VERTEX DiscoveryRejection CONTENT :payload",
+            {"payload": payload},
+        )
+
     async def _get_record_rid(
         self, record_type: str, field: str, value: UUID | str
     ) -> str:
@@ -492,6 +542,12 @@ async def persist_rejection(self, rejection: Any) -> None:
     @staticmethod
     def _to_item(row: dict[str, Any]) -> Item:
         """Map an ArcadeDB Item record to the Pydantic model."""
+        observed_at = _coalesce_datetime(
+            row.get("last_seen"),
+            row.get("first_seen"),
+            row.get("last_synced"),
+            row.get("last_evaluated"),
+        )
         return Item.model_validate(
             {
                 "item_id": row["item_id"],
@@ -508,18 +564,26 @@ async def persist_rejection(self, rejection: Any) -> None:
                 "version": row.get("version"),
                 "status": row.get("status", "active"),
                 "reliability": {
-                    "score": row.get("reliability_score", 0.0),
-                    "confidence": row.get("reliability_confidence", 0.0),
-                    "scoring_version": row.get("scoring_version", "v1"),
+                    "score": row.get("reliability_score") or 0.0,
+                    "confidence": row.get("reliability_confidence") or 0.0,
+                    "scoring_version": row.get("scoring_version") or "v1",
                     "last_evaluated": row.get("last_evaluated"),
-                    "security_validation": row.get("security_validation", 0.0),
-                    "signals": row.get("reliability_signals", {}),
-                    "reasons": row.get("reliability_reasons", []),
+                    "security_validation": (
+                        row.get("security_validation")
+                        if isinstance(row.get("security_validation"), (int, float))
+                        else 0.0
+                    ),
+                    "signals": (
+                        row.get("reliability_signals")
+                        if isinstance(row.get("reliability_signals"), dict)
+                        else {}
+                    ),
+                    "reasons": row.get("reliability_reasons") or [],
                 },
                 "discovery": {
-                    "first_seen": row["first_seen"],
-                    "last_seen": row["last_seen"],
-                    "last_synced": row["last_synced"],
+                    "first_seen": row.get("first_seen") or observed_at,
+                    "last_seen": row.get("last_seen") or observed_at,
+                    "last_synced": row.get("last_synced") or observed_at,
                 },
                 "tool": row.get("tool"),
                 "agent": row.get("agent"),
@@ -529,6 +593,13 @@ async def persist_rejection(self, rejection: Any) -> None:
                 "embedding": row.get("embedding"),
             }
         )
+
+
+def _coalesce_datetime(*values: Any) -> Any:
+    for value in values:
+        if value:
+            return value
+    return datetime.now(timezone.utc)
 
 
 class TestRunRepository:

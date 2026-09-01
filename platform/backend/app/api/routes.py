@@ -20,6 +20,7 @@ from app.api.schemas import (
     SearchMetadata,
     SearchResponse,
     SearchResultItem,
+    SearchToolItem,
     TestRunResponse,
 )
 from app.db.repositories import ItemRepository, TestRunRepository
@@ -52,8 +53,24 @@ async def search(
         )
         for ranked in result.ranked.results
     ]
+    tools = [
+        SearchToolItem(
+            item_id=ranked.item.item_id,
+            name=ranked.item.name,
+            description=ranked.item.description,
+            server_id=ranked.item.tool.server_id,
+            tool_name=ranked.item.tool.tool_name,
+            mcp_schema=ranked.item.tool.mcp_schema,
+            source=ranked.item.source,
+            final_score=ranked.final_score,
+            reliability=ranked.reliability,
+        )
+        for ranked in result.ranked.results
+        if ranked.item.tool is not None
+    ]
     return SearchResponse(
         results=rows,
+        tools=tools,
         metadata=SearchMetadata(
             mode=result.metadata.mode,
             sources_attempted=list(result.metadata.sources_attempted),

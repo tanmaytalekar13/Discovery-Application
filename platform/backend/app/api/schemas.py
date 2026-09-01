@@ -36,8 +36,21 @@ class SearchResultItem(BaseModel):
     evidence: float
 
 
+class SearchToolItem(BaseModel):
+    item_id: UUID
+    name: str
+    description: str
+    server_id: str
+    tool_name: str
+    mcp_schema: dict[str, Any] = Field(serialization_alias="schema")
+    source: DiscoverySource
+    final_score: float
+    reliability: float
+
+
 class SearchResponse(BaseModel):
     results: list[SearchResultItem]
+    tools: list[SearchToolItem] = Field(default_factory=list)
     metadata: SearchMetadata
 
 

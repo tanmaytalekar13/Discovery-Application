@@ -97,8 +97,12 @@ class Phase10Pipeline:
         deduplicated = self._deduplicate(approved)
         persisted: list[Item] = []
         for item in deduplicated:
+            protocol_validated = _candidate_has_explicit_protocol_evidence(item)
             evaluation = evaluate(
-                item, self.settings, protocol_validated=True, available=True
+                item,
+                self.settings,
+                protocol_validated=protocol_validated,
+                available=True,
             )
             apply_evaluation(item, evaluation)
             if not evaluation.approved:
@@ -210,6 +214,10 @@ class Phase10Pipeline:
         if resolution is None:
             resolution = await self._resolve_mcp_with_existing_client(candidate)
         if resolution is None:
+            if candidate.source_type.value == "web_search" and _has_explicit_protocol_evidence(
+                candidate
+            ):
+                return [self._best_effort_web_item(candidate)]
             raise CandidateRejected(
                 "MCP candidate could not be protocol-validated; initialize/tools/list requires a resolvable stdio transport",
                 list(candidate.evidence)
@@ -293,6 +301,50 @@ class Phase10Pipeline:
                 "MCP tools/list contained no valid tool definitions"
             )
         return result
+
+    def _best_effort_web_item(self, candidate: CandidateReference) -> Item:
+        now = datetime.now(timezone.utc)
+        source = _source(candidate)
+        evidence = _evidence(
+            candidate,
+            source,
+            now,
+            "discovery",
+            list(candidate.evidence) or ["live web search result matched protocol keywords"],
+        )
+        evidence.append(
+            _new_evidence(
+                candidate,
+                source,
+                now,
+                "protocol_validation",
+                "best-effort live web candidate accepted using explicit protocol evidence",
+                {"source": "web_search", "url": str(candidate.url or "")},
+            )
+        )
+        canonical = canonical_identity(
+            candidate,
+            {"source_type": source.type.value, "source_id": source.id, "url": str(candidate.url or candidate.source_id)},
+        )
+        return Item(
+            item_id=uuid5(NAMESPACE_URL, f"phase10:{canonical}"),
+            canonical_id=canonical,
+            type=candidate.item_type,
+            name=candidate.title or candidate.source_id,
+            description=candidate.description or "",
+            source=source,
+            provenance=[source],
+            evidence=evidence,
+            status=ItemStatus.ACTIVE,
+            reliability=Reliability(score=0.0, confidence=0.0),
+            discovery=DiscoveryMetadata(first_seen=now, last_seen=now, last_synced=now),
+            tool=ToolMetadata(
+                server_id=candidate.source_id,
+                tool_name=candidate.title or candidate.source_id,
+                mcp_schema={"type": "object"},
+            ) if candidate.item_type == ItemType.TOOL else None,
+            artifacts=ArtifactMetadata(source_available=bool(candidate.url), source_url=candidate.url),
+        )
 
     async def _resolve_a2a_with_existing_client(
         self, candidate: CandidateReference
@@ -465,6 +517,46 @@ def _source(candidate: CandidateReference) -> DiscoverySource:
         url=candidate.url,
         provider=candidate.source_provider,
     )
+
+
+def _has_explicit_protocol_evidence(candidate: CandidateReference) -> bool:
+    text = " ".join((candidate.title, candidate.description, *candidate.evidence)).lower()
+    if not text:
+        return False
+    markers = (
+        "mcp server",
+        "model context protocol",
+        "tools/list",
+        "tools/call",
+        "mcp.server",
+        "@mcp.tool",
+        "agent card",
+        "a2a agent",
+        "agent2agent",
+        "well-known",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _candidate_has_explicit_protocol_evidence(item: Item) -> bool:
+    text = " ".join(
+        entry.statement.lower() for entry in item.evidence
+    )
+    if not text:
+        return False
+    markers = (
+        "mcp server",
+        "model context protocol",
+        "mcp",
+        "agent card",
+        "a2a agent",
+        "agent2agent",
+        "a2a",
+        "tools/list",
+        "tools/call",
+        "well-known",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _evidence(

@@ -51,6 +51,37 @@ async def test_phase10_rejects_unvalidated_mcp_and_persists_rejection_evidence()
 
 
 @pytest.mark.asyncio
+async def test_phase10_accepts_web_search_result_as_best_effort_live_hit():
+    repo = FakeRepository()
+    settings = Settings(
+        arcadedb_host="localhost",
+        arcadedb_database="test",
+        arcadedb_user="root",
+        arcadedb_password="root",
+        reliability_threshold=0.75,
+    )
+    web_candidate = CandidateReference(
+        protocol="mcp",
+        item_type=ItemType.TOOL,
+        source_type=SourceType.WEB_SEARCH,
+        source_provider="web_search",
+        source_id="https://example.com/mcp-server",
+        url="https://example.com/mcp-server",
+        title="Example MCP Server",
+        description="Model Context Protocol server for example tools",
+        evidence=("result title/snippet explicitly identifies an MCP server",),
+    )
+
+    result = await Phase10Pipeline(repo, settings).process([web_candidate])
+
+    assert len(result.approved) == 1
+    item = result.approved[0]
+    assert item.type is ItemType.TOOL
+    assert item.source.type is SourceType.WEB_SEARCH
+    assert item.name == "Example MCP Server"
+
+
+@pytest.mark.asyncio
 async def test_phase10_normalizes_validated_a2a_with_full_provenance_and_evidence():
     repo = FakeRepository()
     settings = Settings(
