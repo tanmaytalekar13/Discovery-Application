@@ -482,6 +482,12 @@ def tool_item() -> Item:
             source_code=(
                 "def search_tracks(query: str):\n" "    return search_spotify(query)\n"
             ),
+            config_files=[
+                {
+                    "kind": "web_extraction",
+                    "url": "https://example.com/spotify-mcp/source",
+                }
+            ],
         ),
     )
 
@@ -596,6 +602,7 @@ async def test_get_item(
     assert result.tool.tool_name == "search_tracks"
 
     assert result.artifacts.source_code is not None
+    assert result.artifacts.config_files[0]["kind"] == "web_extraction"
 
 
 def test_to_item_backfills_missing_discovery_timestamps(tool_item: Item) -> None:

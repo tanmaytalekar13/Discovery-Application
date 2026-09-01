@@ -47,6 +47,8 @@ from app.discovery.common.candidate import (
 from app.discovery.github.client import GitHubDiscoveryAdapter
 from app.discovery.mcp_registry.client import MCPRegistryClient
 from app.discovery.web_extraction.client import WebExtractionAdapter
+from app.discovery.web_extraction.client import WebExtractionError
+from app.discovery.web_search.client import WebSearchCandidate
 from app.discovery.web_search.client import WebSearchDiscoveryAdapter
 from app.search.concurrency import gather_source_outcomes
 
@@ -137,7 +139,13 @@ class MCPDiscoveryAdapter:
             _mcp_biased_query(query),
             max_results,
         )
-        return [_from_web_search(candidate) for candidate in candidates]
+        return [
+            await _web_search_reference_with_extracted_content(
+                candidate,
+                self._web_extraction,
+            )
+            for candidate in candidates
+        ]
 
     async def _discover_extraction(self) -> list[CandidateReference]:
         assert self._web_extraction is not None
@@ -156,3 +164,22 @@ class MCPDiscoveryAdapter:
             succeeded=True,
             candidates=candidates,
         )
+
+
+async def _web_search_reference_with_extracted_content(
+    candidate: WebSearchCandidate,
+    extractor: WebExtractionAdapter | None,
+) -> CandidateReference:
+    reference = _from_web_search(candidate)
+    if extractor is None:
+        return reference
+
+    try:
+        extracted = await extractor.extract(candidate.url)
+    except WebExtractionError as exc:
+        reference.raw_metadata["web_extraction_error"] = str(exc)
+        return reference
+
+    if extracted is not None:
+        reference.raw_metadata["web_extraction_candidate"] = extracted
+    return reference

@@ -7,6 +7,8 @@ from app.config import Settings
 from app.discovery.common.candidate import CandidateReference
 from app.discovery.github.client import GitHubCandidate
 from app.discovery.mcp_registry.client import MCPRegistryCandidate
+from app.discovery.web_extraction.client import WebExtractionCandidate
+from app.discovery.web_search.client import WebSearchCandidate
 from app.models import ItemType, SourceType
 from app.models import DiscoverySource
 from app.normalization.pipeline import Phase10Pipeline
@@ -82,6 +84,73 @@ async def test_phase10_accepts_web_search_result_as_best_effort_live_hit():
     assert item.type is ItemType.TOOL
     assert item.source.type is SourceType.WEB_SEARCH
     assert item.name == "Example MCP Server"
+
+
+@pytest.mark.asyncio
+async def test_phase10_stores_extracted_web_search_content_as_artifact_source_code():
+    repo = FakeRepository()
+    settings = Settings(
+        arcadedb_host="localhost",
+        arcadedb_database="test",
+        arcadedb_user="root",
+        arcadedb_password="root",
+        reliability_threshold=0.75,
+    )
+    raw = WebSearchCandidate(
+        title="Example MCP Server",
+        url="https://example.com/mcp-server",
+        snippet="Model Context Protocol server for example tools",
+        item_type=ItemType.TOOL,
+        evidence=("result title/snippet explicitly identifies an MCP server",),
+        source=DiscoverySource(
+            type=SourceType.WEB_SEARCH,
+            id="https://example.com/mcp-server",
+            url="https://example.com/mcp-server",
+        ),
+        raw_result={"title": "Example MCP Server", "url": "https://example.com/mcp-server"},
+    )
+    extracted = WebExtractionCandidate(
+        title="Example MCP Server",
+        url="https://example.com/mcp-server",
+        text_excerpt="Short page text",
+        item_type=ItemType.TOOL,
+        evidence=("page text explicitly identifies an MCP server",),
+        source=DiscoverySource(
+            type=SourceType.WEB_PAGE,
+            id="https://example.com/mcp-server",
+            url="https://example.com/mcp-server",
+        ),
+        content_type="text/html",
+        text_content="Full extracted page text with Model Context Protocol details.",
+    )
+    web_candidate = CandidateReference(
+        protocol="mcp",
+        item_type=ItemType.TOOL,
+        source_type=SourceType.WEB_SEARCH,
+        source_provider="Web Search",
+        source_id="https://example.com/mcp-server",
+        url="https://example.com/mcp-server",
+        title="Example MCP Server",
+        description="Model Context Protocol server for example tools",
+        evidence=raw.evidence,
+        raw_metadata={
+            "source_candidate": raw,
+            "web_extraction_candidate": extracted,
+        },
+    )
+
+    result = await Phase10Pipeline(repo, settings).process([web_candidate])
+
+    assert len(result.approved) == 1
+    item = result.approved[0]
+    assert item.source.type is SourceType.WEB_SEARCH
+    assert item.artifacts.source_code == (
+        "Full extracted page text with Model Context Protocol details."
+    )
+    assert {entry["kind"] for entry in item.artifacts.config_files} == {
+        "web_search_result",
+        "web_extraction",
+    }
 
 
 @pytest.mark.asyncio

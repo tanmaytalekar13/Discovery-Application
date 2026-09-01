@@ -119,6 +119,7 @@ class WebExtractionCandidate:
     evidence: tuple[str, ...]
     source: DiscoverySource
     content_type: str
+    text_content: str = ""
 
 
 class WebExtractionAdapter:
@@ -189,6 +190,7 @@ class WebExtractionAdapter:
                 url=url,
             ),
             content_type=content_type,
+            text_content=extractor.text,
         )
 
     async def extract_many(

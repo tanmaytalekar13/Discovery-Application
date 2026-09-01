@@ -209,7 +209,7 @@ def _build_web_extraction_adapter(
     *,
     httpx_client: httpx.AsyncClient | None,
 ) -> WebExtractionAdapter | None:
-    if not settings.enable_web_extraction or not settings.web_extraction_url_list:
+    if not settings.enable_web_extraction:
         return None
     return WebExtractionAdapter(
         httpx_client=httpx_client,

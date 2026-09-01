@@ -582,21 +582,59 @@ def _artifact_metadata(candidate: CandidateReference) -> ArtifactMetadata:
 def _artifact_source_code(candidate: CandidateReference) -> str | None:
     raw = candidate.raw_metadata.get("source_candidate")
     if raw is None:
-        return None
+        extracted = candidate.raw_metadata.get("web_extraction_candidate")
+        return _extracted_text_content(extracted)
 
     readme = getattr(raw, "readme", None)
     if isinstance(readme, str) and readme.strip():
         return readme
 
+    extracted = candidate.raw_metadata.get("web_extraction_candidate")
+    content = _extracted_text_content(extracted)
+    if content:
+        return content
+
+    return None
+
+
+def _extracted_text_content(extracted: Any) -> str | None:
+    if extracted is None:
+        return None
+    text = getattr(extracted, "text_content", None)
+    if isinstance(text, str) and text.strip():
+        return text
+    excerpt = getattr(extracted, "text_excerpt", None)
+    if isinstance(excerpt, str) and excerpt.strip():
+        return excerpt
     return None
 
 
 def _artifact_config_files(candidate: CandidateReference) -> list[dict[str, Any]]:
     raw = candidate.raw_metadata.get("source_candidate")
-    if raw is None:
-        return []
-
     config: list[dict[str, Any]] = []
+    if raw is not None:
+        raw_result = getattr(raw, "raw_result", None)
+        if isinstance(raw_result, dict) and raw_result:
+            config.append({"kind": "web_search_result", "result": raw_result})
+
+    extracted = candidate.raw_metadata.get("web_extraction_candidate")
+    if extracted is not None:
+        config.append(
+            {
+                "kind": "web_extraction",
+                "url": getattr(extracted, "url", None),
+                "title": getattr(extracted, "title", None),
+                "content_type": getattr(extracted, "content_type", None),
+            }
+        )
+
+    extraction_error = candidate.raw_metadata.get("web_extraction_error")
+    if isinstance(extraction_error, str) and extraction_error:
+        config.append({"kind": "web_extraction_error", "error": extraction_error})
+
+    if raw is None:
+        return config
+
     repository = getattr(raw, "repository", None)
     clone_url = getattr(raw, "clone_url", None)
     default_branch = getattr(raw, "default_branch", None)

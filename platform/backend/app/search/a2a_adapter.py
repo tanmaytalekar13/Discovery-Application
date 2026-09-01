@@ -41,6 +41,8 @@ from app.discovery.common.candidate import (
 from app.discovery.common.candidate import from_well_known_probe as _from_well_known
 from app.discovery.github.client import GitHubDiscoveryAdapter
 from app.discovery.web_extraction.client import WebExtractionAdapter
+from app.discovery.web_extraction.client import WebExtractionError
+from app.discovery.web_search.client import WebSearchCandidate
 from app.discovery.web_search.client import WebSearchDiscoveryAdapter
 from app.search.concurrency import gather_source_outcomes
 
@@ -131,7 +133,13 @@ class A2ADiscoveryAdapter:
             _a2a_biased_query(query),
             max_results,
         )
-        return [_from_web_search(candidate) for candidate in candidates]
+        return [
+            await _web_search_reference_with_extracted_content(
+                candidate,
+                self._web_extraction,
+            )
+            for candidate in candidates
+        ]
 
     async def _discover_extraction(self) -> list[CandidateReference]:
         assert self._web_extraction is not None
@@ -155,3 +163,22 @@ class A2ADiscoveryAdapter:
             else:
                 candidates.append(from_configured_endpoint(url=url, protocol="a2a"))
         return candidates
+
+
+async def _web_search_reference_with_extracted_content(
+    candidate: WebSearchCandidate,
+    extractor: WebExtractionAdapter | None,
+) -> CandidateReference:
+    reference = _from_web_search(candidate)
+    if extractor is None:
+        return reference
+
+    try:
+        extracted = await extractor.extract(candidate.url)
+    except WebExtractionError as exc:
+        reference.raw_metadata["web_extraction_error"] = str(exc)
+        return reference
+
+    if extracted is not None:
+        reference.raw_metadata["web_extraction_candidate"] = extracted
+    return reference

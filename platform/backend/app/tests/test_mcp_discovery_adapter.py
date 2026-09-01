@@ -2,6 +2,8 @@ import pytest
 
 from app.discovery.github.client import GitHubCandidate
 from app.discovery.mcp_registry.client import MCPRegistryCandidate
+from app.discovery.web_extraction.client import WebExtractionCandidate
+from app.discovery.web_search.client import WebSearchCandidate
 from app.models import DiscoverySource, ItemType, SourceType
 from app.search.mcp_adapter import MCPDiscoveryAdapter
 
@@ -62,6 +64,43 @@ class FakeMCPRegistry:
         return self._candidates
 
 
+class FakeWebSearch:
+    async def discover(self, query, max_results):
+        return [
+            WebSearchCandidate(
+                title="weather-mcp",
+                url="https://example.com/weather-mcp",
+                snippet="An MCP server for weather.",
+                item_type=ItemType.TOOL,
+                evidence=("result title/snippet explicitly identifies an MCP server",),
+                source=DiscoverySource(
+                    type=SourceType.WEB_SEARCH,
+                    id="https://example.com/weather-mcp",
+                    url="https://example.com/weather-mcp",
+                ),
+                raw_result={"title": "weather-mcp"},
+            )
+        ]
+
+
+class FakeWebExtractor:
+    def __init__(self):
+        self.urls = []
+
+    async def extract(self, url):
+        self.urls.append(url)
+        return WebExtractionCandidate(
+            title="weather-mcp",
+            url=url,
+            text_excerpt="short",
+            item_type=ItemType.TOOL,
+            evidence=("page text explicitly identifies an MCP server",),
+            source=DiscoverySource(type=SourceType.WEB_PAGE, id=url, url=url),
+            content_type="text/html",
+            text_content="Full extracted web page text.",
+        )
+
+
 @pytest.mark.asyncio
 async def test_disabled_sources_are_not_attempted():
     adapter = MCPDiscoveryAdapter()
@@ -120,3 +159,18 @@ async def test_configured_endpoints_are_included_without_a_network_call():
     assert outcomes[0].succeeded is True
     assert outcomes[0].candidates[0].source_type is SourceType.CONFIGURED
     assert outcomes[0].candidates[0].protocol == "mcp"
+
+
+@pytest.mark.asyncio
+async def test_web_search_candidates_are_enriched_with_extracted_page_content():
+    extractor = FakeWebExtractor()
+    adapter = MCPDiscoveryAdapter(web_search=FakeWebSearch(), web_extraction=extractor)
+
+    outcomes = await adapter.discover("weather")
+
+    assert len(outcomes) == 1
+    assert outcomes[0].source == "web_search"
+    candidate = outcomes[0].candidates[0]
+    assert extractor.urls == ["https://example.com/weather-mcp"]
+    extracted = candidate.raw_metadata["web_extraction_candidate"]
+    assert extracted.text_content == "Full extracted web page text."
