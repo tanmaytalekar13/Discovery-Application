@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     arcadedb_user: str = Field(min_length=1)
     arcadedb_password: str = Field(min_length=1)
     reliability_threshold: float = Field(default=0.75, ge=0, le=1)
-    discovery_mode: str = Field(default="mock", pattern="^(mock|live|mixed)$")
+    discovery_mode: str = Field(default="cached", pattern="^(cached|live|mixed|mock)$")
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     query_planner_timeout_seconds: float = Field(default=5.0, gt=0)
@@ -45,11 +45,22 @@ class Settings(BaseSettings):
     well_known_agent_hosts: str = ""
     configured_mcp_endpoints: str = ""
     configured_agent_card_urls: str = ""
+    web_extraction_urls: str = ""
+    web_extraction_timeout_seconds: float = Field(default=10.0, gt=0)
+    web_extraction_max_redirects: int = Field(default=5, ge=0)
+    web_extraction_max_response_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
+    web_extraction_respect_robots: bool = True
+    web_extraction_user_agent: str = "DiscoveryApplicationBot/0.1"
 
     discovery_max_results_per_source: int = Field(default=20, ge=1, le=100)
 
     def _split_csv(self, value: str) -> tuple[str, ...]:
         return tuple(item.strip() for item in value.split(",") if item.strip())
+
+    @field_validator("discovery_mode")
+    @classmethod
+    def normalize_discovery_mode(cls, value: str) -> str:
+        return "cached" if value == "mock" else value
 
     @property
     def a2a_registry_base_url_list(self) -> tuple[str, ...]:
@@ -66,6 +77,10 @@ class Settings(BaseSettings):
     @property
     def configured_agent_card_url_list(self) -> tuple[str, ...]:
         return self._split_csv(self.configured_agent_card_urls)
+
+    @property
+    def web_extraction_url_list(self) -> tuple[str, ...]:
+        return self._split_csv(self.web_extraction_urls)
 
 
 @lru_cache

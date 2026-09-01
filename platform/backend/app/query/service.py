@@ -64,3 +64,35 @@ class Phase11SearchService:
         )
         result_limit = limit or self._settings.discovery_max_results_per_source
         return Phase11SearchResult(plan=plan, results=tuple(ranked[:result_limit]))
+
+    async def rank_catalog_items(
+        self,
+        query: str,
+        items: list,
+        *,
+        item_type: PreferredType | None = None,
+        limit: int | None = None,
+        plan: QueryPlan | None = None,
+    ) -> Phase11SearchResult:
+        """Rank an already selected catalog item set through Phase 11 scoring."""
+        plan = plan or await plan_query(query, self._settings, preferred_type=item_type)
+        effective_type = item_type or plan.preferred_type
+        candidates = [
+            item
+            for item in items
+            if effective_type == "all" or item.type.value == effective_type
+        ]
+        weights = RankingWeights(
+            relevance=self._settings.ranking_relevance_weight,
+            reliability=self._settings.ranking_reliability_weight,
+            freshness=self._settings.ranking_freshness_weight,
+            evidence=self._settings.ranking_evidence_weight,
+        )
+        ranked = rank_items(
+            plan.expanded_query,
+            candidates,
+            embedder=self._embedder,
+            weights=weights,
+        )
+        result_limit = limit or self._settings.discovery_max_results_per_source
+        return Phase11SearchResult(plan=plan, results=tuple(ranked[:result_limit]))

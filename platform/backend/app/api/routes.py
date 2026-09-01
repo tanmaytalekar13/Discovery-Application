@@ -8,8 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.dependencies import (
+    get_application_search_service,
     get_item_repository,
-    get_search_service,
     get_test_run_repository,
 )
 from app.api.schemas import (
@@ -25,7 +25,7 @@ from app.api.schemas import (
 from app.db.repositories import ItemRepository, TestRunRepository
 from app.models import Item, TestRun
 from app.query.planner import PreferredType
-from app.query.service import Phase11SearchService
+from app.search.application import ApplicationSearchService
 
 router = APIRouter(prefix="/api", tags=["discovery"])
 
@@ -37,9 +37,9 @@ async def search(
     q: Annotated[str, Query(min_length=1)],
     type: Annotated[SearchType, Query()] = "all",
     limit: Annotated[int | None, Query(ge=1, le=100)] = None,
-    service: Phase11SearchService = Depends(get_search_service),
+    service: ApplicationSearchService = Depends(get_application_search_service),
 ) -> SearchResponse:
-    """Search the cached ArcadeDB catalog through the Phase 11 ranking boundary."""
+    """Search through the configured application discovery pipeline."""
     result = await service.search(q, item_type=_preferred_type(type), limit=limit)
     rows = [
         SearchResultItem(
@@ -50,16 +50,20 @@ async def search(
             freshness=ranked.freshness,
             evidence=ranked.evidence,
         )
-        for ranked in result.results
+        for ranked in result.ranked.results
     ]
     return SearchResponse(
         results=rows,
         metadata=SearchMetadata(
-            mode="cached",
-            sources_attempted=["arcadedb"],
-            sources_succeeded=["arcadedb"],
-            cached_results=len(rows),
-            plan=result.plan,
+            mode=result.metadata.mode,
+            sources_attempted=list(result.metadata.sources_attempted),
+            sources_succeeded=list(result.metadata.sources_succeeded),
+            sources_failed=list(result.metadata.sources_failed),
+            cached_results=result.metadata.cached_results,
+            live_candidates=result.metadata.live_candidates,
+            approved_count=result.metadata.approved_count,
+            rejected_count=result.metadata.rejected_count,
+            plan=result.ranked.plan,
         ),
     )
 

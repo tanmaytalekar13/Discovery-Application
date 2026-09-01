@@ -6,8 +6,8 @@ from uuid import UUID, uuid4
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import (
+    get_application_search_service,
     get_item_repository,
-    get_search_service,
     get_test_run_repository,
 )
 from app.main import app
@@ -27,6 +27,7 @@ from app.models import (
 from app.query.planner import QueryPlan
 from app.query.ranking import RankedItem
 from app.query.service import Phase11SearchResult
+from app.search.application import ApplicationSearchMetadata, ApplicationSearchResult
 
 
 def source(name: str = "weather") -> DiscoverySource:
@@ -87,7 +88,7 @@ def item(
     )
 
 
-class FakeSearchService:
+class FakeApplicationSearchService:
     def __init__(self, result_item: Item):
         self.result_item = result_item
         self.calls = []
@@ -100,7 +101,7 @@ class FakeSearchService:
             expanded_query=query,
             used_fallback=True,
         )
-        return Phase11SearchResult(
+        ranked = Phase11SearchResult(
             plan=plan,
             results=(
                 RankedItem(
@@ -111,6 +112,15 @@ class FakeSearchService:
                     freshness=1.0,
                     evidence=0.5,
                 ),
+            ),
+        )
+        return ApplicationSearchResult(
+            ranked=ranked,
+            metadata=ApplicationSearchMetadata(
+                mode="cached",
+                sources_attempted=("arcadedb",),
+                sources_succeeded=("arcadedb",),
+                cached_results=len(ranked.results),
             ),
         )
 
@@ -144,8 +154,8 @@ def teardown_function():
 
 def test_search_contract_returns_ranked_results_and_cached_metadata():
     result_item = item()
-    service = FakeSearchService(result_item)
-    client = client_with_overrides({get_search_service: lambda: service})
+    service = FakeApplicationSearchService(result_item)
+    client = client_with_overrides({get_application_search_service: lambda: service})
 
     response = client.get(
         "/api/search", params={"q": "weather tool", "type": "tool", "limit": 5}

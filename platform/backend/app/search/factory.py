@@ -60,13 +60,16 @@ def build_mcp_adapter(
         )
         web_search = WebSearchDiscoveryAdapter(provider)
 
-    web_extraction = (
-        WebExtractionAdapter(httpx_client=httpx_client)
-        if settings.enable_web_extraction
-        else None
-    )
+    web_extraction_urls = settings.web_extraction_url_list
+    web_extraction = _build_web_extraction_adapter(settings, httpx_client=httpx_client)
 
-    if github is None and mcp_registry is None and web_search is None:
+    if (
+        github is None
+        and mcp_registry is None
+        and web_search is None
+        and (web_extraction is None or not web_extraction_urls)
+        and not settings.configured_mcp_endpoint_list
+    ):
         return None
 
     return MCPDiscoveryAdapter(
@@ -74,6 +77,7 @@ def build_mcp_adapter(
         mcp_registry=mcp_registry,
         web_search=web_search,
         web_extraction=web_extraction,
+        extraction_urls=web_extraction_urls,
         configured_endpoints=settings.configured_mcp_endpoint_list,
     )
 
@@ -107,11 +111,8 @@ def build_a2a_adapter(
         )
         web_search = WebSearchDiscoveryAdapter(provider)
 
-    web_extraction = (
-        WebExtractionAdapter(httpx_client=httpx_client)
-        if settings.enable_web_extraction
-        else None
-    )
+    web_extraction_urls = settings.web_extraction_url_list
+    web_extraction = _build_web_extraction_adapter(settings, httpx_client=httpx_client)
 
     well_known_hosts: tuple[str, ...] = ()
     if settings.enable_well_known_a2a:
@@ -121,6 +122,7 @@ def build_a2a_adapter(
         github is None
         and not a2a_registries
         and web_search is None
+        and (web_extraction is None or not web_extraction_urls)
         and not well_known_hosts
         and not settings.configured_agent_card_url_list
     ):
@@ -131,6 +133,7 @@ def build_a2a_adapter(
         a2a_registries=a2a_registries,
         web_search=web_search,
         web_extraction=web_extraction,
+        extraction_urls=web_extraction_urls,
         well_known_hosts=well_known_hosts,
         configured_agent_card_urls=settings.configured_agent_card_url_list,
     )
@@ -183,4 +186,36 @@ def build_phase11_search_service(settings: Settings, db_client):
         repository=ItemRepository(db_client),
         settings=settings,
         embedder=LocalEmbeddingModel(settings.embedding_dimensions),
+    )
+
+
+def build_application_search_service(settings: Settings, db_client):
+    """Construct the user-facing search pipeline across Phases 09, 10, and 11."""
+    from app.search.application import ApplicationSearchService
+
+    phase11 = build_phase11_search_service(settings, db_client)
+    orchestrator = build_orchestrator(settings)
+    phase10 = build_phase10_pipeline(settings, db_client) if orchestrator else None
+    return ApplicationSearchService(
+        settings=settings,
+        phase11=phase11,
+        orchestrator=orchestrator,
+        phase10_pipeline=phase10,
+    )
+
+
+def _build_web_extraction_adapter(
+    settings: Settings,
+    *,
+    httpx_client: httpx.AsyncClient | None,
+) -> WebExtractionAdapter | None:
+    if not settings.enable_web_extraction or not settings.web_extraction_url_list:
+        return None
+    return WebExtractionAdapter(
+        httpx_client=httpx_client,
+        timeout_seconds=settings.web_extraction_timeout_seconds,
+        max_redirects=settings.web_extraction_max_redirects,
+        max_response_bytes=settings.web_extraction_max_response_bytes,
+        user_agent=settings.web_extraction_user_agent,
+        respect_robots=settings.web_extraction_respect_robots,
     )
