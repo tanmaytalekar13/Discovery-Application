@@ -19,6 +19,7 @@ from app.models import (
     ItemStatus,
     ItemType,
     Reliability,
+    SourceType,
     ToolMetadata,
 )
 from app.query.embeddings import LocalEmbeddingModel
@@ -214,10 +215,8 @@ class Phase10Pipeline:
         if resolution is None:
             resolution = await self._resolve_mcp_with_existing_client(candidate)
         if resolution is None:
-            if candidate.source_type.value == "web_search" and _has_explicit_protocol_evidence(
-                candidate
-            ):
-                return [self._best_effort_web_item(candidate)]
+            if _can_accept_best_effort_mcp(candidate):
+                return [self._best_effort_mcp_item(candidate)]
             raise CandidateRejected(
                 "MCP candidate could not be protocol-validated; initialize/tools/list requires a resolvable stdio transport",
                 list(candidate.evidence)
@@ -290,10 +289,7 @@ class Phase10Pipeline:
                     tool=ToolMetadata(
                         server_id=server_id, tool_name=tool_name, mcp_schema=schema
                     ),
-                    artifacts=ArtifactMetadata(
-                        source_available=bool(candidate.repository_url),
-                        source_url=candidate.repository_url,
-                    ),
+                    artifacts=_artifact_metadata(candidate),
                 )
             )
         if not result:
@@ -302,7 +298,7 @@ class Phase10Pipeline:
             )
         return result
 
-    def _best_effort_web_item(self, candidate: CandidateReference) -> Item:
+    def _best_effort_mcp_item(self, candidate: CandidateReference) -> Item:
         now = datetime.now(timezone.utc)
         source = _source(candidate)
         evidence = _evidence(
@@ -310,7 +306,7 @@ class Phase10Pipeline:
             source,
             now,
             "discovery",
-            list(candidate.evidence) or ["live web search result matched protocol keywords"],
+            list(candidate.evidence) or ["live discovery result matched protocol keywords"],
         )
         evidence.append(
             _new_evidence(
@@ -318,8 +314,8 @@ class Phase10Pipeline:
                 source,
                 now,
                 "protocol_validation",
-                "best-effort live web candidate accepted using explicit protocol evidence",
-                {"source": "web_search", "url": str(candidate.url or "")},
+                "best-effort live candidate accepted from source-backed protocol evidence",
+                {"source": source.type.value, "url": str(candidate.url or "")},
             )
         )
         canonical = canonical_identity(
@@ -343,7 +339,7 @@ class Phase10Pipeline:
                 tool_name=candidate.title or candidate.source_id,
                 mcp_schema={"type": "object"},
             ) if candidate.item_type == ItemType.TOOL else None,
-            artifacts=ArtifactMetadata(source_available=bool(candidate.url), source_url=candidate.url),
+            artifacts=_artifact_metadata(candidate),
         )
 
     async def _resolve_a2a_with_existing_client(
@@ -538,6 +534,20 @@ def _has_explicit_protocol_evidence(candidate: CandidateReference) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _can_accept_best_effort_mcp(candidate: CandidateReference) -> bool:
+    """Accept non-executable MCP discovery hits without running arbitrary code."""
+    if candidate.item_type is not ItemType.TOOL:
+        return False
+    if candidate.source_type is SourceType.MCP_REGISTRY:
+        raw = candidate.raw_metadata.get("source_candidate")
+        return raw is not None and bool(getattr(raw, "version", None))
+    if candidate.source_type is SourceType.GITHUB:
+        return bool(candidate.repository_url and candidate.evidence)
+    if candidate.source_type in {SourceType.WEB_SEARCH, SourceType.WEB_PAGE}:
+        return _has_explicit_protocol_evidence(candidate)
+    return False
+
+
 def _candidate_has_explicit_protocol_evidence(item: Item) -> bool:
     text = " ".join(
         entry.statement.lower() for entry in item.evidence
@@ -557,6 +567,65 @@ def _candidate_has_explicit_protocol_evidence(item: Item) -> bool:
         "well-known",
     )
     return any(marker in text for marker in markers)
+
+
+def _artifact_metadata(candidate: CandidateReference) -> ArtifactMetadata:
+    source_url = candidate.repository_url or candidate.url
+    return ArtifactMetadata(
+        source_available=bool(source_url),
+        source_url=source_url,
+        source_code=_artifact_source_code(candidate),
+        config_files=_artifact_config_files(candidate),
+    )
+
+
+def _artifact_source_code(candidate: CandidateReference) -> str | None:
+    raw = candidate.raw_metadata.get("source_candidate")
+    if raw is None:
+        return None
+
+    readme = getattr(raw, "readme", None)
+    if isinstance(readme, str) and readme.strip():
+        return readme
+
+    return None
+
+
+def _artifact_config_files(candidate: CandidateReference) -> list[dict[str, Any]]:
+    raw = candidate.raw_metadata.get("source_candidate")
+    if raw is None:
+        return []
+
+    config: list[dict[str, Any]] = []
+    repository = getattr(raw, "repository", None)
+    clone_url = getattr(raw, "clone_url", None)
+    default_branch = getattr(raw, "default_branch", None)
+    if repository or clone_url or default_branch:
+        config.append(
+            {
+                "kind": "github_repository",
+                "repository": repository,
+                "clone_url": clone_url,
+                "default_branch": default_branch,
+            }
+        )
+
+    root_entries = tuple(getattr(raw, "root_entries", ()) or ())
+    if root_entries:
+        config.append({"kind": "github_root_entries", "entries": list(root_entries)})
+
+    packages = tuple(getattr(raw, "packages", ()) or ())
+    remotes = tuple(getattr(raw, "remotes", ()) or ())
+    if packages:
+        config.append({"kind": "mcp_registry_packages", "packages": list(packages)})
+    if remotes:
+        config.append({"kind": "mcp_registry_remotes", "remotes": list(remotes)})
+
+    raw_server = getattr(raw, "raw_server", None)
+    if isinstance(raw_server, dict) and raw_server:
+        config.append({"kind": "mcp_registry_server", "server": raw_server})
+
+    return config
 
 
 def _evidence(

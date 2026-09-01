@@ -47,6 +47,8 @@ class GitHubCandidate:
     item_type: ItemType
     evidence: tuple[str, ...]
     source: DiscoverySource
+    readme: str = ""
+    root_entries: tuple[dict[str, Any], ...] = ()
 
 
 class GitHubDiscoveryAdapter:
@@ -192,6 +194,8 @@ class GitHubDiscoveryAdapter:
                 id=full_name,
                 url=repo.get("html_url"),
             ),
+            readme=readme,
+            root_entries=tuple(root_entries),
         )
 
     @staticmethod

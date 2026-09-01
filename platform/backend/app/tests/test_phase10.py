@@ -5,7 +5,10 @@ import pytest
 
 from app.config import Settings
 from app.discovery.common.candidate import CandidateReference
+from app.discovery.github.client import GitHubCandidate
+from app.discovery.mcp_registry.client import MCPRegistryCandidate
 from app.models import ItemType, SourceType
+from app.models import DiscoverySource
 from app.normalization.pipeline import Phase10Pipeline
 from app.reliability.engine import evaluate
 
@@ -79,6 +82,107 @@ async def test_phase10_accepts_web_search_result_as_best_effort_live_hit():
     assert item.type is ItemType.TOOL
     assert item.source.type is SourceType.WEB_SEARCH
     assert item.name == "Example MCP Server"
+
+
+@pytest.mark.asyncio
+async def test_phase10_accepts_github_mcp_candidate_and_exposes_repository_artifacts():
+    repo = FakeRepository()
+    settings = Settings(
+        arcadedb_host="localhost",
+        arcadedb_database="test",
+        arcadedb_user="root",
+        arcadedb_password="root",
+        reliability_threshold=0.75,
+    )
+    raw = GitHubCandidate(
+        repository="example/mcp-server",
+        name="mcp-server",
+        html_url="https://github.com/example/mcp-server",
+        clone_url="https://github.com/example/mcp-server.git",
+        default_branch="main",
+        description="Model Context Protocol server",
+        item_type=ItemType.TOOL,
+        evidence=("repository metadata/documentation explicitly identifies an MCP server",),
+        source=DiscoverySource(
+            type=SourceType.GITHUB,
+            id="example/mcp-server",
+            url="https://github.com/example/mcp-server",
+        ),
+    )
+    github_candidate = CandidateReference(
+        protocol="mcp",
+        item_type=ItemType.TOOL,
+        source_type=SourceType.GITHUB,
+        source_provider="GitHub",
+        source_id="example/mcp-server",
+        url="https://github.com/example/mcp-server",
+        repository_url="https://github.com/example/mcp-server",
+        title="mcp-server",
+        description="Model Context Protocol server",
+        evidence=raw.evidence,
+        raw_metadata={"source_candidate": raw},
+    )
+
+    result = await Phase10Pipeline(repo, settings).process([github_candidate])
+
+    assert len(result.approved) == 1
+    item = result.approved[0]
+    assert item.source.type is SourceType.GITHUB
+    assert str(item.artifacts.source_url) == "https://github.com/example/mcp-server"
+    assert item.artifacts.config_files[0]["kind"] == "github_repository"
+    assert item.artifacts.config_files[0]["clone_url"].endswith(".git")
+
+
+@pytest.mark.asyncio
+async def test_phase10_accepts_mcp_registry_candidate_and_exposes_registry_artifacts():
+    repo = FakeRepository()
+    settings = Settings(
+        arcadedb_host="localhost",
+        arcadedb_database="test",
+        arcadedb_user="root",
+        arcadedb_password="root",
+        reliability_threshold=0.75,
+    )
+    raw = MCPRegistryCandidate(
+        server_name="io.example/weather",
+        title="Weather MCP",
+        description="Weather Model Context Protocol server",
+        version="1.0.0",
+        repository_url="https://github.com/example/weather-mcp",
+        packages=({"registryType": "npm", "identifier": "@example/weather-mcp"},),
+        remotes=({"transportType": "sse", "url": "https://example.com/mcp"},),
+        raw_server={"name": "io.example/weather", "version": "1.0.0"},
+        source=DiscoverySource(
+            type=SourceType.MCP_REGISTRY,
+            id="io.example/weather",
+            url="https://github.com/example/weather-mcp",
+        ),
+    )
+    registry_candidate = CandidateReference(
+        protocol="mcp",
+        item_type=ItemType.TOOL,
+        source_type=SourceType.MCP_REGISTRY,
+        source_provider="MCP Registry",
+        source_id="io.example/weather",
+        url="https://github.com/example/weather-mcp",
+        repository_url="https://github.com/example/weather-mcp",
+        title="Weather MCP",
+        description="Weather Model Context Protocol server",
+        evidence=("returned by the official MCP Registry as version 1.0.0",),
+        raw_metadata={"source_candidate": raw},
+    )
+
+    result = await Phase10Pipeline(repo, settings).process([registry_candidate])
+
+    assert len(result.approved) == 1
+    item = result.approved[0]
+    assert item.source.type is SourceType.MCP_REGISTRY
+    assert str(item.artifacts.source_url) == "https://github.com/example/weather-mcp"
+    assert {entry["kind"] for entry in item.artifacts.config_files} == {
+        "mcp_registry_packages",
+        "mcp_registry_remotes",
+        "mcp_registry_server",
+    }
 
 
 @pytest.mark.asyncio
