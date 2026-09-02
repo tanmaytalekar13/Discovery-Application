@@ -15,8 +15,13 @@ from typing import Any
 from uuid import UUID
 
 
-# Base directory for all cached artifacts
-CACHE_BASE_DIR = Path("/tmp/discovery_cache")
+# Base directory for all cached artifacts.
+#
+# Defaults to a path meant to live on a mounted, persistent Docker volume
+# (see docker-compose.yml -> backend.volumes) so that downloaded source
+# code/trees survive container restarts and rebuilds. Override with the
+# SOURCE_CACHE_DIR env var for local (non-container) development.
+CACHE_BASE_DIR = Path(os.getenv("SOURCE_CACHE_DIR", "/data/discovery_cache"))
 
 
 def _get_cache_root() -> Path:

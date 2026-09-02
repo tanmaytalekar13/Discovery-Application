@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -108,14 +109,25 @@ async def get_item_artifacts(
     item = await _require_item(item_id, repository)
 
     integration_result, integration_cache_path = synthesize_integration(item)
-    source_result = await resolve_source(item)
+    source_result, source_readme_cache_path = await resolve_source(item)
 
-    # Update cache path in DB if new path was generated
+    # Persist any newly-written disk cache pointers in a single DB update
+    # (avoid two sequential writes stomping on each other's stale snapshot
+    # of item.artifacts).
+    artifact_updates: dict = {}
     if integration_cache_path and integration_cache_path != item.artifacts.integration_cache_path:
+        artifact_updates["integration_cache_path"] = integration_cache_path
+    if (
+        source_readme_cache_path
+        and source_readme_cache_path != item.artifacts.source_readme_cache_path
+    ):
+        artifact_updates["source_readme_cache_path"] = source_readme_cache_path
+
+    if artifact_updates:
         await repository.update(item_id, {
             "artifacts": {
-                **item.artifacts.model_dump(mode='json'),
-                "integration_cache_path": integration_cache_path,
+                **item.artifacts.model_dump(mode="json"),
+                **artifact_updates,
             }
         })
 
@@ -181,12 +193,15 @@ async def get_source_tree(
 
     tree_result, tree_cache_path = await get_repository_tree(item)
 
-    # Update cache path in DB if new path was generated
+    # Update cache path (and full-download timestamp) in DB if a new tree
+    # was just fetched+cached. From here on, /source/files/{path} calls for
+    # this item are served straight from disk - GitHub isn't hit again.
     if tree_cache_path and tree_cache_path != item.artifacts.source_tree_cache_path:
         await repository.update(item_id, {
             "artifacts": {
-                **item.artifacts.model_dump(mode='json'),
+                **item.artifacts.model_dump(mode="json"),
                 "source_tree_cache_path": tree_cache_path,
+                "source_downloaded_at": datetime.now(timezone.utc).isoformat(),
             }
         })
 

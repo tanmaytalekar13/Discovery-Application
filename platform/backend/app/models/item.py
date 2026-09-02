@@ -112,6 +112,11 @@ class ArtifactMetadata(BaseModel):
     # Cache paths (relative paths stored in DB, actual content on disk)
     integration_cache_path: str | None = None
     source_tree_cache_path: str | None = None
+    source_readme_cache_path: str | None = None
+
+    # Timestamp of the last full repository download (tree + all files).
+    # None means the repository has never been fully cached to disk.
+    source_downloaded_at: datetime | None = None
 
 
 class Item(BaseModel):

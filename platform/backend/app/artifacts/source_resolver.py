@@ -16,6 +16,39 @@ from app.models import Item
 from app.artifacts import disk_cache
 
 
+# Extensions that are almost never useful to preview/inspect and are
+# frequently large (binaries, images, archives, lockfiles). Skipped during
+# the eager "download the whole repo" pass to save disk space and avoid
+# burning through the GitHub API rate limit on files nobody will open.
+_SKIP_DOWNLOAD_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg",
+    ".pdf", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar",
+    ".woff", ".woff2", ".ttf", ".eot",
+    ".mp4", ".mp3", ".mov", ".avi",
+    ".so", ".dll", ".dylib", ".exe", ".bin", ".wasm",
+    ".lock",
+)
+_SKIP_DOWNLOAD_FILENAMES = (
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+    "Cargo.lock", "Gemfile.lock", "composer.lock",
+)
+# Files larger than this are skipped during the eager download pass.
+_MAX_EAGER_DOWNLOAD_BYTES = 500_000
+
+
+def _should_skip_eager_download(file_path: str, size: int | None) -> bool:
+    """Decide whether a repo file should be skipped during bulk download."""
+    lower_path = file_path.lower()
+    if lower_path.endswith(_SKIP_DOWNLOAD_EXTENSIONS):
+        return True
+    filename = file_path.rsplit("/", 1)[-1]
+    if filename in _SKIP_DOWNLOAD_FILENAMES:
+        return True
+    if size is not None and size > _MAX_EAGER_DOWNLOAD_BYTES:
+        return True
+    return False
+
+
 class SourcePreviewResult:
     def __init__(
         self,
@@ -118,8 +151,16 @@ async def _download_all_files(
     Download all files from the repository tree in parallel and cache them to disk.
     Only downloads blob (file) types, skips tree (directory) entries.
     """
-    # Filter only files (blobs), skip directories (trees)
-    file_nodes = [node for node in tree if node.get("type") == "blob"]
+    # Filter only files (blobs), skip directories (trees) and files we've
+    # decided aren't worth eagerly caching (binaries, lockfiles, oversized
+    # files - see _should_skip_eager_download).
+    file_nodes = [
+        node
+        for node in tree
+        if node.get("type") == "blob"
+        and node.get("path")
+        and not _should_skip_eager_download(node["path"], node.get("size"))
+    ]
 
     # Limit concurrent downloads to avoid overwhelming GitHub API
     semaphore = asyncio.Semaphore(10)  # Max 10 concurrent downloads
@@ -131,7 +172,9 @@ async def _download_all_files(
             if not file_path:
                 return
 
-            # Check if already cached
+            # Check if already cached (path_exists is the correct check here,
+            # not a truthy read, so empty-but-valid cached files aren't
+            # mistaken for "not cached" and re-downloaded).
             cache_path = disk_cache.generate_source_file_cache_path(item.item_id, file_path)
             if disk_cache.path_exists(cache_path):
                 return  # Already cached, skip
@@ -250,7 +293,9 @@ async def get_repository_tree(item: Item) -> tuple[RepositoryTreeResult, str | N
     cache_path = item.artifacts.source_tree_cache_path
     if cache_path:
         cached_data = disk_cache.read_cached_json(cache_path)
-        if cached_data:
+        # Use `is not None`, not truthy: an empty-but-valid cached JSON
+        # object (e.g. `{}`) must still count as a cache hit, not a miss.
+        if cached_data is not None:
             return RepositoryTreeResult(
                 available=True,
                 tree=cached_data.get("tree"),
@@ -291,7 +336,9 @@ async def get_repository_tree(item: Item) -> tuple[RepositoryTreeResult, str | N
 
     disk_cache.write_cached_json(new_cache_path, cache_data)
 
-    # Download all files in the tree and cache them
+    # Download all files in the tree and cache them to disk right away, so
+    # that every subsequent /source/files/{path} call is served from disk
+    # instead of hitting GitHub again.
     await _download_all_files(item, owner, repo, branch, tree)
 
     return RepositoryTreeResult(available=True, tree=tree), new_cache_path
@@ -306,7 +353,9 @@ async def get_source_file(item: Item, file_path: str) -> SourceFileResult:
     # Check cache
     cache_path = disk_cache.generate_source_file_cache_path(item.item_id, file_path)
     cached_content = disk_cache.read_cached_file(cache_path)
-    if cached_content:
+    # `is not None`, not truthy: a cached-but-empty file is still a cache
+    # hit and must not trigger a redundant GitHub fetch.
+    if cached_content is not None:
         return SourceFileResult(
             available=True,
             content=cached_content,
@@ -347,39 +396,65 @@ async def get_source_file(item: Item, file_path: str) -> SourceFileResult:
     )
 
 
-async def resolve_source(item: Item) -> SourcePreviewResult:
+async def resolve_source(item: Item) -> tuple[SourcePreviewResult, str | None]:
     """
-    Returns README/doc text for source preview.
+    Returns README/doc text for source preview, with disk caching.
 
-    First checks item.artifacts.source_code (captured during discovery).
-    If missing, attempts to fetch README.md from GitHub repository.
+    Resolution order:
+      1. item.artifacts.source_code (captured inline during discovery -
+         already persisted in the DB, so no disk cache needed).
+      2. Disk cache at item.artifacts.source_readme_cache_path, if set.
+      3. Fetch README.md from GitHub, then write it to disk and return the
+         new relative cache path so the caller can persist it as a pointer
+         in the DB (mirrors the integration/source-tree caching pattern).
+
+    Returns (SourcePreviewResult, relative_cache_path or None). The cache
+    path is only non-None when a *new* cache entry was written; callers
+    should compare against the existing DB value before writing.
     """
     source_code = item.artifacts.source_code
+    if source_code:
+        return _source_preview_from_inline_code(item, source_code), None
 
-    # If source_code is missing, try fetching README from GitHub
-    if not source_code:
-        source_url = str(item.artifacts.source_url) if item.artifacts.source_url else None
-        if source_url:
-            repo_info = _extract_github_repo_info(source_url)
-            if repo_info:
-                owner, repo, branch = repo_info
-                # Try fetching README.md
-                readme_content = await fetch_github_file(owner, repo, "README.md", branch)
-                if readme_content:
-                    return SourcePreviewResult(
-                        available=True,
-                        language="markdown",
-                        content=readme_content,
-                        note="README.md fetched from GitHub repository.",
-                    )
+    # Cache hit: serve the previously downloaded README straight from disk,
+    # no network call at all.
+    existing_cache_path = item.artifacts.source_readme_cache_path
+    if existing_cache_path:
+        cached_content = disk_cache.read_cached_file(existing_cache_path)
+        if cached_content is not None:
+            return SourcePreviewResult(
+                available=True,
+                language="markdown",
+                content=cached_content,
+                note="README.md served from disk cache.",
+            ), existing_cache_path
 
-        return SourcePreviewResult(
-            available=False,
-            note="Source code was not retrieved for this item — only registry "
-                 "or configuration metadata is available.",
-        )
+    # Cache miss: fetch README from GitHub, then persist it to disk.
+    source_url = str(item.artifacts.source_url) if item.artifacts.source_url else None
+    if source_url:
+        repo_info = _extract_github_repo_info(source_url)
+        if repo_info:
+            owner, repo, branch = repo_info
+            readme_content = await fetch_github_file(owner, repo, "README.md", branch)
+            if readme_content:
+                new_cache_path = disk_cache.generate_cache_path(item.item_id, "readme", "md")
+                disk_cache.write_cached_file(new_cache_path, readme_content)
+                return SourcePreviewResult(
+                    available=True,
+                    language="markdown",
+                    content=readme_content,
+                    note="README.md fetched from GitHub repository and cached to disk.",
+                ), new_cache_path
 
-    # Infer language from source URL
+    return SourcePreviewResult(
+        available=False,
+        note="Source code was not retrieved for this item — only registry "
+             "or configuration metadata is available.",
+    ), None
+
+
+def _source_preview_from_inline_code(item: Item, source_code: str) -> SourcePreviewResult:
+    """Build a SourcePreviewResult from source_code already stored on the item."""
     url = str(item.artifacts.source_url) if item.artifacts.source_url else ""
     language = "markdown"
     for ext, lang in (

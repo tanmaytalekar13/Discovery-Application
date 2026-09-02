@@ -55,8 +55,14 @@ services:
       CONFIGURED_MCP_ENDPOINTS: ${CONFIGURED_MCP_ENDPOINTS:-}
       CONFIGURED_AGENT_CARD_URLS: ${CONFIGURED_AGENT_CARD_URLS:-}
       DISCOVERY_MAX_RESULTS_PER_SOURCE: ${DISCOVERY_MAX_RESULTS_PER_SOURCE:-20}
+      SOURCE_CACHE_DIR: ${SOURCE_CACHE_DIR:-/data/discovery_cache}
     volumes:
       - ./platform/arcadedb/init:/app/arcadedb/init:ro
+      # Persistent cache for downloaded repo trees/files/READMEs so a
+      # container restart or rebuild doesn't wipe out already-downloaded
+      # source code. DB (ArcadeDB) only stores a pointer (relative path)
+      # into this volume.
+      - agentic_discovery_platform_source_cache:/data/discovery_cache
     ports:
       - "8000:8000"
     depends_on:
@@ -82,3 +88,5 @@ networks:
 volumes:
   agentic_discovery_platform_arcadedb_data:
     name: agentic_discovery_platform_arcadedb_data
+  agentic_discovery_platform_source_cache:
+    name: agentic_discovery_platform_source_cache
