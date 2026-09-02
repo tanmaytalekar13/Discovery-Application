@@ -1,10 +1,7 @@
 from __future__ import annotations
-
 from typing import Any, Literal
 from uuid import UUID
-
 from pydantic import BaseModel, Field
-
 from app.models import (
     ArtifactMetadata,
     DiscoveryEvidence,
@@ -66,9 +63,34 @@ class ItemProvenanceResponse(BaseModel):
     evidence: list[DiscoveryEvidence]
 
 
+# --- NEW: View Code / Monaco editor support ---------------------------------
+
+class IntegrationSnippet(BaseModel):
+    """Ready-to-paste mcpServers JSON config for the 'Integration' tab."""
+
+    available: bool
+    language: str = "json"
+    snippet: str | None = None
+    source: str | None = None  # "synthesized_from_registry" | "extracted_from_docs" | "cached"
+    note: str | None = None
+
+
+class SourcePreview(BaseModel):
+    """README / extracted docs text for the 'Source' tab."""
+
+    available: bool
+    language: str | None = None
+    content: str | None = None
+    note: str | None = None
+
+
 class ItemArtifactsResponse(BaseModel):
     item_id: UUID
     artifacts: ArtifactMetadata
+    integration: IntegrationSnippet
+    source_preview: SourcePreview
+
+# ------------------------------------------------------------------------------
 
 
 class DeferredExecutionResponse(BaseModel):

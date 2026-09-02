@@ -14,6 +14,7 @@ from app.api.dependencies import (
 )
 from app.api.schemas import (
     DeferredExecutionResponse,
+    IntegrationSnippet,
     ItemArtifactsResponse,
     ItemProvenanceResponse,
     ItemSchemaResponse,
@@ -21,8 +22,11 @@ from app.api.schemas import (
     SearchResponse,
     SearchResultItem,
     SearchToolItem,
+    SourcePreview,
     TestRunResponse,
 )
+from app.artifacts.integration_synthesizer import synthesize_integration
+from app.artifacts.source_resolver import resolve_source
 from app.db.repositories import ItemRepository, TestRunRepository
 from app.models import Item, TestRun
 from app.query.planner import PreferredType
@@ -99,7 +103,26 @@ async def get_item_artifacts(
     repository: ItemRepository = Depends(get_item_repository),
 ) -> ItemArtifactsResponse:
     item = await _require_item(item_id, repository)
-    return ItemArtifactsResponse(item_id=item.item_id, artifacts=item.artifacts)
+
+    integration_result = synthesize_integration(item)
+    source_result = resolve_source(item)
+
+    return ItemArtifactsResponse(
+        item_id=item.item_id,
+        artifacts=item.artifacts,
+        integration=IntegrationSnippet(
+            available=integration_result.available,
+            snippet=integration_result.snippet,
+            source=integration_result.source,
+            note=integration_result.note,
+        ),
+        source_preview=SourcePreview(
+            available=source_result.available,
+            language=source_result.language,
+            content=source_result.content,
+            note=source_result.note,
+        ),
+    )
 
 
 @router.get("/items/{item_id}/schema", response_model=ItemSchemaResponse)

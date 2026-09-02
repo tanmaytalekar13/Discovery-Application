@@ -1,0 +1,1 @@
+"""Artifact-related synthesis and source resolution for View Code panel."""
