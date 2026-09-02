@@ -5,6 +5,7 @@ Supports fetching repository tree and individual files from GitHub with caching.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 from typing import Any
@@ -100,7 +101,7 @@ def _extract_github_repo_info(source_url: str) -> tuple[str, str, str] | None:
         return None
 
     owner = path_parts[0]
-    repo = path_parts[1]
+    repo = path_parts[1].removesuffix(".git")  # Strip .git suffix if present
 
     # Default to main branch
     branch = "main"
@@ -110,11 +111,47 @@ def _extract_github_repo_info(source_url: str) -> tuple[str, str, str] | None:
     return owner, repo, branch
 
 
+async def _download_all_files(
+    item: Item, owner: str, repo: str, branch: str, tree: list[dict[str, Any]]
+) -> None:
+    """
+    Download all files from the repository tree in parallel and cache them to disk.
+    Only downloads blob (file) types, skips tree (directory) entries.
+    """
+    # Filter only files (blobs), skip directories (trees)
+    file_nodes = [node for node in tree if node.get("type") == "blob"]
+
+    # Limit concurrent downloads to avoid overwhelming GitHub API
+    semaphore = asyncio.Semaphore(10)  # Max 10 concurrent downloads
+
+    async def download_one_file(file_node: dict[str, Any]) -> None:
+        """Download and cache a single file."""
+        async with semaphore:
+            file_path = file_node.get("path")
+            if not file_path:
+                return
+
+            # Check if already cached
+            cache_path = disk_cache.generate_source_file_cache_path(item.item_id, file_path)
+            if disk_cache.path_exists(cache_path):
+                return  # Already cached, skip
+
+            # Fetch from GitHub
+            content = await fetch_github_file(owner, repo, file_path, branch)
+            if content:
+                # Save to disk
+                disk_cache.write_cached_file(cache_path, content)
+
+    # Download all files in parallel
+    await asyncio.gather(*[download_one_file(node) for node in file_nodes], return_exceptions=True)
+
+
 async def fetch_github_tree(
     owner: str, repo: str, branch: str = "main"
 ) -> list[dict[str, Any]] | None:
     """
     Fetch repository tree from GitHub API.
+    Automatically tries common branch names if the specified branch fails.
 
     Returns simplified tree structure or None on error.
     """
@@ -126,31 +163,41 @@ async def fetch_github_tree(
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
 
-    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+    # Try provided branch first, then fallback to common alternatives
+    branches_to_try = [branch]
+    if branch == "main":
+        branches_to_try.extend(["master", "HEAD"])
+    elif branch == "master":
+        branches_to_try.extend(["main", "HEAD"])
+    else:
+        branches_to_try.extend(["main", "master", "HEAD"])
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers)
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        for try_branch in branches_to_try:
+            url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{try_branch}?recursive=1"
 
-            if response.status_code != 200:
-                return None
+            try:
+                response = await client.get(url, headers=headers)
 
-            data = response.json()
-            tree = data.get("tree", [])
+                if response.status_code == 200:
+                    data = response.json()
+                    tree = data.get("tree", [])
 
-            # Simplify tree structure for frontend
-            simplified_tree = []
-            for item in tree:
-                if item.get("type") in ("blob", "tree"):
-                    simplified_tree.append({
-                        "path": item["path"],
-                        "type": item["type"],  # "blob" = file, "tree" = directory
-                        "size": item.get("size"),
-                    })
+                    # Simplify tree structure for frontend
+                    simplified_tree = []
+                    for item in tree:
+                        if item.get("type") in ("blob", "tree"):
+                            simplified_tree.append({
+                                "path": item["path"],
+                                "type": item["type"],  # "blob" = file, "tree" = directory
+                                "size": item.get("size"),
+                            })
 
-            return simplified_tree
-    except Exception:
-        return None
+                    return simplified_tree
+            except Exception:
+                continue
+
+    return None
 
 
 async def fetch_github_file(
@@ -174,7 +221,7 @@ async def fetch_github_file(
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}?ref={branch}"
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             response = await client.get(url, headers=headers)
 
             if response.status_code != 200:
@@ -233,7 +280,7 @@ async def get_repository_tree(item: Item) -> tuple[RepositoryTreeResult, str | N
             note="Failed to fetch repository tree from GitHub.",
         ), None
 
-    # Save to disk cache
+    # Save tree to disk cache
     new_cache_path = disk_cache.generate_cache_path(item.item_id, "source_tree", "json")
     cache_data = {
         "owner": owner,
@@ -242,10 +289,12 @@ async def get_repository_tree(item: Item) -> tuple[RepositoryTreeResult, str | N
         "tree": tree,
     }
 
-    if disk_cache.write_cached_json(new_cache_path, cache_data):
-        return RepositoryTreeResult(available=True, tree=tree), new_cache_path
+    disk_cache.write_cached_json(new_cache_path, cache_data)
 
-    return RepositoryTreeResult(available=True, tree=tree), None
+    # Download all files in the tree and cache them
+    await _download_all_files(item, owner, repo, branch, tree)
+
+    return RepositoryTreeResult(available=True, tree=tree), new_cache_path
 
 
 async def get_source_file(item: Item, file_path: str) -> SourceFileResult:
@@ -298,11 +347,32 @@ async def get_source_file(item: Item, file_path: str) -> SourceFileResult:
     )
 
 
-def resolve_source(item: Item) -> SourcePreviewResult:
-    """Legacy function for backward compatibility - returns README/doc text."""
+async def resolve_source(item: Item) -> SourcePreviewResult:
+    """
+    Returns README/doc text for source preview.
+
+    First checks item.artifacts.source_code (captured during discovery).
+    If missing, attempts to fetch README.md from GitHub repository.
+    """
     source_code = item.artifacts.source_code
 
+    # If source_code is missing, try fetching README from GitHub
     if not source_code:
+        source_url = str(item.artifacts.source_url) if item.artifacts.source_url else None
+        if source_url:
+            repo_info = _extract_github_repo_info(source_url)
+            if repo_info:
+                owner, repo, branch = repo_info
+                # Try fetching README.md
+                readme_content = await fetch_github_file(owner, repo, "README.md", branch)
+                if readme_content:
+                    return SourcePreviewResult(
+                        available=True,
+                        language="markdown",
+                        content=readme_content,
+                        note="README.md fetched from GitHub repository.",
+                    )
+
         return SourcePreviewResult(
             available=False,
             note="Source code was not retrieved for this item — only registry "

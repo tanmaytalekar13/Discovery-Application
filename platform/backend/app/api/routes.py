@@ -108,7 +108,7 @@ async def get_item_artifacts(
     item = await _require_item(item_id, repository)
 
     integration_result, integration_cache_path = synthesize_integration(item)
-    source_result = resolve_source(item)
+    source_result = await resolve_source(item)
 
     # Update cache path in DB if new path was generated
     if integration_cache_path and integration_cache_path != item.artifacts.integration_cache_path:
