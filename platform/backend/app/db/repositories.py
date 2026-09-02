@@ -548,6 +548,15 @@ class ItemRepository:
             row.get("last_synced"),
             row.get("last_evaluated"),
         )
+
+        # Fix corrupted artifacts.source_url if it's a dict
+        artifacts = row.get("artifacts", {})
+        if isinstance(artifacts, dict) and "source_url" in artifacts:
+            source_url = artifacts["source_url"]
+            if isinstance(source_url, dict) and "_url" in source_url:
+                # Corrupted HttpUrl object - extract the actual URL string
+                artifacts["source_url"] = source_url["_url"]
+
         return Item.model_validate(
             {
                 "item_id": row["item_id"],
@@ -587,7 +596,7 @@ class ItemRepository:
                 },
                 "tool": row.get("tool"),
                 "agent": row.get("agent"),
-                "artifacts": row.get("artifacts", {}),
+                "artifacts": artifacts,
                 "provenance": row.get("provenance", []),
                 "evidence": row.get("evidence_summary", []),
                 "embedding": row.get("embedding"),

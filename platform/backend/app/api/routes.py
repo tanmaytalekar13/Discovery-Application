@@ -18,15 +18,18 @@ from app.api.schemas import (
     ItemArtifactsResponse,
     ItemProvenanceResponse,
     ItemSchemaResponse,
+    RepositoryTreeItem,
+    RepositoryTreeResponse,
     SearchMetadata,
     SearchResponse,
     SearchResultItem,
     SearchToolItem,
+    SourceFileResponse,
     SourcePreview,
     TestRunResponse,
 )
 from app.artifacts.integration_synthesizer import synthesize_integration
-from app.artifacts.source_resolver import resolve_source
+from app.artifacts.source_resolver import get_repository_tree, get_source_file, resolve_source
 from app.db.repositories import ItemRepository, TestRunRepository
 from app.models import Item, TestRun
 from app.query.planner import PreferredType
@@ -104,8 +107,17 @@ async def get_item_artifacts(
 ) -> ItemArtifactsResponse:
     item = await _require_item(item_id, repository)
 
-    integration_result = synthesize_integration(item)
+    integration_result, integration_cache_path = synthesize_integration(item)
     source_result = resolve_source(item)
+
+    # Update cache path in DB if new path was generated
+    if integration_cache_path and integration_cache_path != item.artifacts.integration_cache_path:
+        await repository.update(item_id, {
+            "artifacts": {
+                **item.artifacts.model_dump(mode='json'),
+                "integration_cache_path": integration_cache_path,
+            }
+        })
 
     return ItemArtifactsResponse(
         item_id=item.item_id,
@@ -156,6 +168,63 @@ async def get_item_provenance(
         item_id=item.item_id,
         provenance=item.provenance,
         evidence=item.evidence,
+    )
+
+
+@router.get("/items/{item_id}/source/tree", response_model=RepositoryTreeResponse)
+async def get_source_tree(
+    item_id: UUID,
+    repository: ItemRepository = Depends(get_item_repository),
+) -> RepositoryTreeResponse:
+    """Fetch repository file tree structure with caching."""
+    item = await _require_item(item_id, repository)
+
+    tree_result, tree_cache_path = await get_repository_tree(item)
+
+    # Update cache path in DB if new path was generated
+    if tree_cache_path and tree_cache_path != item.artifacts.source_tree_cache_path:
+        await repository.update(item_id, {
+            "artifacts": {
+                **item.artifacts.model_dump(mode='json'),
+                "source_tree_cache_path": tree_cache_path,
+            }
+        })
+
+    tree_items = [
+        RepositoryTreeItem(
+            path=node["path"],
+            type=node["type"],
+            size=node.get("size"),
+        )
+        for node in (tree_result.tree or [])
+    ]
+
+    return RepositoryTreeResponse(
+        item_id=item.item_id,
+        available=tree_result.available,
+        tree=tree_items,
+        note=tree_result.note,
+    )
+
+
+@router.get("/items/{item_id}/source/files/{file_path:path}", response_model=SourceFileResponse)
+async def get_source_file_content(
+    item_id: UUID,
+    file_path: str,
+    repository: ItemRepository = Depends(get_item_repository),
+) -> SourceFileResponse:
+    """Fetch individual source file content with caching."""
+    item = await _require_item(item_id, repository)
+
+    file_result = await get_source_file(item, file_path)
+
+    return SourceFileResponse(
+        item_id=item.item_id,
+        file_path=file_path,
+        available=file_result.available,
+        language=file_result.language,
+        content=file_result.content,
+        note=file_result.note,
     )
 
 

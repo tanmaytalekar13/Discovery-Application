@@ -109,6 +109,10 @@ class ArtifactMetadata(BaseModel):
         default_factory=list
     )
 
+    # Cache paths (relative paths stored in DB, actual content on disk)
+    integration_cache_path: str | None = None
+    source_tree_cache_path: str | None = None
+
 
 class Item(BaseModel):
     item_id: UUID

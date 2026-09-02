@@ -84,6 +84,34 @@ class SourcePreview(BaseModel):
     note: str | None = None
 
 
+class RepositoryTreeItem(BaseModel):
+    """Single item in repository file tree."""
+
+    path: str
+    type: Literal["blob", "tree"]  # "blob" = file, "tree" = directory
+    size: int | None = None
+
+
+class RepositoryTreeResponse(BaseModel):
+    """Response containing repository file tree."""
+
+    item_id: UUID
+    available: bool
+    tree: list[RepositoryTreeItem] = Field(default_factory=list)
+    note: str | None = None
+
+
+class SourceFileResponse(BaseModel):
+    """Response containing individual source file content."""
+
+    item_id: UUID
+    file_path: str
+    available: bool
+    language: str | None = None
+    content: str | None = None
+    note: str | None = None
+
+
 class ItemArtifactsResponse(BaseModel):
     item_id: UUID
     artifacts: ArtifactMetadata

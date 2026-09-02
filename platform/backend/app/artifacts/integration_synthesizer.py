@@ -21,8 +21,10 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Optional
+from uuid import UUID
 
 from app.models import Item
+from app.artifacts import disk_cache
 
 
 _CONFIG_KIND_REGISTRY_PACKAGES = "mcp_registry_packages"
@@ -151,41 +153,67 @@ class IntegrationResult:
         self.note = note
 
 
-def synthesize_integration(item: Item) -> IntegrationResult:
+def synthesize_integration(item: Item, save_to_disk: bool = True) -> tuple[IntegrationResult, str | None]:
+    """
+    Synthesize integration code for an item with disk caching.
+
+    Returns:
+        tuple of (IntegrationResult, relative_cache_path or None)
+    """
     if item.type.value != "tool" or item.tool is None:
         return IntegrationResult(
             available=False,
             note="Integration config generation currently supports MCP tools only.",
-        )
+        ), None
 
-    # 1. already-cached synthesis
-    cached = _find_config(item, _CONFIG_KIND_SYNTHESIZED)
-    if cached and cached.get("snippet"):
-        return IntegrationResult(available=True, snippet=cached["snippet"], source="cached")
+    # Step 1: Check existing cache path in ArcadeDB
+    cache_path = item.artifacts.integration_cache_path
+    if cache_path:
+        # Step 2: Check whether cached file exists on disk (Cache Hit)
+        cached_content = disk_cache.read_cached_file(cache_path)
+        if cached_content:
+            return IntegrationResult(
+                available=True,
+                snippet=cached_content,
+                source="cached",
+            ), cache_path
 
-    # 2. Path A — structured registry packages
+    # Cache Miss: Generate content
+    snippet: str | None = None
+    source: str | None = None
+
+    # Path A — structured registry packages
     packages_cf = _find_config(item, _CONFIG_KIND_REGISTRY_PACKAGES)
     if packages_cf and packages_cf.get("packages"):
         result = _build_from_registry_packages(packages_cf["packages"], item.name)
         if result:
-            return IntegrationResult(
-                available=True,
-                snippet=json.dumps(result, indent=2),
-                source="synthesized_from_registry",
-            )
+            snippet = json.dumps(result, indent=2)
+            source = "synthesized_from_registry"
 
-    # 3. Path B — extract from source_code / doc text
-    if item.artifacts.source_code:
+    # Path B — extract from source_code / doc text
+    if not snippet and item.artifacts.source_code:
         result = _extract_json_config_block(item.artifacts.source_code)
         if result:
-            return IntegrationResult(
-                available=True,
-                snippet=json.dumps(result, indent=2),
-                source="extracted_from_docs",
-            )
+            snippet = json.dumps(result, indent=2)
+            source = "extracted_from_docs"
 
-    # 4. nothing found
+    if not snippet:
+        return IntegrationResult(
+            available=False,
+            note="No integration config could be derived from registry metadata or source documentation.",
+        ), None
+
+    # Save to disk and generate relative path
+    new_cache_path: str | None = None
+    if save_to_disk:
+        new_cache_path = disk_cache.generate_cache_path(item.item_id, "integration", "json")
+        if disk_cache.write_cached_file(new_cache_path, snippet):
+            pass  # Successfully saved
+        else:
+            new_cache_path = None  # Failed to write
+
     return IntegrationResult(
-        available=False,
-        note="No integration config could be derived from registry metadata or source documentation.",
-    )
+        available=True,
+        snippet=snippet,
+        source=source,
+    ), new_cache_path
