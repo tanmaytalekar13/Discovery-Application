@@ -6,6 +6,11 @@ import {
   SearchResponse,
   DiscoveryError,
   PreferredType,
+  ItemArtifactsResponse,
+  SourceTreeResponse,
+  SourceFileResponse,
+  ItemSchemaResponse,
+  ItemProvenanceResponse,
 } from './models';
 
 export type DiscoveryResult = SearchResponse | DiscoveryError;
@@ -38,6 +43,41 @@ export class DiscoveryService {
     return this.http
       .get<SearchResponse>(`${this.apiBase}/search`, { params })
       .pipe(catchError(this.handleError()));
+  }
+
+  /** GET /api/items/{item_id}/artifacts */
+  getArtifacts(itemId: string): Observable<ItemArtifactsResponse> {
+    return this.http.get<ItemArtifactsResponse>(
+      `${this.apiBase}/items/${itemId}/artifacts`,
+    );
+  }
+
+  /** GET /api/items/{item_id}/source/tree */
+  getSourceTree(itemId: string): Observable<SourceTreeResponse> {
+    return this.http.get<SourceTreeResponse>(
+      `${this.apiBase}/items/${itemId}/source/tree`,
+    );
+  }
+
+  /** GET /api/items/{item_id}/source/files/{path} */
+  getSourceFile(itemId: string, path: string): Observable<SourceFileResponse> {
+    return this.http.get<SourceFileResponse>(
+      `${this.apiBase}/items/${itemId}/source/files/${path}`,
+    );
+  }
+
+  /** GET /api/items/{item_id}/schema */
+  getSchema(itemId: string): Observable<ItemSchemaResponse> {
+    return this.http.get<ItemSchemaResponse>(
+      `${this.apiBase}/items/${itemId}/schema`,
+    );
+  }
+
+  /** GET /api/items/{item_id}/provenance */
+  getProvenance(itemId: string): Observable<ItemProvenanceResponse> {
+    return this.http.get<ItemProvenanceResponse>(
+      `${this.apiBase}/items/${itemId}/provenance`,
+    );
   }
 
   private handleError() {

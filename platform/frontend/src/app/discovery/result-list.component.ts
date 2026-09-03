@@ -1,4 +1,4 @@
-import { Component, Input } from '@angular/core';
+import { Component, Input, Output, EventEmitter } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { SearchResultItem, DiscoveryError } from './models';
 import { ResultCardComponent } from './result-card.component';
@@ -53,7 +53,7 @@ import { ResultCardComponent } from './result-card.component';
       <ol class="result-list" aria-label="Discovery results">
         @for (result of results; track result.item.item_id) {
           <li>
-            <app-result-card [result]="result"></app-result-card>
+            <app-result-card [result]="result" (viewCode)="viewCode.emit($event)"></app-result-card>
           </li>
         }
       </ol>
@@ -140,6 +140,7 @@ export class ResultListComponent {
   @Input() loading = false;
   @Input() error: DiscoveryError | null = null;
   @Input() hasSearched = false;
+  @Output() viewCode = new EventEmitter<SearchResultItem>();
 
   get errorMessage(): string {
     if (!this.error) return '';

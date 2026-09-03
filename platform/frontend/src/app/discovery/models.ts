@@ -132,6 +132,72 @@ export interface SearchResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Artifacts / View Code (Phase 14)
+// ---------------------------------------------------------------------------
+
+export interface IntegrationSnippet {
+  available: boolean;
+  snippet?: string;
+  source?: string;
+  note?: string;
+}
+
+export interface SourcePreview {
+  available: boolean;
+  language?: string;
+  content?: string;
+  path?: string;
+  note?: string;
+}
+
+export interface ItemArtifactsResponse {
+  item_id: string;
+  artifacts: ArtifactMetadata;
+  integration: IntegrationSnippet;
+  source_preview: SourcePreview;
+}
+
+export interface SourceTreeNode {
+  name: string;
+  path: string;
+  type: 'file' | 'dir';
+  size?: number;
+  children?: SourceTreeNode[];
+}
+
+export interface SourceTreeResponse {
+  item_id: string;
+  available: boolean;
+  root?: string;
+  note?: string;
+  tree?: SourceTreeNode[];
+}
+
+export interface SourceFileResponse {
+  item_id: string;
+  path: string;
+  available: boolean;
+  language?: string;
+  content?: string;
+  size?: number;
+  note?: string;
+}
+
+export interface ItemSchemaResponse {
+  item_id: string;
+  type: ItemType;
+  schema?: Record<string, unknown>;
+  agent_card?: Record<string, unknown>;
+  note?: string;
+}
+
+export interface ItemProvenanceResponse {
+  item_id: string;
+  provenance: DiscoverySource[];
+  evidence: DiscoveryEvidence[];
+}
+
+// ---------------------------------------------------------------------------
 // Client-side error discriminated union
 // ---------------------------------------------------------------------------
 

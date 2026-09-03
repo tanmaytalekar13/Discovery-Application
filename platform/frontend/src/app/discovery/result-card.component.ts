@@ -1,4 +1,4 @@
-import { Component, Input, computed } from '@angular/core';
+import { Component, Input, Output, EventEmitter, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { SearchResultItem } from './models';
 
@@ -94,7 +94,7 @@ import { SearchResultItem } from './models';
 
       <!-- Deferred action buttons -->
       <div class="card-actions">
-        <button class="action-btn" disabled title="Available in Phase 14">
+        <button class="action-btn" (click)="onViewCode($event)">
           View Code
         </button>
         @if (result.item.type === 'tool') {
@@ -307,6 +307,16 @@ import { SearchResultItem } from './models';
         background: transparent;
         color: var(--color-text-muted);
         font: 600 0.8125rem/1 var(--font-mono);
+        cursor: pointer;
+        opacity: 1;
+        transition: border-color 0.15s, color 0.15s, background 0.15s;
+      }
+      .action-btn:hover:not(:disabled) {
+        border-color: var(--color-accent);
+        color: var(--color-accent);
+        background: var(--color-bg);
+      }
+      .action-btn:disabled {
         cursor: not-allowed;
         opacity: 0.55;
       }
@@ -315,6 +325,12 @@ import { SearchResultItem } from './models';
 })
 export class ResultCardComponent {
   @Input({ required: true }) result!: SearchResultItem;
+  @Output() viewCode = new EventEmitter<SearchResultItem>();
+
+  onViewCode(event: MouseEvent): void {
+    event.stopPropagation();
+    this.viewCode.emit(this.result);
+  }
 
   get reliabilityClass(): string {
     const s = this.result.reliability;

@@ -5,10 +5,12 @@ import {
   SearchResponse,
   DiscoveryError,
   PreferredType,
+  SearchResultItem,
 } from './models';
 import { SearchFormComponent, SearchFormSubmit } from './search-form.component';
 import { ResultListComponent } from './result-list.component';
 import { MetadataStripComponent } from './metadata-strip.component';
+import { ViewCodeModalComponent } from './view-code-modal.component';
 
 @Component({
   selector: 'app-discovery-page',
@@ -18,6 +20,7 @@ import { MetadataStripComponent } from './metadata-strip.component';
     SearchFormComponent,
     ResultListComponent,
     MetadataStripComponent,
+    ViewCodeModalComponent,
   ],
   template: `
     <div class="discovery-page">
@@ -49,7 +52,15 @@ import { MetadataStripComponent } from './metadata-strip.component';
         [loading]="loading()"
         [error]="error()"
         [hasSearched]="hasSearched()"
+        (viewCode)="onViewCode($event)"
       ></app-result-list>
+
+      @if (viewingItem()) {
+        <app-view-code-modal
+          [item]="viewingItem()"
+          (close)="closeViewCode()"
+        ></app-view-code-modal>
+      }
     </div>
   `,
   styles: [
@@ -90,6 +101,7 @@ export class DiscoveryPageComponent {
   readonly hasSearched = signal(false);
   readonly response = signal<SearchResponse | null>(null);
   readonly error = signal<DiscoveryError | null>(null);
+  readonly viewingItem = signal<SearchResultItem | null>(null);
 
   constructor(private readonly service: DiscoveryService) {}
 
@@ -97,6 +109,14 @@ export class DiscoveryPageComponent {
     this.query.set(submit.q);
     this.type.set(submit.type);
     this.runSearch(submit.q, submit.type);
+  }
+
+  onViewCode(item: SearchResultItem): void {
+    this.viewingItem.set(item);
+  }
+
+  closeViewCode(): void {
+    this.viewingItem.set(null);
   }
 
   private runSearch(q: string, type: PreferredType): void {
