@@ -1,2 +1,86 @@
-html { background: #f4efe6; }
-body { margin: 0; color: #132d35; font-family: Georgia, serif; }
+/* ==========================================================================
+   Design tokens
+   ========================================================================== */
+
+:root {
+  /* Palette — warm parchment ground + earthy accent (matches the previous
+     AppComponent inline styles, so Docker dev isn't jarring) */
+  --color-bg:             #f4efe6;
+  --color-surface:        #ffffff;
+  --color-text:           #132d35;
+  --color-text-muted:     #4a6670;
+  --color-accent:         #d5653f;
+  --color-border:         #d9d3c8;
+  --color-green:          #15803d;
+  --color-amber:          #b45309;
+  --color-red:            #b91c1c;
+
+  /* Typography */
+  --font-serif: Georgia, 'Times New Roman', serif;
+  --font-mono:  'Courier New', Courier, monospace;
+
+  /* Spacing */
+  --space-1:  0.25rem;
+  --space-2:  0.5rem;
+  --space-3:  0.75rem;
+  --space-4:  1rem;
+  --space-5:  1.25rem;
+  --space-6:  1.5rem;
+
+  /* Border radius */
+  --radius-sm:   4px;
+  --radius-md:   8px;
+  --radius-lg:   12px;
+
+  /* Shadows */
+  --shadow-sm:   0 1px 3px rgba(0,0,0,0.08);
+  --shadow-md:   0 4px 12px rgba(0,0,0,0.12);
+  --shadow-lg:   0 8px 24px rgba(0,0,0,0.16);
+}
+
+/* ==========================================================================
+   Base reset
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--color-bg);
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  color: var(--color-text);
+  font-family: var(--font-serif);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ==========================================================================
+   Global selection + scrollbar polish
+   ========================================================================== */
+
+::selection {
+  background: var(--color-accent);
+  color: #fff;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
