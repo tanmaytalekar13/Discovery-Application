@@ -193,6 +193,12 @@ export type ViewCodeTab = 'source' | 'config' | 'schema' | 'agent' | 'provenance
     <!-- Tree Node Template -->
     <ng-template #treeNodeTpl let-node="node" let-depth="depth">
       <div class="tree-item" [style.padding-left.px]="depth * 16 + 8" (click)="onTreeNodeClick(node)">
+        <span class="tree-chevron" *ngIf="node.type === 'dir'" [class.expanded]="isExpanded(node.path)">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <polyline points="9 18 15 12 9 6"></polyline>
+          </svg>
+        </span>
+        <span class="tree-chevron-placeholder" *ngIf="node.type === 'file'"></span>
         <span class="tree-icon" [class.dir]="node.type === 'dir'">
           <svg *ngIf="node.type === 'dir'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
@@ -204,7 +210,7 @@ export type ViewCodeTab = 'source' | 'config' | 'schema' | 'agent' | 'provenance
         </span>
         <span class="tree-name" [class.active]="currentFilePath() === node.path">{{ node.name }}</span>
       </div>
-      <ng-container *ngIf="node.type === 'dir' && node.children">
+      <ng-container *ngIf="node.type === 'dir' && node.children && isExpanded(node.path)">
         <ng-container *ngFor="let child of node.children">
           <ng-container *ngTemplateOutlet="treeNodeTpl; context: { node: child, depth: depth + 1 }"></ng-container>
         </ng-container>
@@ -375,6 +381,25 @@ export type ViewCodeTab = 'source' | 'config' | 'schema' | 'agent' | 'provenance
       }
       .tree-icon.dir { color: #f59e0b; }
       .tree-icon:not(.dir) { color: var(--color-text-muted); }
+      .tree-chevron {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 14px;
+        height: 14px;
+        flex-shrink: 0;
+        color: var(--color-text-muted);
+        transition: transform 0.15s ease;
+      }
+      .tree-chevron.expanded {
+        transform: rotate(90deg);
+      }
+      .tree-chevron-placeholder {
+        display: inline-block;
+        width: 14px;
+        height: 14px;
+        flex-shrink: 0;
+      }
       .editor-pane {
         flex: 1;
         display: flex;
@@ -523,6 +548,7 @@ export class ViewCodeModalComponent implements OnInit, AfterViewInit, OnDestroy 
 
   // Editor state
   currentFilePath = signal('');
+  expandedDirs = signal<Set<string>>(new Set());
   private monacoEditor: Monaco.editor.IStandaloneCodeEditor | null = null;
   private monaco: typeof Monaco | null = null;
 
@@ -632,10 +658,16 @@ export class ViewCodeModalComponent implements OnInit, AfterViewInit, OnDestroy 
           // Convert flat list to nested tree structure
           const nestedTree = this.buildNestedTree(flatTree);
           this.sourceTree.set(nestedTree);
+          // Auto-expand root directories
+          const rootDirs = nestedTree.filter(n => n.type === 'dir').map(n => n.path);
+          this.expandedDirs.set(new Set(rootDirs));
         } else {
           // Build synthetic tree from available data
           const synthetic = this.buildSyntheticTree();
           this.sourceTree.set(synthetic);
+          // Auto-expand synthetic directories
+          const syntheticDirs = synthetic.filter(n => n.type === 'dir').map(n => n.path);
+          this.expandedDirs.set(new Set(syntheticDirs));
         }
         this.treeLoading.set(false);
       },
@@ -831,9 +863,25 @@ export class ViewCodeModalComponent implements OnInit, AfterViewInit, OnDestroy 
   }
 
   onTreeNodeClick(node: SourceTreeNode): void {
-    if (node.type === 'file') {
+    if (node.type === 'dir') {
+      this.toggleDir(node.path);
+    } else {
       this.openFile(node.path);
     }
+  }
+
+  isExpanded(path: string): boolean {
+    return this.expandedDirs().has(path);
+  }
+
+  private toggleDir(path: string): void {
+    const current = new Set(this.expandedDirs());
+    if (current.has(path)) {
+      current.delete(path);
+    } else {
+      current.add(path);
+    }
+    this.expandedDirs.set(current);
   }
 
   private openFile(path: string): void {
