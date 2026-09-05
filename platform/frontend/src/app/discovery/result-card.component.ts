@@ -1,6 +1,6 @@
 import { Component, Input, Output, EventEmitter, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { SearchResultItem } from './models';
+import { SearchResultItem, ClassificationMode } from './models';
 
 @Component({
   selector: 'app-result-card',
@@ -92,15 +92,27 @@ import { SearchResultItem } from './models';
         }
       }
 
-      <!-- Deferred action buttons -->
+      <!-- Action buttons -->
       <div class="card-actions">
         <button class="action-btn" (click)="onViewCode($event)">
           View Code
         </button>
         @if (result.item.type === 'tool') {
-          <button class="action-btn" disabled title="Available in Phase 15">
-            Test Tool
-          </button>
+          @switch (testActionMode) {
+            @case ('test') {
+              <button class="action-btn action-btn--primary" (click)="onTestTool($event)">
+                Test Tool
+              </button>
+            }
+            @case ('run-locally') {
+              <button class="action-btn action-btn--local" (click)="onTestTool($event)" title="This is a local stdio tool. Click for install instructions.">
+                Run Locally
+              </button>
+            }
+            @case ('hidden') {
+              <!-- no test button -->
+            }
+          }
         }
         @if (result.item.type === 'agent') {
           <button class="action-btn" disabled title="Available in Phase 16">
@@ -320,16 +332,52 @@ import { SearchResultItem } from './models';
         cursor: not-allowed;
         opacity: 0.55;
       }
+      .action-btn--primary {
+        background: var(--color-accent);
+        color: white;
+        border-color: var(--color-accent);
+      }
+      .action-btn--primary:hover:not(:disabled) {
+        background: var(--color-accent);
+        color: white;
+        border-color: var(--color-accent);
+        filter: brightness(1.1);
+      }
+      .action-btn--local {
+        background: #fef3c7;
+        color: #92400e;
+        border-color: #fde68a;
+      }
+      .action-btn--local:hover:not(:disabled) {
+        background: #fef3c7;
+        color: #92400e;
+        border-color: #f59e0b;
+      }
     `,
   ],
 })
 export class ResultCardComponent {
   @Input({ required: true }) result!: SearchResultItem;
   @Output() viewCode = new EventEmitter<SearchResultItem>();
+  @Output() testTool = new EventEmitter<SearchResultItem>();
 
   onViewCode(event: MouseEvent): void {
     event.stopPropagation();
     this.viewCode.emit(this.result);
+  }
+
+  onTestTool(event: MouseEvent): void {
+    event.stopPropagation();
+    this.testTool.emit(this.result);
+  }
+
+  /** Determines which test button variant to show based on classification.mode. */
+  get testActionMode(): 'test' | 'run-locally' | 'hidden' {
+    const cls = this.result.classification;
+    if (!cls) return 'hidden';
+    if (cls.mode === 'remote' || cls.mode === 'remote_via_package') return 'test';
+    if (cls.mode === 'local_stdio') return 'run-locally';
+    return 'hidden'; // not_testable
   }
 
   get reliabilityClass(): string {

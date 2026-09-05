@@ -11,6 +11,11 @@ import {
   SourceFileResponse,
   ItemSchemaResponse,
   ItemProvenanceResponse,
+  ToolConnectResponse,
+  ToolInvokeRequest,
+  ToolInvokeResponse,
+  OAuthStartResponse,
+  OAuthCallbackResponse,
 } from './models';
 
 export type DiscoveryResult = SearchResponse | DiscoveryError;
@@ -77,6 +82,118 @@ export class DiscoveryService {
   getProvenance(itemId: string): Observable<ItemProvenanceResponse> {
     return this.http.get<ItemProvenanceResponse>(
       `${this.apiBase}/items/${itemId}/provenance`,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Tool Test endpoints (Phase 15)
+  // -------------------------------------------------------------------------
+
+  /**
+   * POST /api/items/{item_id}/test/connect
+   * Open an MCP session, run initialize + tools/list.
+   * Returns the list of available tools (or auth_required=true).
+   */
+  testConnect(
+    itemId: string,
+    sessionId?: string,
+  ): Observable<ToolConnectResponse> {
+    let params = new HttpParams();
+    if (sessionId) params = params.set('session_id', sessionId);
+    return this.http.post<ToolConnectResponse>(
+      `${this.apiBase}/items/${itemId}/test/connect`,
+      null,
+      { params },
+    );
+  }
+
+  /**
+   * POST /api/items/{item_id}/test/invoke
+   * Call a tool with the given arguments.
+   */
+  testInvoke(
+    itemId: string,
+    body: ToolInvokeRequest,
+    sessionId?: string,
+  ): Observable<ToolInvokeResponse> {
+    let params = new HttpParams();
+    if (sessionId) params = params.set('session_id', sessionId);
+    return this.http.post<ToolInvokeResponse>(
+      `${this.apiBase}/items/${itemId}/test/invoke`,
+      body,
+      { params },
+    );
+  }
+
+  /**
+   * POST /api/items/{item_id}/test/authorize/start
+   * Begin an OAuth flow. Backend returns a 501 for now (spec gating).
+   */
+  testAuthorizeStart(
+    itemId: string,
+    sessionId?: string,
+  ): Observable<OAuthStartResponse> {
+    let params = new HttpParams();
+    if (sessionId) params = params.set('session_id', sessionId);
+    return this.http.post<OAuthStartResponse>(
+      `${this.apiBase}/items/${itemId}/test/authorize/start`,
+      null,
+      { params },
+    );
+  }
+
+  /**
+   * GET /api/items/{item_id}/test/authorize/callback
+   * OAuth provider callback (server-to-server).
+   */
+  testAuthorizeCallback(
+    itemId: string,
+    code: string,
+    state: string,
+    sessionId: string,
+  ): Observable<OAuthCallbackResponse> {
+    const params = new HttpParams()
+      .set('code', code)
+      .set('state', state)
+      .set('session_id', sessionId);
+    return this.http.get<OAuthCallbackResponse>(
+      `${this.apiBase}/items/${itemId}/test/authorize/callback`,
+      { params },
+    );
+  }
+
+  /**
+   * POST /api/items/{item_id}/test/disconnect
+   * Immediately discard the stored token for a test session.
+   */
+  testDisconnect(
+    itemId: string,
+    sessionId: string,
+  ): Observable<{ status: string; message: string }> {
+    const params = new HttpParams().set('session_id', sessionId);
+    return this.http.post<{ status: string; message: string }>(
+      `${this.apiBase}/items/${itemId}/test/disconnect`,
+      null,
+      { params },
+    );
+  }
+
+  /**
+   * POST /api/items/{item_id}/test/manual-token
+   * MVP fallback: user provides a bearer token / API key directly.
+   * Returns a session_id that subsequent connect/invoke calls should send.
+   */
+  testSubmitManualToken(
+    itemId: string,
+    token: string,
+    sessionId?: string,
+  ): Observable<{ status: string; session_id: string; message: string }> {
+    let params = new HttpParams().set('token', token);
+    if (sessionId) params = params.set('session_id', sessionId);
+    return this.http.post<{ status: string; session_id: string; message: string }>(
+      `${this.apiBase}/items/${itemId}/test/manual-token`,
+      null,
+      { params },
     );
   }
 

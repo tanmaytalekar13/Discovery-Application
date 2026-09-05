@@ -17,6 +17,7 @@ from app.api.schemas import (
     DeferredExecutionResponse,
     IntegrationSnippet,
     ItemArtifactsResponse,
+    ItemClassificationResponse,
     ItemProvenanceResponse,
     ItemSchemaResponse,
     RepositoryTreeItem,
@@ -34,6 +35,7 @@ from app.artifacts.source_resolver import get_repository_tree, get_source_file, 
 from app.db.repositories import ItemRepository, TestRunRepository
 from app.models import Item, TestRun
 from app.query.planner import PreferredType
+from app.sandbox.classifier import classify_tool
 from app.search.application import ApplicationSearchService
 
 router = APIRouter(prefix="/api", tags=["discovery"])
@@ -58,6 +60,7 @@ async def search(
             reliability=ranked.reliability,
             freshness=ranked.freshness,
             evidence=ranked.evidence,
+            classification=classify_tool(ranked.item),
         )
         for ranked in result.ranked.results
     ]
@@ -99,6 +102,30 @@ async def get_item(
     repository: ItemRepository = Depends(get_item_repository),
 ) -> Item:
     return await _require_item(item_id, repository)
+
+
+@router.get(
+    "/items/{item_id}/classification",
+    response_model=ItemClassificationResponse,
+    summary="Classify tool for live testing",
+    tags=["tool-test"],
+)
+async def get_item_classification(
+    item_id: UUID,
+    repository: ItemRepository = Depends(get_item_repository),
+):
+    """Return the testability classification for a specific item.
+
+    The frontend uses this to decide which action button (Test Tool /
+    Run Locally / hidden) to render. The classification is derived
+    from the item's `artifacts.config_files` at request time and is
+    not persisted.
+    """
+    item = await _require_item(item_id, repository)
+    return ItemClassificationResponse(
+        item_id=item.item_id,
+        classification=classify_tool(item),
+    )
 
 
 @router.get("/items/{item_id}/artifacts", response_model=ItemArtifactsResponse)

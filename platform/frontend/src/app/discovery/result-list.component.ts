@@ -53,7 +53,11 @@ import { ResultCardComponent } from './result-card.component';
       <ol class="result-list" aria-label="Discovery results">
         @for (result of results; track result.item.item_id) {
           <li>
-            <app-result-card [result]="result" (viewCode)="viewCode.emit($event)"></app-result-card>
+            <app-result-card
+              [result]="result"
+              (viewCode)="viewCode.emit($event)"
+              (testTool)="testTool.emit($event)"
+            ></app-result-card>
           </li>
         }
       </ol>
@@ -141,6 +145,7 @@ export class ResultListComponent {
   @Input() error: DiscoveryError | null = null;
   @Input() hasSearched = false;
   @Output() viewCode = new EventEmitter<SearchResultItem>();
+  @Output() testTool = new EventEmitter<SearchResultItem>();
 
   get errorMessage(): string {
     if (!this.error) return '';

@@ -11,6 +11,7 @@ import { SearchFormComponent, SearchFormSubmit } from './search-form.component';
 import { ResultListComponent } from './result-list.component';
 import { MetadataStripComponent } from './metadata-strip.component';
 import { ViewCodeModalComponent } from './view-code-modal.component';
+import { TestToolModalComponent } from './test-tool-modal.component';
 
 @Component({
   selector: 'app-discovery-page',
@@ -21,6 +22,7 @@ import { ViewCodeModalComponent } from './view-code-modal.component';
     ResultListComponent,
     MetadataStripComponent,
     ViewCodeModalComponent,
+    TestToolModalComponent,
   ],
   template: `
     <div class="discovery-page">
@@ -53,6 +55,7 @@ import { ViewCodeModalComponent } from './view-code-modal.component';
         [error]="error()"
         [hasSearched]="hasSearched()"
         (viewCode)="onViewCode($event)"
+        (testTool)="onTestTool($event)"
       ></app-result-list>
 
       @if (viewingItem()) {
@@ -60,6 +63,13 @@ import { ViewCodeModalComponent } from './view-code-modal.component';
           [item]="viewingItem()"
           (close)="closeViewCode()"
         ></app-view-code-modal>
+      }
+
+      @if (testingItem()) {
+        <app-test-tool-modal
+          [result]="testingItem()!"
+          (close)="closeTestTool()"
+        ></app-test-tool-modal>
       }
     </div>
   `,
@@ -102,6 +112,7 @@ export class DiscoveryPageComponent {
   readonly response = signal<SearchResponse | null>(null);
   readonly error = signal<DiscoveryError | null>(null);
   readonly viewingItem = signal<SearchResultItem | null>(null);
+  readonly testingItem = signal<SearchResultItem | null>(null);
 
   constructor(private readonly service: DiscoveryService) {}
 
@@ -117,6 +128,14 @@ export class DiscoveryPageComponent {
 
   closeViewCode(): void {
     this.viewingItem.set(null);
+  }
+
+  onTestTool(item: SearchResultItem): void {
+    this.testingItem.set(item);
+  }
+
+  closeTestTool(): void {
+    this.testingItem.set(null);
   }
 
   private runSearch(q: string, type: PreferredType): void {

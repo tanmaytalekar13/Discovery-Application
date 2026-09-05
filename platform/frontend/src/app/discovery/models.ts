@@ -123,6 +123,7 @@ export interface SearchResultItem {
   reliability: number;
   freshness: number;
   evidence: number;
+  classification?: ClassificationResult;
 }
 
 export interface SearchResponse {
@@ -205,3 +206,88 @@ export type DiscoveryError =
   | { kind: 'network'; message: string }
   | { kind: 'backend'; status: number; message: string }
   | { kind: 'unknown'; message: string };
+
+// ---------------------------------------------------------------------------
+// Tool Test / Classification (Phase 15)
+// Mirrors backend/app/sandbox/schemas.py ClassificationResult.
+// ---------------------------------------------------------------------------
+
+export type ClassificationMode =
+  | 'remote'
+  | 'remote_via_package'
+  | 'local_stdio'
+  | 'not_testable';
+
+export interface RemoteCandidate {
+  type: 'streamable-http' | 'sse';
+  url: string;
+}
+
+export interface EnvironmentVariableHint {
+  name: string;
+  isSecret?: boolean;
+  description?: string;
+}
+
+export interface LocalPackageHint {
+  registryType?: string;
+  identifier?: string;
+  runtimeHint?: string;
+  transportType?: string;
+  installCommand?: string;
+  environmentVariables: EnvironmentVariableHint[];
+}
+
+export interface ClassificationResult {
+  testable: boolean;
+  mode: ClassificationMode;
+  detail?: RemoteCandidate[] | LocalPackageHint[];
+  reason?: string;
+}
+
+export interface ItemClassificationResponse {
+  item_id: string;
+  classification: ClassificationResult;
+}
+
+// ---------------------------------------------------------------------------
+// Tool Test / Connect (Phase 15)
+// ---------------------------------------------------------------------------
+
+export interface ToolInfo {
+  name: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export interface ToolConnectResponse {
+  connected: boolean;
+  auth_required: boolean;
+  transport?: string;
+  tools: ToolInfo[];
+  error?: string;
+  requires_auth?: boolean;
+}
+
+export interface ToolInvokeRequest {
+  tool_name: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface ToolInvokeResponse {
+  status: 'success' | 'error';
+  result?: unknown;
+  error?: string;
+  requires_auth?: boolean;
+  duration_ms?: number;
+}
+
+export interface OAuthStartResponse {
+  authorization_url: string;
+  state: string;
+}
+
+export interface OAuthCallbackResponse {
+  success: boolean;
+  message: string;
+}

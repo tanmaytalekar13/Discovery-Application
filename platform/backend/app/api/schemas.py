@@ -10,6 +10,7 @@ from app.models import (
     TestRun,
 )
 from app.query.planner import QueryPlan
+from app.sandbox.schemas import ClassificationResult
 
 
 class SearchMetadata(BaseModel):
@@ -31,6 +32,7 @@ class SearchResultItem(BaseModel):
     reliability: float
     freshness: float
     evidence: float
+    classification: ClassificationResult | None = None
 
 
 class SearchToolItem(BaseModel):
@@ -64,6 +66,47 @@ class ItemProvenanceResponse(BaseModel):
 
 
 # --- NEW: View Code / Monaco editor support ---------------------------------
+
+# --- NEW: Tool Test / Classification (Phase 15) ---------------------------------
+
+class ItemClassificationResponse(BaseModel):
+    """Classification result for a single item (used by /items/{id}/classification)."""
+    item_id: UUID
+    classification: ClassificationResult
+
+
+class ToolConnectResponse(BaseModel):
+    """Result of a /test/connect call."""
+    connected: bool
+    auth_required: bool = False
+    transport: str | None = None
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    error: str | None = None
+    requires_auth: bool = False
+
+
+class ToolInvokeRequest(BaseModel):
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolInvokeResponse(BaseModel):
+    status: Literal["success", "error"]
+    result: Any = None
+    error: str | None = None
+    duration_ms: int | None = None
+    requires_auth: bool = False
+
+
+class OAuthStartResponse(BaseModel):
+    authorization_url: str
+    state: str
+
+
+class OAuthCallbackResponse(BaseModel):
+    success: bool
+    message: str
+
 
 class IntegrationSnippet(BaseModel):
     """Ready-to-paste mcpServers JSON config for the 'Integration' tab."""
