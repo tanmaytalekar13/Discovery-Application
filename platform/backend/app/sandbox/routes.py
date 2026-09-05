@@ -42,7 +42,7 @@ router = APIRouter(prefix="/api/items", tags=["tool-test"])
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _require_testable(
+async def _require_testable(
     item_id: UUID,
     repository: ItemRepository,
 ) -> tuple[RemoteCandidate, str]:
@@ -50,7 +50,7 @@ def _require_testable(
 
     Raises HTTPException(400) if the item is not testable.
     """
-    item = _require_item(item_id, repository)
+    item = await _require_item(item_id, repository)
     classification = classify_tool(item)
     if not classification.testable:
         raise HTTPException(
@@ -125,7 +125,7 @@ async def connect(
     An optional `session_id` query parameter will attach any previously
     stored bearer token to the request (e.g. after an OAuth flow).
     """
-    candidate, url = _require_testable(item_id, repository)
+    candidate, url = await _require_testable(item_id, repository)
     token = _extract_bearer_token(session_store, session_id) if session_id else None
 
     client = MCPTestClient(
@@ -177,7 +177,7 @@ async def invoke(
     If the server returns 401/403 the response carries
     `requires_auth=True` so the frontend can offer a re-auth flow.
     """
-    candidate, url = _require_testable(item_id, repository)
+    candidate, url = await _require_testable(item_id, repository)
     token = _extract_bearer_token(session_store, session_id) if session_id else None
 
     client = MCPTestClient(
@@ -338,6 +338,7 @@ async def disconnect(
     item_id: UUID,
     session_id: Annotated[str, Query(description="Test-session ID to revoke")],
     session_store: SessionStore = Depends(get_session_store),
+    repository: ItemRepository = Depends(get_item_repository),
 ):
     """Immediately discard the stored token for a test session.
 
@@ -377,7 +378,7 @@ async def submit_manual_token(
     The token is stored encrypted in the session store and attached
     to subsequent connect/invoke calls automatically.
     """
-    candidate, url = _require_testable(item_id, repository)
+    candidate, url = await _require_testable(item_id, repository)
 
     if session_id is None:
         session = session_store.create_session(item_id)

@@ -386,6 +386,10 @@ class MCPTestClient:
                 ) as session:
                     init_result = await session.initialize()
                     tools_result = await session.list_tools()
+            except asyncio.CancelledError:
+                raise MCPTimeoutError(
+                    f"Connection to {self._url} was cancelled (timeout or request interrupted)"
+                ) from None
             except httpx.HTTPStatusError as exc:
                 if _is_auth_required_response(None, exc):
                     return ConnectResult(
@@ -464,6 +468,10 @@ class MCPTestClient:
                 ) as session:
                     await session.initialize()
                     call_result = await session.call_tool(tool_name, arguments)
+            except asyncio.CancelledError:
+                raise MCPTimeoutError(
+                    f"Request to {self._url} was cancelled (timeout or request interrupted)"
+                ) from None
             except httpx.HTTPStatusError as exc:
                 if _is_auth_required_response(None, exc):
                     return InvokeResult(
