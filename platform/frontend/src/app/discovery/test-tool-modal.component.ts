@@ -18,6 +18,7 @@ import {
   ToolConnectResponse,
   ToolInfo,
   ToolInvokeResponse,
+  AuthReason,
 } from './models';
 
 // ---------------------------------------------------------------------------
@@ -98,17 +99,83 @@ type ModalState =
             </div>
           }
 
-          <!-- error -->
+          <!-- error: connection-error-panel (generic, all auth_reason values) -->
           @if (state() === 'error') {
-            <div class="state-container state-container--error">
-              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <circle cx="12" cy="12" r="10"></circle>
-                <line x1="12" y1="8" x2="12" y2="12"></line>
-                <line x1="12" y1="16" x2="12.01" y2="16"></line>
-              </svg>
-              <p class="error-title">Connection failed</p>
-              <p class="error-message">{{ errorMessage() }}</p>
-              <button class="btn btn--secondary" (click)="retryConnect()">Try Again</button>
+            <div class="error-panel">
+              <div class="error-panel-icon" [class]="'error-panel-icon--' + authReason()">
+                @switch (authReason()) {
+                  @case ('payment_required') {
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <rect x="2" y="5" width="20" height="14" rx="2"></rect>
+                      <line x1="2" y1="10" x2="22" y2="10"></line>
+                    </svg>
+                  }
+                  @case ('not_found') {
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <circle cx="11" cy="11" r="8"></circle>
+                      <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                      <line x1="11" y1="8" x2="11" y2="11"></line>
+                      <line x1="11" y1="14" x2="11.01" y2="14"></line>
+                    </svg>
+                  }
+                  @case ('rate_limited') {
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <polyline points="12 6 12 12 16 14"></polyline>
+                    </svg>
+                  }
+                  @case ('server_error') {
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                      <line x1="12" y1="9" x2="12" y2="13"></line>
+                      <line x1="12" y1="17" x2="12.01" y2="17"></line>
+                    </svg>
+                  }
+                  @case ('connection_error') {
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <line x1="1" y1="1" x2="23" y2="23"></line>
+                      <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"></path>
+                      <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"></path>
+                      <path d="M10.71 5.05A16 16 0 0 1 22.56 9"></path>
+                      <path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"></path>
+                      <path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path>
+                      <line x1="12" y1="20" x2="12.01" y2="20"></line>
+                    </svg>
+                  }
+                  @default {
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <line x1="12" y1="8" x2="12" y2="12"></line>
+                      <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                  }
+                }
+              </div>
+              <div class="error-panel-content">
+                <p class="error-panel-title">{{ errorTitle() }}</p>
+                <p class="error-panel-message">{{ errorMessage() }}</p>
+              </div>
+              <div class="error-panel-actions">
+                @if (showTokenInput()) {
+                  <button class="btn btn--primary" (click)="state.set('auth-required')">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                    Provide Token
+                  </button>
+                }
+                @if (showOAuthButton()) {
+                  <button class="btn btn--primary" (click)="state.set('auth-required')">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                    Connect Account
+                  </button>
+                }
+                <button class="btn btn--secondary" (click)="retryConnect()">Try Again</button>
+              </div>
             </div>
           }
 
@@ -352,7 +419,7 @@ type ModalState =
 
               @if (invokeResult()?.error) {
                 <div class="result-error-body">
-                  <p class="result-error-text">{{ invokeResult()?.error }}</p>
+                  <p class="result-error-text">{{ invokeResult()?.user_message ?? invokeResult()?.error }}</p>
                 </div>
               }
 
@@ -574,6 +641,70 @@ type ModalState =
       .state-container--error { color: var(--color-red); }
       .error-title { font: 700 1rem/1.2 var(--font-serif); }
       .error-message { font-size: 0.875rem; opacity: 0.8; }
+      /* Generic error panel (Step 3: all auth_reason values) */
+      .error-panel {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.875rem;
+        padding: 1.5rem 0.5rem;
+        text-align: center;
+      }
+      .error-panel-icon {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 64px;
+        height: 64px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      .error-panel-icon--payment_required {
+        background: #fff7ed;
+        color: #c2410c;
+      }
+      .error-panel-icon--not_found {
+        background: #f1f5f9;
+        color: #64748b;
+      }
+      .error-panel-icon--rate_limited {
+        background: #fef9c3;
+        color: #854d0e;
+      }
+      .error-panel-icon--server_error {
+        background: #fef2f2;
+        color: #b91c1c;
+      }
+      .error-panel-icon--connection_error {
+        background: #f1f5f9;
+        color: #475569;
+      }
+      .error-panel-icon--timeout {
+        background: #fffbeb;
+        color: #92400e;
+      }
+      .error-panel-icon--unauthorized {
+        background: #eff6ff;
+        color: #1d4ed8;
+      }
+      .error-panel-icon--unknown {
+        background: #f8fafc;
+        color: #64748b;
+      }
+      @media (prefers-color-scheme: dark) {
+        .error-panel-icon--payment_required { background: #431407; color: #fdba74; }
+        .error-panel-icon--not_found { background: #1e293b; color: #94a3b8; }
+        .error-panel-icon--rate_limited { background: #422006; color: #fde047; }
+        .error-panel-icon--server_error { background: #450a0a; color: #fca5a5; }
+        .error-panel-icon--connection_error { background: #1e293b; color: #94a3b8; }
+        .error-panel-icon--timeout { background: #292524; color: #fde68a; }
+        .error-panel-icon--unauthorized { background: #1e1b4b; color: #a5b4fc; }
+        .error-panel-icon--unknown { background: #1e293b; color: #94a3b8; }
+      }
+      .error-panel-content { display: flex; flex-direction: column; gap: 0.375rem; }
+      .error-panel-title { font: 700 1.0625rem/1.2 var(--font-serif); color: var(--color-text); margin: 0; }
+      .error-panel-message { font-size: 0.875rem; color: var(--color-text-muted); margin: 0; max-width: 42ch; }
+      .error-panel-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; justify-content: center; margin-top: 0.25rem; }
       .spinner {
         display: inline-block;
         width: 28px;
@@ -888,6 +1019,11 @@ export class TestToolModalComponent implements OnInit {
   showToken = signal(false);
   tokenSubmitting = signal(false);
   tokenSubmitError = signal<string>('');
+  // Error classification from the backend
+  authReason = signal<AuthReason | null>(null);
+  userMessage = signal<string>('');
+  showTokenInput = signal(false);
+  showOAuthButton = signal(false);
   // When auth fails mid-invoke and user submits a token, we retry the invoke
   // automatically after re-connect. Stores (tool, args) for the pending retry.
   private pendingInvokeForRetry: { tool: ToolInfo; args: Record<string, unknown> } | null = null;
@@ -927,6 +1063,19 @@ export class TestToolModalComponent implements OnInit {
     const r = this.invokeResult();
     if (!r) return '';
     return r.status === 'success' ? 'result-status--success' : 'result-status--error';
+  });
+
+  errorTitle = computed(() => {
+    switch (this.authReason()) {
+      case 'payment_required':  return 'Paid subscription required';
+      case 'not_found':        return 'Endpoint not found';
+      case 'rate_limited':     return 'Rate limited';
+      case 'server_error':     return 'Server unavailable';
+      case 'connection_error': return 'Connection failed';
+      case 'timeout':          return 'Request timed out';
+      case 'unauthorized':     return 'Authentication required';
+      default:                 return 'Connection failed';
+    }
   });
 
   constructor(private readonly service: DiscoveryService) {}
@@ -978,6 +1127,12 @@ export class TestToolModalComponent implements OnInit {
   }
 
   private handleConnectResponse(res: ToolConnectResponse, token?: string): void {
+    // Always store the error classification for display
+    this.authReason.set(res.auth_reason ?? null);
+    this.userMessage.set(res.user_message ?? res.error ?? '');
+    this.showTokenInput.set(res.show_token_input ?? false);
+    this.showOAuthButton.set(res.show_oauth_button ?? false);
+
     if (res.connected) {
       this.tools.set(res.tools ?? []);
       // If we just re-authenticated and have a pending invoke retry, replay it
@@ -1009,7 +1164,7 @@ export class TestToolModalComponent implements OnInit {
 
     if (res.error) {
       this.state.set('error');
-      this.errorMessage.set(res.error);
+      this.errorMessage.set(res.user_message ?? res.error);
       return;
     }
 

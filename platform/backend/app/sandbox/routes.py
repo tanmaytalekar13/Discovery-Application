@@ -149,6 +149,10 @@ async def connect(
         ],
         error=result.error,
         requires_auth=result.auth_required,
+        auth_reason=result.auth_reason,
+        user_message=result.user_message,
+        show_token_input=result.show_token_input,
+        show_oauth_button=result.show_oauth_button,
     )
 
 
@@ -193,6 +197,10 @@ async def invoke(
         error=result.error,
         requires_auth=result.requires_auth,
         duration_ms=result.duration_ms,
+        auth_reason=result.auth_reason,
+        user_message=result.user_message,
+        show_token_input=result.show_token_input,
+        show_oauth_button=result.show_oauth_button,
     )
 
 

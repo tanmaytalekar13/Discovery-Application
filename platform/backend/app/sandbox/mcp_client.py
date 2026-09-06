@@ -30,6 +30,19 @@ from urllib.parse import urlparse
 
 import httpx
 
+# BaseExceptionGroup is built-in in Python 3.11+; fall back to the
+# exceptiongroup backport package on earlier versions.
+try:
+    BaseExceptionGroup  # type: ignore[name-defined]
+except NameError:
+    from exceptiongroup import BaseExceptionGroup  # type: ignore[no-redef]
+
+# ExceptionGroup is built-in in Python 3.11+; backport for earlier versions.
+try:
+    ExceptionGroup  # type: ignore[name-defined]
+except NameError:
+    from exceptiongroup import ExceptionGroup  # type: ignore[no-redef]
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +69,222 @@ class RemoteToolInfo:
 
 
 @dataclass
+class ConnectionErrorInfo:
+    """Structured classification of a connection/invoke failure.
+
+    Produced by :func:`classify_connection_error`. All fields are
+    guaranteed to be set so the UI can branch on them without null checks.
+    """
+
+    # Machine-readable reason — one of the AUTH_REASON_* constants.
+    auth_reason: str
+    # Human-readable message safe to show to the user (no tokens, no internals).
+    user_message: str
+    # True when a manual bearer-token / API-key input is a useful next step.
+    show_token_input: bool
+    # True when an OAuth / provider-authorization flow is a useful next step.
+    show_oauth_button: bool
+
+
+# ---------------------------------------------------------------------------
+# Auth reason constants
+# ---------------------------------------------------------------------------
+AUTH_REASON_UNAUTHORIZED = "unauthorized"
+AUTH_REASON_PAYMENT_REQUIRED = "payment_required"
+AUTH_REASON_NOT_FOUND = "not_found"
+AUTH_REASON_RATE_LIMITED = "rate_limited"
+AUTH_REASON_SERVER_ERROR = "server_error"
+AUTH_REASON_CONNECTION_ERROR = "connection_error"
+AUTH_REASON_TIMEOUT = "timeout"
+AUTH_REASON_UNKNOWN = "unknown"
+
+
+def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
+    """Classify a connection/invoke failure for user-facing display.
+
+    Handles:
+      - Direct HTTP errors (401, 402, 403, 404, 429, 5xx)
+      - ExceptionGroup-wrapped errors from the MCP library's internal task groups
+      - Network-level errors (DNS, TLS, connect refused, genuine timeouts)
+      - Any other unexpected exception
+
+    This function is pure — no side effects, no network calls, no token logging.
+
+    Args:
+        exc: Any exception from the MCP call stack.
+
+    Returns:
+        ConnectionErrorInfo with auth_reason, user_message, show_token_input,
+        and show_oauth_button fields populated.
+    """
+    # Recursively unwrap ExceptionGroup / BaseExceptionGroup to find the
+    # first meaningful exception. MCP library wraps errors in TaskGroups.
+    # Follow __cause__ chain to handle nested conversions:
+    #   MCPTransportError → MCPTimeoutError → CancelledError → BaseExceptionGroup → HTTPStatusError
+    root_cause = exc
+    while True:
+        if isinstance(root_cause, (ExceptionGroup, BaseExceptionGroup)):
+            root_cause = _unwrap_exception(root_cause)
+        elif (isinstance(root_cause, MCPClientError)
+              and root_cause.__cause__ is not None):
+            root_cause = root_cause.__cause__
+        else:
+            break
+
+    # --- HTTP status-based classification ---
+    if isinstance(root_cause, httpx.HTTPStatusError):
+        status = root_cause.response.status_code
+        headers = root_cause.response.headers
+
+        if status in (401, 403):
+            return ConnectionErrorInfo(
+                auth_reason=AUTH_REASON_UNAUTHORIZED,
+                user_message="This MCP server requires credentials. "
+                             "Provide your API key or bearer token to continue.",
+                show_token_input=True,
+                show_oauth_button=True,  # OAuth discovery done by caller if needed
+            )
+
+        if status == 402:
+            retry_after = headers.get("retry-after", "")
+            msg = "This tool requires a paid subscription. "
+            if retry_after:
+                msg += f"Rate limit: retry after {retry_after}."
+            else:
+                msg += "Set up an account or subscription on the provider's website first."
+            return ConnectionErrorInfo(
+                auth_reason=AUTH_REASON_PAYMENT_REQUIRED,
+                user_message=msg,
+                show_token_input=False,
+                show_oauth_button=False,
+            )
+
+        if status == 404:
+            return ConnectionErrorInfo(
+                auth_reason=AUTH_REASON_NOT_FOUND,
+                user_message="MCP endpoint not found. The URL may be incorrect "
+                             "or the server may no longer be hosted at this address.",
+                show_token_input=False,
+                show_oauth_button=False,
+            )
+
+        if status == 429:
+            retry_after = headers.get("retry-after", "")
+            msg = "Too many requests. "
+            if retry_after:
+                msg += f"Retry after {retry_after}."
+            else:
+                msg += "Slow down or wait before trying again."
+            return ConnectionErrorInfo(
+                auth_reason=AUTH_REASON_RATE_LIMITED,
+                user_message=msg,
+                show_token_input=False,
+                show_oauth_button=False,
+            )
+
+        if status >= 500:
+            return ConnectionErrorInfo(
+                auth_reason=AUTH_REASON_SERVER_ERROR,
+                user_message="The tool's server is temporarily unavailable "
+                             "(internal error). Try again later.",
+                show_token_input=False,
+                show_oauth_button=False,
+            )
+
+        # Other 4xx — treat as unknown
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_UNKNOWN,
+            user_message=f"Server rejected the request (HTTP {status}). "
+                         "If credentials are needed, try providing them below.",
+            show_token_input=True,
+            show_oauth_button=True,
+        )
+
+    # --- Network-level errors ---
+    exc_type = type(root_cause).__name__
+    exc_msg = str(root_cause).lower()
+
+    # SSL/TLS errors
+    if any(tag in exc_type.lower() for tag in ("ssl", "tls", "certificate")) \
+       or any(tag in exc_msg for tag in ("ssl", "tls", "certificate", "sslerror")):
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_CONNECTION_ERROR,
+            user_message="Secure connection failed. The server may be misconfigured "
+                         "or using an invalid TLS certificate.",
+            show_token_input=True,
+            show_oauth_button=True,
+        )
+
+    # DNS resolution failures
+    if any(tag in exc_msg for tag in ("name or service not known",
+                                       "no address associated",
+                                       "getaddrinfo failed",
+                                       "dns")) \
+       or "dns" in exc_type.lower():
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_CONNECTION_ERROR,
+            user_message="Server address could not be resolved. "
+                         "The URL may be incorrect.",
+            show_token_input=True,
+            show_oauth_button=True,
+        )
+
+    # Connection refused / reset / unreachable
+    if any(tag in exc_msg for tag in ("connection refused", "connection reset",
+                                       "connection closed", "cannot connect",
+                                       "network unreachable", "host unreachable")):
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_CONNECTION_ERROR,
+            user_message="Could not connect to the server. "
+                         "The server may be down or the URL may be incorrect.",
+            show_token_input=True,
+            show_oauth_button=True,
+        )
+
+    # Timeout — no HTTP response received at all
+    if isinstance(root_cause, (asyncio.TimeoutError, asyncio.CancelledError,
+                               httpx.TimeoutException,
+                               TimeoutError, TimeoutError)) \
+       or any(tag in exc_type.lower() for tag in ("timeout", "cancelled")) \
+       or "timeout" in exc_msg or "timed out" in exc_msg:
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_TIMEOUT,
+            user_message="Server is not responding. This may be an authentication "
+                         "issue or the server may be temporarily offline.",
+            show_token_input=True,
+            show_oauth_button=True,
+        )
+
+    # Fallback: unknown / unexpected exception
+    return ConnectionErrorInfo(
+        auth_reason=AUTH_REASON_UNKNOWN,
+        user_message="Connection failed. If this tool requires credentials, "
+                     "provide your API key or bearer token below.",
+        show_token_input=True,
+        show_oauth_button=True,
+    )
+
+
+def _unwrap_exception(exc: BaseException) -> BaseException:
+    """Recursively unwrap ExceptionGroup / BaseExceptionGroup to find the
+    first non-ExceptionGroup exception.
+
+    MCP's streamablehttp_client runs requests in a TaskGroup; when one fails,
+    the group wraps it in an ExceptionGroup (or BaseExceptionGroup in Python 3.11+).
+    We need to extract the actual cause so we can classify it.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        for sub_exc in exc.exceptions:
+            # Recurse in case of nested groups
+            inner = _unwrap_exception(sub_exc)
+            if not isinstance(inner, BaseExceptionGroup):
+                return inner
+        # All sub-exceptions are groups — return the outermost
+        return exc
+    return exc
+
+
+@dataclass
 class ConnectResult:
     """Result of a connect/handshake attempt.
 
@@ -71,6 +300,11 @@ class ConnectResult:
     tools: list[RemoteToolInfo] = field(default_factory=list)
     error: str | None = None
     server_info: dict[str, Any] = field(default_factory=dict)
+    # Error classification (populated when connected=False and error is set)
+    auth_reason: str | None = None
+    user_message: str | None = None
+    show_token_input: bool = False
+    show_oauth_button: bool = False
 
 
 @dataclass
@@ -82,6 +316,11 @@ class InvokeResult:
     error: str | None = None
     requires_auth: bool = False
     duration_ms: int = 0
+    # Error classification (populated when status="error")
+    auth_reason: str | None = None
+    user_message: str | None = None
+    show_token_input: bool = False
+    show_oauth_button: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +534,14 @@ async def _open_session(
     finally:
         try:
             await client_ctx.__aexit__(None, None, None)
+        except (ExceptionGroup, BaseExceptionGroup) as exc:
+            # MCP library raises ExceptionGroups from internal TaskGroup
+            # cleanup — re-raise so the outer handler can classify the real
+            # HTTP status, instead of silently swallowing it.
+            root = _unwrap_exception(exc)
+            raise MCPClientError(
+                f"Transport cleanup raised {type(root).__name__}: {root}"
+            ) from exc
         except Exception:  # noqa: BLE001
             logger.debug("Transport close failed", exc_info=True)
 
@@ -390,6 +637,14 @@ class MCPTestClient:
                 raise MCPTimeoutError(
                     f"Connection to {self._url} was cancelled (timeout or request interrupted)"
                 ) from None
+            except (ExceptionGroup, BaseExceptionGroup) as exc:
+                # MCP library wraps many errors in ExceptionGroup — unwrap the
+                # first real cause. If it's an HTTPStatusError, let it propagate
+                # to the existing HTTP handler so auth_required can be detected.
+                root = _unwrap_exception(exc)
+                if isinstance(root, httpx.HTTPStatusError):
+                    raise root from exc
+                raise MCPClientError(f"Unhandled exception during connect: {root}") from exc
             except httpx.HTTPStatusError as exc:
                 if _is_auth_required_response(None, exc):
                     return ConnectResult(
@@ -443,12 +698,16 @@ class MCPTestClient:
 
         try:
             return await self._with_retries("connect", _do_connect)
-        except MCPTimeoutError as exc:
-            return ConnectResult(error=str(exc), transport=transport)
-        except MCPTransportError as exc:
-            return ConnectResult(error=str(exc), transport=transport)
-        except MCPClientError as exc:
-            return ConnectResult(error=str(exc), transport=transport)
+        except (MCPTimeoutError, MCPTransportError, MCPClientError) as exc:
+            info = classify_connection_error(exc)
+            return ConnectResult(
+                error=info.user_message,
+                transport=transport,
+                auth_reason=info.auth_reason,
+                user_message=info.user_message,
+                show_token_input=info.show_token_input,
+                show_oauth_button=info.show_oauth_button,
+            )
 
     # ---- public: invoke --------------------------------------------------
 
@@ -472,6 +731,11 @@ class MCPTestClient:
                 raise MCPTimeoutError(
                     f"Request to {self._url} was cancelled (timeout or request interrupted)"
                 ) from None
+            except (ExceptionGroup, BaseExceptionGroup) as exc:
+                root = _unwrap_exception(exc)
+                if isinstance(root, httpx.HTTPStatusError):
+                    raise root from exc
+                raise MCPClientError(f"Unhandled exception during invoke: {root}") from exc
             except httpx.HTTPStatusError as exc:
                 if _is_auth_required_response(None, exc):
                     return InvokeResult(
@@ -564,14 +828,17 @@ class MCPTestClient:
 
         try:
             return await self._with_retries("invoke", _do_invoke)
-        except MCPTimeoutError as exc:
-            return InvokeResult(status="error", error=str(exc), duration_ms=_elapsed_ms(started))
-        except MCPTransportError as exc:
-            return InvokeResult(status="error", error=str(exc), duration_ms=_elapsed_ms(started))
-        except MCPProtocolError as exc:
-            return InvokeResult(status="error", error=str(exc), duration_ms=_elapsed_ms(started))
-        except MCPClientError as exc:
-            return InvokeResult(status="error", error=str(exc), duration_ms=_elapsed_ms(started))
+        except (MCPTimeoutError, MCPTransportError, MCPProtocolError, MCPClientError) as exc:
+            info = classify_connection_error(exc)
+            return InvokeResult(
+                status="error",
+                error=info.user_message,
+                duration_ms=_elapsed_ms(started),
+                auth_reason=info.auth_reason,
+                user_message=info.user_message,
+                show_token_input=info.show_token_input,
+                show_oauth_button=info.show_oauth_button,
+            )
 
 
 # ---------------------------------------------------------------------------

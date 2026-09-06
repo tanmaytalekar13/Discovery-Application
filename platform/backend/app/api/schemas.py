@@ -83,6 +83,11 @@ class ToolConnectResponse(BaseModel):
     tools: list[dict[str, Any]] = Field(default_factory=list)
     error: str | None = None
     requires_auth: bool = False
+    # Error classification (populated when connected=False and error is set)
+    auth_reason: str | None = None
+    user_message: str | None = None
+    show_token_input: bool = False
+    show_oauth_button: bool = False
 
 
 class ToolInvokeRequest(BaseModel):
@@ -96,6 +101,11 @@ class ToolInvokeResponse(BaseModel):
     error: str | None = None
     duration_ms: int | None = None
     requires_auth: bool = False
+    # Error classification (populated when status="error")
+    auth_reason: str | None = None
+    user_message: str | None = None
+    show_token_input: bool = False
+    show_oauth_button: bool = False
 
 
 class OAuthStartResponse(BaseModel):

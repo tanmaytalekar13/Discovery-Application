@@ -254,6 +254,16 @@ export interface ItemClassificationResponse {
 // Tool Test / Connect (Phase 15)
 // ---------------------------------------------------------------------------
 
+export type AuthReason =
+  | 'unauthorized'
+  | 'payment_required'
+  | 'not_found'
+  | 'rate_limited'
+  | 'server_error'
+  | 'connection_error'
+  | 'timeout'
+  | 'unknown';
+
 export interface ToolInfo {
   name: string;
   description?: string;
@@ -267,6 +277,10 @@ export interface ToolConnectResponse {
   tools: ToolInfo[];
   error?: string;
   requires_auth?: boolean;
+  auth_reason?: AuthReason;
+  user_message?: string;
+  show_token_input?: boolean;
+  show_oauth_button?: boolean;
 }
 
 export interface ToolInvokeRequest {
@@ -280,6 +294,10 @@ export interface ToolInvokeResponse {
   error?: string;
   requires_auth?: boolean;
   duration_ms?: number;
+  auth_reason?: AuthReason;
+  user_message?: string;
+  show_token_input?: boolean;
+  show_oauth_button?: boolean;
 }
 
 export interface OAuthStartResponse {
