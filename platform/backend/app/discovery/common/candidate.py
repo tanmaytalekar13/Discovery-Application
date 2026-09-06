@@ -93,6 +93,15 @@ def _url_or_none(value: str | None) -> str | None:
     return value if value else None
 
 
+def _normalize_git_url(url: str | None) -> str | None:
+    """Strip 'git+' prefix from git URLs (e.g. git+https://... → https://...)."""
+    if not url:
+        return None
+    if url.startswith("git+"):
+        return url[4:]
+    return url
+
+
 def from_github_candidate(candidate: Any) -> CandidateReference:
     """Convert a `GitHubDiscoveryAdapter` `GitHubCandidate`."""
     protocol: Protocol = "mcp" if candidate.item_type is ItemType.TOOL else "a2a"
@@ -223,7 +232,7 @@ def from_npm_candidate(candidate: Any) -> CandidateReference:
         source_provider="npm Registry",
         source_id=candidate.source.id,
         url=_url_or_none(candidate.npm_url),
-        repository_url=_url_or_none(candidate.repository_url),
+        repository_url=_url_or_none(_normalize_git_url(candidate.repository_url)),
         title=candidate.name,
         description=candidate.description,
         evidence=candidate.evidence,
