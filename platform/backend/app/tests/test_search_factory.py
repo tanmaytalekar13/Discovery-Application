@@ -19,6 +19,8 @@ def _settings(**overrides) -> Settings:
         "enable_a2a_registry_discovery": False,
         "enable_web_search_discovery": False,
         "enable_web_extraction": False,
+        "enable_npm_discovery": False,
+        "enable_awesome_list_discovery": False,
         "github_token": "",
         "firecrawl_api_key": "",
         "a2a_registry_base_urls": "",
