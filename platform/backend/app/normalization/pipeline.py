@@ -543,6 +543,11 @@ def _can_accept_best_effort_mcp(candidate: CandidateReference) -> bool:
         return raw is not None and bool(getattr(raw, "version", None))
     if candidate.source_type is SourceType.GITHUB:
         return bool(candidate.repository_url and candidate.evidence)
+    # CONFIGURED covers npm Registry, awesome-list, GitHub Topics, and other
+    # structured discovery sources — accept them if they have a repository URL
+    # and descriptive evidence (same bar as GITHUB).
+    if candidate.source_type is SourceType.CONFIGURED:
+        return bool(candidate.repository_url and candidate.evidence)
     if candidate.source_type in {SourceType.WEB_SEARCH, SourceType.WEB_PAGE}:
         return _has_explicit_protocol_evidence(candidate)
     return False

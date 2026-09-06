@@ -275,6 +275,7 @@ def from_awesome_list_candidate(candidate: Any) -> CandidateReference:
         source_provider=candidate.source.provider or "awesome-list",
         source_id=candidate.source.id,
         url=_url_or_none(candidate.html_url),
+        repository_url=_url_or_none(candidate.html_url),
         title=candidate.name,
         description=candidate.description,
         evidence=candidate.evidence,

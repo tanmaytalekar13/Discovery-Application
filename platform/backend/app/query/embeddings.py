@@ -89,7 +89,9 @@ def cosine_similarity(left: list[float] | None, right: list[float] | None) -> fl
     right_norm = math.sqrt(sum(value * value for value in right[:length]))
     if left_norm == 0 or right_norm == 0:
         return 0.0
-    return max(0.0, min(1.0, dot / (left_norm * right_norm)))
+    # Use absolute value of cosine so that opposite-sign hash collisions
+    # (same term, negative sign) still score as highly similar rather than 0.
+    return max(0.0, min(1.0, abs(dot / (left_norm * right_norm))))
 
 
 def _flatten(value: Any) -> str:

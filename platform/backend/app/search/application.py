@@ -77,7 +77,13 @@ class ApplicationSearchService:
                 metadata=self._live_metadata(discovery, catalog, mode="live"),
             )
 
-        cached = await self._phase11.search(query, item_type=item_type, limit=limit)
+        # Always use the full ranking pool (ranking_candidate_limit) for cached
+        # items so that lower-priority sources (npm, awesome-list) are ranked
+        # before the result slice. The user's limit applies only to the final
+        # ranked output.
+        cached = await self._phase11.search(
+            query, item_type=item_type, limit=self._settings.ranking_candidate_limit
+        )
         discovery, catalog = await self._run_live_discovery(query, item_type, limit)
         live_metadata = self._live_metadata(discovery, catalog, mode="merged")
 

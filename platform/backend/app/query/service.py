@@ -46,7 +46,11 @@ class Phase11SearchService:
 
         for item in candidates:
             expected_dimensions = self._settings.embedding_dimensions
-            if item.embedding is None or len(item.embedding) != expected_dimensions:
+            if (
+                item.embedding is None
+                or len(item.embedding) != expected_dimensions
+                or all(v == 0.0 for v in item.embedding)
+            ):
                 item.embedding = self._embedder.embed_item(item)
                 await self._repository.update_embedding(item.item_id, item.embedding)
 
@@ -82,6 +86,19 @@ class Phase11SearchService:
             for item in items
             if effective_type == "all" or item.type.value == effective_type
         ]
+
+        # Regenerate zero-vector embeddings so that items seeded before the
+        # zero-vector guard was added (or accepted without a live MCP protocol
+        # resolution) are still ranked by semantic relevance.
+        for item in candidates:
+            if (
+                item.embedding is None
+                or len(item.embedding) != self._embedder.dimensions
+                or all(v == 0.0 for v in item.embedding)
+            ):
+                item.embedding = self._embedder.embed_item(item)
+                await self._repository.update_embedding(item.item_id, item.embedding)
+
         weights = RankingWeights(
             relevance=self._settings.ranking_relevance_weight,
             reliability=self._settings.ranking_reliability_weight,
