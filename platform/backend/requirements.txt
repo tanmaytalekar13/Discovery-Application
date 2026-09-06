@@ -9,3 +9,4 @@ pytest-asyncio==1.2.0
 mcp==1.9.4
 starlette==0.47.2
 sse-starlette==2.4.1
+cryptography==45.0.0

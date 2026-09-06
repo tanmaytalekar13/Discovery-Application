@@ -132,6 +132,7 @@ async def connect(
         url=url,
         auth_token=token,
         preferred_transport=candidate.type,
+        auth_header=candidate.auth_header,
     )
     result = await client.connect()
 
@@ -188,6 +189,7 @@ async def invoke(
         url=url,
         auth_token=token,
         preferred_transport=candidate.type,
+        auth_header=candidate.auth_header,
     )
     result = await client.invoke(body.tool_name, body.arguments)
 

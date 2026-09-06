@@ -216,6 +216,26 @@ class TestMCPTestClientConstruction:
         assert headers["Accept"] == "application/json, text/event-stream"
         assert "User-Agent" in headers
 
+    def test_custom_auth_header(self):
+        client = MCPTestClient(
+            "https://mcp.example.com/mcp",
+            auth_token="rf_abc123",
+            auth_header="x-api-key",
+        )
+        headers = client._build_headers()
+        assert headers["x-api-key"] == "rf_abc123"
+        assert "Authorization" not in headers
+
+    def test_bearer_fallback_when_auth_header_none(self):
+        client = MCPTestClient(
+            "https://mcp.example.com/mcp",
+            auth_token="sk-secret",
+            auth_header=None,
+        )
+        headers = client._build_headers()
+        assert headers["Authorization"] == "Bearer sk-secret"
+        assert "x-api-key" not in headers
+
 
 # ---------------------------------------------------------------------------
 # Result dataclasses

@@ -72,6 +72,10 @@ def _build_remote_candidates(
 
     Preserves order so the caller's preferred transport (streamable-http
     first, sse second per the spec) is preserved.
+
+    Auth headers are extracted from the first required header entry in
+    the remote's header list. The MCP registry uses 'x-api-key' for
+    tools that require a bearer/API-key header instead of HTTP Basic.
     """
     candidates: list[RemoteCandidate] = []
     for remote in remotes or []:
@@ -83,7 +87,25 @@ def _build_remote_candidates(
             continue
         if _is_local_host(url):
             continue
-        candidates.append(RemoteCandidate(type=transport_type, url=url))
+
+        # Extract auth header from the first required header entry.
+        # Registry entries with isRequired=True headers (e.g. x-api-key)
+        # override the default Authorization: Bearer header.
+        auth_header: str | None = None
+        headers = remote.get("headers") or []
+        if isinstance(headers, list):
+            for h in headers:
+                if isinstance(h, dict) and h.get("isRequired") is True:
+                    auth_header = h.get("name")
+                    break
+
+        candidates.append(
+            RemoteCandidate(
+                type=transport_type,
+                url=url,
+                auth_header=auth_header,
+            )
+        )
     return candidates
 
 

@@ -221,6 +221,7 @@ export type ClassificationMode =
 export interface RemoteCandidate {
   type: 'streamable-http' | 'sse';
   url: string;
+  auth_header?: string;
 }
 
 export interface EnvironmentVariableHint {

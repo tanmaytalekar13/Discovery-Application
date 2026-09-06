@@ -46,6 +46,13 @@ class RemoteCandidate(BaseModel):
 
     type: Literal["streamable-http", "sse"]
     url: str
+    auth_header: str | None = Field(
+        default=None,
+        description=(
+            "The HTTP header name to use for the auth token (e.g. 'x-api-key'). "
+            "If absent, the client falls back to 'Authorization: Bearer'."
+        ),
+    )
 
 
 class ClassificationResult(BaseModel):

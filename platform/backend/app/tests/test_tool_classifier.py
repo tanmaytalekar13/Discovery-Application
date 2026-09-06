@@ -441,6 +441,122 @@ def test_remote_candidates_have_correct_shape():
     assert isinstance(result.detail[0], RemoteCandidate)
 
 
+def test_auth_header_extracted_from_required_header():
+    """When a remote has isRequired=True headers, the first one becomes auth_header."""
+    item = _item(
+        [
+            {
+                "kind": "mcp_registry_remotes",
+                "remotes": [
+                    {
+                        "type": "streamable-http",
+                        "url": "https://mcp.roboflow.com/mcp",
+                        "headers": [
+                            {
+                                "name": "x-api-key",
+                                "description": "Roboflow API key",
+                                "isRequired": True,
+                                "isSecret": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    result = classify_tool(item)
+    assert result.testable is True
+    assert result.detail[0].auth_header == "x-api-key"
+
+
+def test_auth_header_not_set_when_no_required_headers():
+    """No auth_header when the remote has no required headers."""
+    item = _item(
+        [
+            {
+                "kind": "mcp_registry_remotes",
+                "remotes": [
+                    {
+                        "type": "streamable-http",
+                        "url": "https://mcp.example.com/mcp",
+                        "headers": [
+                            {
+                                "name": "x-custom-header",
+                                "description": "Optional header",
+                                "isRequired": False,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    result = classify_tool(item)
+    assert result.detail[0].auth_header is None
+
+
+def test_auth_header_picks_first_required_header():
+    item = _item(
+        [
+            {
+                "kind": "mcp_registry_remotes",
+                "remotes": [
+                    {
+                        "type": "streamable-http",
+                        "url": "https://mcp.example.com/mcp",
+                        "headers": [
+                            {
+                                "name": "x-temp-token",
+                                "isRequired": False,
+                            },
+                            {
+                                "name": "x-api-key",
+                                "isRequired": True,
+                            },
+                            {
+                                "name": "x-other",
+                                "isRequired": True,
+                            },
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    result = classify_tool(item)
+    # First isRequired=True wins
+    assert result.detail[0].auth_header == "x-api-key"
+
+
+def test_auth_header_preserved_across_multiple_remotes():
+    item = _item(
+        [
+            {
+                "kind": "mcp_registry_remotes",
+                "remotes": [
+                    {
+                        "type": "streamable-http",
+                        "url": "https://mcp.roboflow.com/mcp",
+                        "headers": [
+                            {"name": "x-api-key", "isRequired": True},
+                        ],
+                    },
+                    {
+                        "type": "streamable-http",
+                        "url": "https://mcp2.example.com/mcp",
+                        "headers": [
+                            {"name": "Authorization", "isRequired": True},
+                        ],
+                    },
+                ],
+            }
+        ]
+    )
+    result = classify_tool(item)
+    assert result.detail[0].auth_header == "x-api-key"
+    assert result.detail[1].auth_header == "Authorization"
+
+
 # ---------------------------------------------------------------------------
 # Multiple kinds: remotes present but only localhost
 # ---------------------------------------------------------------------------

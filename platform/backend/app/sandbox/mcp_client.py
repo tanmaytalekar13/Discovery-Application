@@ -568,6 +568,7 @@ class MCPTestClient:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
         allow_local_host: bool = False,
+        auth_header: str | None = None,
     ) -> None:
         self._url = _validate_url(url, allow_local=allow_local_host)
         self._auth_token = auth_token
@@ -575,6 +576,7 @@ class MCPTestClient:
         self._timeout = timeout
         self._max_retries = max_retries
         self._transport_name = _pick_transport(self._url, preferred_transport)
+        self._auth_header = auth_header  # e.g. "x-api-key" (None = use Authorization: Bearer)
 
     # ---- headers ---------------------------------------------------------
 
@@ -585,10 +587,12 @@ class MCPTestClient:
             "User-Agent": "DiscoveryApplicationBot/1.0 (+tool-test)",
         }
         if self._auth_token:
-            # Bearer is the most common shape; servers that expect a
-            # raw API key can still accept this since the auth scheme
-            # is server-defined.
-            headers["Authorization"] = f"Bearer {self._auth_token}"
+            # Most servers accept Authorization: Bearer <token>. Some tools
+            # (e.g. Roboflow) require a custom header like x-api-key.
+            if self._auth_header:
+                headers[self._auth_header] = self._auth_token
+            else:
+                headers["Authorization"] = f"Bearer {self._auth_token}"
         return headers
 
     # ---- retry helper ---------------------------------------------------
@@ -700,9 +704,18 @@ class MCPTestClient:
             return await self._with_retries("connect", _do_connect)
         except (MCPTimeoutError, MCPTransportError, MCPClientError) as exc:
             info = classify_connection_error(exc)
+            # Auth errors (401/403) that come through the outer handler
+            # (wrapped in ExceptionGroup) should still surface as auth_required.
+            auth_required = info.auth_reason in (
+                AUTH_REASON_UNAUTHORIZED,
+                AUTH_REASON_CONNECTION_ERROR,
+                AUTH_REASON_TIMEOUT,
+                AUTH_REASON_UNKNOWN,
+            )
             return ConnectResult(
                 error=info.user_message,
                 transport=transport,
+                auth_required=auth_required,
                 auth_reason=info.auth_reason,
                 user_message=info.user_message,
                 show_token_input=info.show_token_input,
