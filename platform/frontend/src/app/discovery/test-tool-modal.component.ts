@@ -188,11 +188,8 @@ type ModalState =
                   <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
                 </svg>
               </div>
-              <p class="auth-title">Authentication required</p>
-              <p class="auth-desc">
-                This MCP server requires credentials.
-                Provide your API key or bearer token to continue.
-              </p>
+              <p class="auth-title">{{ errorTitle() }}</p>
+              <p class="auth-desc">{{ userMessage() }}</p>
 
               <!-- Token input -->
               <div class="token-form">
@@ -1163,8 +1160,13 @@ export class TestToolModalComponent implements OnInit {
     }
 
     if (res.error) {
-      this.state.set('error');
-      this.errorMessage.set(res.user_message ?? res.error);
+      // If credentials can help, show the auth form instead of the error panel.
+      if (res.show_token_input || res.show_oauth_button) {
+        this.state.set('auth-required');
+      } else {
+        this.state.set('error');
+        this.errorMessage.set(res.user_message ?? res.error);
+      }
       return;
     }
 
