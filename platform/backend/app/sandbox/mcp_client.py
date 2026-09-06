@@ -512,11 +512,46 @@ class MCPTestClient:
             # is set, but the call itself succeeded at the protocol
             # level. Surface that distinction to the UI.
             is_error = getattr(call_result, "isError", False)
-            if is_error:
+
+            # Check for auth-required patterns in the result content.
+            # Some servers (e.g. pipeworx) return {"error":"connection_required"}
+            # in structuredContent rather than via HTTP 401/403 or isError flag.
+            auth_required = False
+            auth_message: str | None = None
+            structured = getattr(call_result, "structuredContent", None)
+            if structured is not None:
+                if isinstance(structured, dict):
+                    err_val = structured.get("error", "")
+                    if isinstance(err_val, str) and "connection_required" in err_val.lower():
+                        auth_required = True
+                        auth_message = structured.get("message") or err_val
+                elif isinstance(structured, str) and "connection_required" in structured.lower():
+                    auth_required = True
+                    auth_message = structured
+
+            # Also check content blocks for connection_required text (fallback)
+            if not auth_required:
+                extracted = _extract_error_message(call_result)
+                if extracted and "connection_required" in extracted.lower():
+                    auth_required = True
+                    auth_message = auth_message or extracted
+
+            if is_error and not auth_required:
                 return InvokeResult(
                     status="error",
                     error=_extract_error_message(call_result),
                     result=_coerce_content(call_result),
+                    duration_ms=duration,
+                    requires_auth=False,
+                )
+
+            if auth_required:
+                # Either isError+connection_required, or structuredContent carries
+                # connection_required — treat as an auth-required response.
+                return InvokeResult(
+                    status="error",
+                    error=auth_message or "Authentication required",
+                    requires_auth=True,
                     duration_ms=duration,
                 )
 
@@ -524,6 +559,7 @@ class MCPTestClient:
                 status="success",
                 result=_coerce_content(call_result),
                 duration_ms=duration,
+                requires_auth=False,
             )
 
         try:

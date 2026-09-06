@@ -344,7 +344,7 @@ type ModalState =
                 }
               </div>
 
-              @if (invokeResult()?.result) {
+              @if (invokeResult()?.result && !invokeResult()?.requires_auth) {
                 <div class="result-body">
                   <pre class="result-json">{{ formatResult(invokeResult()?.result) }}</pre>
                 </div>
@@ -358,7 +358,7 @@ type ModalState =
 
               @if (invokeResult()?.requires_auth) {
                 <div class="auth-retry-banner">
-                  <p>This tool requires authentication. Provide your token and try again.</p>
+                  <p>This tool requires authentication to use. Connect your account or provide a token to retry.</p>
                   <button class="btn btn--secondary" (click)="goToAuth()">Provide Token</button>
                 </div>
               }
@@ -888,6 +888,9 @@ export class TestToolModalComponent implements OnInit {
   showToken = signal(false);
   tokenSubmitting = signal(false);
   tokenSubmitError = signal<string>('');
+  // When auth fails mid-invoke and user submits a token, we retry the invoke
+  // automatically after re-connect. Stores (tool, args) for the pending retry.
+  private pendingInvokeForRetry: { tool: ToolInfo; args: Record<string, unknown> } | null = null;
 
   // ---------------------------------------------------------------------------
   // Form fields (derived from selected tool's inputSchema)
@@ -977,6 +980,18 @@ export class TestToolModalComponent implements OnInit {
   private handleConnectResponse(res: ToolConnectResponse, token?: string): void {
     if (res.connected) {
       this.tools.set(res.tools ?? []);
+      // If we just re-authenticated and have a pending invoke retry, replay it
+      // automatically and clear the pending state.
+      if (this.pendingInvokeForRetry) {
+        const { tool, args } = this.pendingInvokeForRetry;
+        this.pendingInvokeForRetry = null;
+        this.selectedTool.set(tool);
+        this.state.set('tool-form');
+        // Defer the actual invoke to the next tick so the form renders
+        // and selectedTool signal is propagated.
+        setTimeout(() => this.replayInvoke(tool, args), 0);
+        return;
+      }
       this.state.set('tools-ready');
       return;
     }
@@ -1002,6 +1017,27 @@ export class TestToolModalComponent implements OnInit {
     this.errorMessage.set('Connection failed for an unknown reason.');
   }
 
+  private replayInvoke(tool: ToolInfo, args: Record<string, unknown>): void {
+    const itemId = this.result.item.item_id;
+    this.invoking.set(true);
+    this.invokeError.set('');
+    this.service.testInvoke(
+      itemId,
+      { tool_name: tool.name, arguments: args },
+      this.sessionId() ?? undefined,
+    ).subscribe({
+      next: (res) => {
+        this.invoking.set(false);
+        this.invokeResult.set(res);
+        this.state.set('result');
+      },
+      error: (err) => {
+        this.invoking.set(false);
+        this.invokeError.set(this.extractErrorMessage(err) || 'Invocation failed.');
+      },
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Token submission
   // ---------------------------------------------------------------------------
@@ -1014,6 +1050,16 @@ export class TestToolModalComponent implements OnInit {
     const itemId = this.result.item.item_id;
     const existingSid = this.sessionId();
 
+    // If we're in the result state and got an auth error on invoke, capture
+    // the pending invoke so we can replay it automatically after re-connecting.
+    const ir = this.invokeResult();
+    if (ir?.requires_auth && this.selectedTool()) {
+      this.pendingInvokeForRetry = {
+        tool: this.selectedTool()!,
+        args: { ...this.formValues },
+      };
+    }
+
     this.service.testSubmitManualToken(itemId, this.tokenInput.trim(), existingSid ?? undefined).subscribe({
       next: (res) => {
         this.tokenSubmitting.set(false);
@@ -1024,6 +1070,7 @@ export class TestToolModalComponent implements OnInit {
       },
       error: (err) => {
         this.tokenSubmitting.set(false);
+        this.pendingInvokeForRetry = null;
         this.tokenSubmitError.set(this.extractErrorMessage(err) || 'Failed to store token.');
       },
     });
@@ -1044,6 +1091,7 @@ export class TestToolModalComponent implements OnInit {
     this.selectedTool.set(null);
     this.invokeResult.set(null);
     this.invokeError.set('');
+    this.pendingInvokeForRetry = null;
     this.state.set('tools-ready');
   }
 
