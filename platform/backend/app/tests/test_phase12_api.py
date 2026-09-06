@@ -111,6 +111,7 @@ class FakeApplicationSearchService:
                     reliability=0.91,
                     freshness=1.0,
                     evidence=0.5,
+                    source_priority=1.0,
                 ),
             ),
         )

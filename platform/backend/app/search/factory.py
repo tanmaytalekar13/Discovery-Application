@@ -20,8 +20,11 @@ import httpx
 
 from app.config import Settings
 from app.discovery.a2a_registry.client import A2ARegistryClient
+from app.discovery.awesome_list.client import AwesomeListAdapter
 from app.discovery.github.client import GitHubDiscoveryAdapter
+from app.discovery.github_topics.client import GitHubTopicsAdapter
 from app.discovery.mcp_registry.client import MCPRegistryClient
+from app.discovery.npm.client import NpmDiscoveryAdapter
 from app.discovery.web_extraction.client import WebExtractionAdapter
 from app.discovery.web_search.client import (
     FirecrawlWebSearchProvider,
@@ -46,12 +49,35 @@ def build_mcp_adapter(
         else None
     )
 
+    github_topics = (
+        GitHubTopicsAdapter(
+            token=settings.github_token,
+            httpx_client=httpx_client,
+        )
+        if settings.enable_github_discovery
+        else None
+    )
+
     mcp_registry = (
         MCPRegistryClient(httpx_client=httpx_client)
         if settings.enable_mcp_registry_discovery
         else None
     )
 
+    npm = (
+        NpmDiscoveryAdapter(httpx_client=httpx_client)
+        if settings.enable_npm_discovery
+        else None
+    )
+
+    awesome_list = (
+        AwesomeListAdapter(httpx_client=httpx_client)
+        if settings.enable_awesome_list_discovery
+        else None
+    )
+
+    # Web search is built but passed to mcp_adapter as Tier 2 fallback.
+    # The mcp_adapter itself decides whether to run it based on Tier 1 results.
     web_search = None
     if settings.enable_web_search_discovery and settings.firecrawl_api_key:
         provider = FirecrawlWebSearchProvider(
@@ -65,7 +91,10 @@ def build_mcp_adapter(
 
     if (
         github is None
+        and github_topics is None
         and mcp_registry is None
+        and npm is None
+        and awesome_list is None
         and web_search is None
         and (web_extraction is None or not web_extraction_urls)
         and not settings.configured_mcp_endpoint_list
@@ -74,7 +103,10 @@ def build_mcp_adapter(
 
     return MCPDiscoveryAdapter(
         github=github,
+        github_topics=github_topics,
         mcp_registry=mcp_registry,
+        npm=npm,
+        awesome_list=awesome_list,
         web_search=web_search,
         web_extraction=web_extraction,
         extraction_urls=web_extraction_urls,

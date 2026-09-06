@@ -123,6 +123,7 @@ export interface SearchResultItem {
   reliability: number;
   freshness: number;
   evidence: number;
+  source_priority: number;
   classification?: ClassificationResult;
 }
 

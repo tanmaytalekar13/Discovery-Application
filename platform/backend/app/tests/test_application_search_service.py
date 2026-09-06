@@ -98,6 +98,7 @@ class FakePhase11:
                     reliability=0.9,
                     freshness=1.0,
                     evidence=0.5,
+                    source_priority=1.0,
                 )
                 for entry in self.cached_items
             ),
@@ -121,6 +122,7 @@ class FakePhase11:
                 reliability=entry.reliability.score,
                 freshness=1.0,
                 evidence=0.5,
+                source_priority=1.0,
             )
             for entry in items
         ]

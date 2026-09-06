@@ -32,6 +32,7 @@ class SearchResultItem(BaseModel):
     reliability: float
     freshness: float
     evidence: float
+    source_priority: float = 1.0
     classification: ClassificationResult | None = None
 
 

@@ -214,6 +214,69 @@ def from_well_known_probe(probe: Any) -> CandidateReference | None:
     )
 
 
+def from_npm_candidate(candidate: Any) -> CandidateReference:
+    """Convert an `NpmDiscoveryAdapter` `NpmCandidate`."""
+    return CandidateReference(
+        protocol="mcp",
+        item_type=ItemType.TOOL,
+        source_type=candidate.source.type,
+        source_provider="npm Registry",
+        source_id=candidate.source.id,
+        url=_url_or_none(candidate.npm_url),
+        repository_url=_url_or_none(candidate.repository_url),
+        title=candidate.name,
+        description=candidate.description,
+        evidence=candidate.evidence,
+        raw_metadata={
+            "source_candidate": candidate,
+            "npm_version": candidate.version,
+            "npm_downloads_monthly": candidate.downloads_monthly,
+            "npm_score": candidate.score_final,
+        },
+    )
+
+
+def from_github_topics_candidate(candidate: Any) -> CandidateReference:
+    """Convert a `GitHubTopicsAdapter` `GitHubTopicsCandidate`."""
+    return CandidateReference(
+        protocol="mcp",
+        item_type=ItemType.TOOL,
+        source_type=candidate.source.type,
+        source_provider="GitHub Topics",
+        source_id=candidate.source.id,
+        url=_url_or_none(candidate.html_url),
+        repository_url=_url_or_none(candidate.clone_url),
+        title=candidate.name,
+        description=candidate.description,
+        evidence=candidate.evidence,
+        raw_metadata={
+            "source_candidate": candidate,
+            "stars": candidate.stars,
+            "language": candidate.language,
+        },
+    )
+
+
+def from_awesome_list_candidate(candidate: Any) -> CandidateReference:
+    """Convert an `AwesomeListAdapter` `AwesomeListCandidate`."""
+    return CandidateReference(
+        protocol="mcp",
+        item_type=ItemType.TOOL,
+        source_type=candidate.source.type,
+        source_provider=candidate.source.provider or "awesome-list",
+        source_id=candidate.source.id,
+        url=_url_or_none(candidate.html_url),
+        title=candidate.name,
+        description=candidate.description,
+        evidence=candidate.evidence,
+        raw_metadata={
+            "source_candidate": candidate,
+            "install_command": candidate.install_command,
+            "category": candidate.category,
+        },
+    )
+
+
 def from_configured_endpoint(
     *,
     url: str,

@@ -60,6 +60,7 @@ async def search(
             reliability=ranked.reliability,
             freshness=ranked.freshness,
             evidence=ranked.evidence,
+            source_priority=ranked.source_priority,
             classification=classify_tool(ranked.item),
         )
         for ranked in result.ranked.results

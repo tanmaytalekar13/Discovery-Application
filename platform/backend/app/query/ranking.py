@@ -7,6 +7,38 @@ from app.models import Item
 from app.query.embeddings import LocalEmbeddingModel, cosine_similarity
 
 
+# Source priority multipliers applied before final sort.
+# MCP Registry entries always rank above other sources even with slightly
+# lower relevance/reliability scores. When the same tool appears from
+# multiple sources (e.g. mcp_registry + npm), the mcp_registry version wins.
+SOURCE_PRIORITY_MULTIPLIER: dict[str, float] = {
+    # MCP Registry is authoritative — highest priority
+    "MCP Registry": 2.0,
+    # Structured free sources — high priority
+    "npm Registry": 1.3,
+    "GitHub Topics": 1.3,
+    "GitHub": 1.2,
+    "awesome-list": 1.1,
+    # Web sources — lower priority (used as fallback)
+    "Web Search": 0.9,
+    "Web Extraction": 0.9,
+    # Configured endpoints — medium priority
+    "Configured Endpoint": 1.0,
+    # Default for unknown providers
+    "": 1.0,
+}
+
+
+def _source_priority(item: Item) -> float:
+    """Return the priority multiplier for an item's primary source."""
+    # Use the first provenance entry as the primary source
+    if item.provenance:
+        provider = getattr(item.provenance[0], "provider", None) or ""
+    else:
+        provider = ""
+    return SOURCE_PRIORITY_MULTIPLIER.get(provider, 1.0)
+
+
 @dataclass(frozen=True)
 class RankingWeights:
     relevance: float = 0.45
@@ -23,6 +55,7 @@ class RankedItem:
     reliability: float
     freshness: float
     evidence: float
+    source_priority: float
 
 
 def rank_items(
@@ -42,12 +75,14 @@ def rank_items(
         reliability = item.reliability.score
         freshness = _freshness_score(item, now=now)
         evidence = _evidence_score(item)
-        final_score = (
+        priority = _source_priority(item)
+        raw_score = (
             weights.relevance * relevance
             + weights.reliability * reliability
             + weights.freshness * freshness
             + weights.evidence * evidence
         )
+        final_score = raw_score * priority
         ranked.append(
             RankedItem(
                 item=item,
@@ -56,6 +91,7 @@ def rank_items(
                 reliability=round(reliability, 6),
                 freshness=round(freshness, 6),
                 evidence=round(evidence, 6),
+                source_priority=priority,
             )
         )
 

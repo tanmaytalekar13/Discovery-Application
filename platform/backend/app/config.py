@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     enable_github_discovery: bool = False
     enable_mcp_registry_discovery: bool = False
     enable_a2a_registry_discovery: bool = False
+    enable_npm_discovery: bool = False
+    enable_awesome_list_discovery: bool = False
     enable_web_search_discovery: bool = False
     enable_web_extraction: bool = False
     enable_well_known_a2a: bool = True
