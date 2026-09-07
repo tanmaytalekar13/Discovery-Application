@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import shlex
 import threading
@@ -39,10 +40,15 @@ SESSION_TIMEOUT_SECONDS = 10 * 60  # 10 minutes
 # How often the cleanup thread runs
 CLEANUP_INTERVAL_SECONDS = 60
 
-# Container resource limits
-CONTAINER_CPU_LIMIT = 0.5  # 0.5 CPU cores
-CONTAINER_MEMORY_LIMIT = 256 * 1024 * 1024  # 256 MB
-CONTAINER_DISK_LIMIT = 100 * 1024 * 1024  # 100 MB
+# Container resource limits (configurable via environment variables for faster local execution)
+CONTAINER_CPU_LIMIT = float(os.getenv("SANDBOX_CPU_LIMIT", "1.5"))  # 1.5 CPU cores
+CONTAINER_MEMORY_LIMIT = int(os.getenv("SANDBOX_MEMORY_LIMIT_MB", "768")) * 1024 * 1024  # 768 MB
+CONTAINER_DISK_LIMIT = int(os.getenv("SANDBOX_DISK_LIMIT_MB", "256")) * 1024 * 1024  # 256 MB
+
+# Shared package cache volumes to avoid re-downloading dependencies on every test
+SANDBOX_ENABLE_CACHE_VOLUMES = os.getenv("SANDBOX_ENABLE_CACHE_VOLUMES", "true").lower() in ("true", "1", "yes")
+NPM_CACHE_VOLUME = os.getenv("SANDBOX_NPM_CACHE_VOLUME", "mcp_npm_cache")
+PIP_CACHE_VOLUME = os.getenv("SANDBOX_PIP_CACHE_VOLUME", "mcp_pip_cache")
 
 # Default images per registry type
 DEFAULT_IMAGES = {
@@ -105,7 +111,7 @@ NPM_RUNNER_SCRIPT = (
     'try{globalRoot=execSync("npm root -g").toString().trim();}catch(e){}'
     'const pkgDir=path.join(globalRoot,getPkgName(id));'
     'if(!fs.existsSync(pkgDir)){'
-    'try{execSync("npm install -g --no-audit --no-fund "+JSON.stringify(id),{stdio:["ignore","ignore","inherit"]});}catch(e){process.exit(1);}'
+    'try{execSync("npm install -g --no-audit --no-fund --prefer-offline --progress=false "+JSON.stringify(id),{stdio:["ignore","ignore","inherit"]});}catch(e){process.exit(1);}'
     '}'
     'let binPath=null;'
     'const pkgJsonPath=path.join(pkgDir,"package.json");'
@@ -165,8 +171,11 @@ class LocalToolConfig:
             return ["sh", "-c", full_cmd]
 
         if self.registry_type == "pip":
-            # Use pipx run to install and execute in one step
-            full_cmd = f"pip install pipx && pipx run {shlex.quote(self.identifier)}"
+            # Check if pipx is installed first to avoid redundant installation on every run
+            full_cmd = (
+                f"(command -v pipx >/dev/null 2>&1 || pip install --quiet --no-warn-script-location --prefer-binary pipx) "
+                f"&& pipx run {shlex.quote(self.identifier)}"
+            )
             if self.runtime_arguments:
                 full_cmd += " " + " ".join(shlex.quote(arg) for arg in self.runtime_arguments)
             return ["sh", "-c", full_cmd]
@@ -294,7 +303,7 @@ class ContainerManager:
             container = await asyncio.get_event_loop().run_in_executor(
                 None,
                 self._create_docker_container,
-                session_id, image, command, env_vars, domains, timeout,
+                session_id, image, command, env_vars, domains, timeout, config.registry_type,
             )
 
             session.container_id = container.id
@@ -425,25 +434,40 @@ class ContainerManager:
         env_vars: dict[str, str],
         allowed_domains: list[str],
         timeout: int,
+        registry_type: str = "npm",
     ) -> Any:
         """Create and start a Docker container with security constraints.
 
         This method:
-        - Pulls image if needed
+        - Uses local image if already present (avoids slow remote registry pull)
         - Creates container with resource limits
+        - Mounts package cache volume for fast repeated testing
         - Sets up network whitelisting via /etc/hosts and iptables-style rules
         - Starts the container (but we don't wait for it to complete)
         """
         client = self.docker
 
-        # Pull image if not present
+        # Only pull image if not present locally (saves 5-15s per run)
         try:
-            client.images.pull(image)
-        except Exception as exc:
-            logger.warning("Failed to pull image %s (may already exist): %s", image, exc)
+            client.images.get(image)
+            logger.debug("Docker image %s is already present locally", image)
+        except Exception:
+            logger.info("Docker image %s not found locally, pulling...", image)
+            try:
+                client.images.pull(image)
+            except Exception as exc:
+                logger.warning("Failed to pull image %s (may already exist): %s", image, exc)
 
         # Build environment list
         env_list = [f"{k}={v}" for k, v in env_vars.items()]
+
+        # Mount cache volumes to avoid re-downloading packages on every test run
+        volumes: dict[str, dict[str, str]] = {}
+        if SANDBOX_ENABLE_CACHE_VOLUMES:
+            if registry_type == "npm":
+                volumes[NPM_CACHE_VOLUME] = {"bind": "/root/.npm", "mode": "rw"}
+            elif registry_type == "pip":
+                volumes[PIP_CACHE_VOLUME] = {"bind": "/root/.cache/pip", "mode": "rw"}
 
         # Container configuration
         # Start with a simple long-running command (sleep infinity) to keep container alive
@@ -454,7 +478,7 @@ class ContainerManager:
             "environment": env_list,
             "detach": True,
             # Resource limits
-            "nano_cpus": int(CONTAINER_CPU_LIMIT * 1e9),  # 0.5 CPU = 500M nano CPUs
+            "nano_cpus": int(CONTAINER_CPU_LIMIT * 1e9),
             "mem_limit": CONTAINER_MEMORY_LIMIT,
             "memswap_limit": CONTAINER_MEMORY_LIMIT,  # Disable swap
             # Drop capabilities (but not all - some needed for network)
@@ -463,6 +487,9 @@ class ContainerManager:
             # Don't auto-remove - we want to inspect logs if needed
             "auto_remove": False,
         }
+
+        if volumes:
+            container_config["volumes"] = volumes
 
         # Try to use sandbox-network if it exists, otherwise use default
         try:
