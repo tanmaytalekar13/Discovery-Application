@@ -508,6 +508,16 @@ class LocalMCPClient:
         # Process exited
         if returncode is not None:
             if returncode != 0:
+                # Check for syntax error pattern (missing shebang or shell mismatch)
+                if "syntax error" in stderr_lower:
+                    for line in stderr.split('\n'):
+                        if "syntax error" in line.lower():
+                            return (
+                                f"MCP server error: {line.strip()[:300]} (package binary appears to be missing a '#!/usr/bin/env node' shebang or has invalid line endings)",
+                                None,
+                                [],
+                            )
+
                 # Check for specific error patterns
                 if any(k in stderr_lower for k in ["error:", "error ", "exception"]):
                     # Try to extract the error message

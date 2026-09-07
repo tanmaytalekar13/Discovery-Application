@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import shlex
 import threading
 import time
 from dataclasses import dataclass, field
@@ -92,6 +93,50 @@ class ContainerSession:
         return time.monotonic() > self.expires_at
 
 
+# Node.js runner script executed inside container for npm MCP servers.
+# Many npm packages omit the '#!/usr/bin/env node' shebang or use Windows CRLF line endings,
+# which causes the shell to fail with 'line 7: syntax error: unexpected "("' when run via npx.
+# This runner installs the package, fixes missing shebangs/CRLF, and invokes node directly.
+NPM_RUNNER_SCRIPT = (
+    'const {execSync,spawn}=require("child_process"),fs=require("fs"),path=require("path");'
+    'function getPkgName(id){const at=id.lastIndexOf("@");return at>0?id.slice(0,at):id;}'
+    'const id=process.argv[1],extraArgs=process.argv.slice(2);'
+    'let globalRoot="/usr/local/lib/node_modules";'
+    'try{globalRoot=execSync("npm root -g").toString().trim();}catch(e){}'
+    'const pkgDir=path.join(globalRoot,getPkgName(id));'
+    'if(!fs.existsSync(pkgDir)){'
+    'try{execSync("npm install -g --no-audit --no-fund "+JSON.stringify(id),{stdio:["ignore","ignore","inherit"]});}catch(e){process.exit(1);}'
+    '}'
+    'let binPath=null;'
+    'const pkgJsonPath=path.join(pkgDir,"package.json");'
+    'if(fs.existsSync(pkgJsonPath)){'
+    'try{'
+    'const pkg=JSON.parse(fs.readFileSync(pkgJsonPath,"utf8"));'
+    'if(typeof pkg.bin==="string"){binPath=path.resolve(pkgDir,pkg.bin);}'
+    'else if(pkg.bin&&typeof pkg.bin==="object"){const vals=Object.values(pkg.bin);if(vals.length>0)binPath=path.resolve(pkgDir,vals[0]);}'
+    'else if(pkg.main){binPath=path.resolve(pkgDir,pkg.main);}'
+    '}catch(e){}'
+    '}'
+    'if(!binPath||!fs.existsSync(binPath)){'
+    'try{const binName=getPkgName(id).split("/").pop();'
+    'const candidate=execSync("which "+binName+" 2>/dev/null").toString().trim();'
+    'if(candidate&&fs.existsSync(candidate))binPath=fs.realpathSync(candidate);'
+    '}catch(e){}'
+    '}'
+    'if(!binPath||!fs.existsSync(binPath)){console.error("Could not locate entrypoint for "+id);process.exit(1);}'
+    'try{'
+    'let content=fs.readFileSync(binPath,"utf8"),modified=false;'
+    'const cr=String.fromCharCode(13),lf=String.fromCharCode(10);'
+    'if(content.indexOf(cr)!==-1){content=content.split(cr+lf).join(lf).split(cr).join(lf);modified=true;}'
+    'if(!content.startsWith("#!")){content="#!/usr/bin/env node"+lf+content;modified=true;}'
+    'if(modified)fs.writeFileSync(binPath,content,"utf8");'
+    'fs.chmodSync(binPath,0o755);'
+    '}catch(e){}'
+    'const child=spawn(process.execPath,[binPath,...extraArgs],{stdio:"inherit"});'
+    'child.on("exit",(code,sig)=>process.exit(code??(sig?1:0)));'
+)
+
+
 @dataclass
 class LocalToolConfig:
     """Configuration for running a local MCP tool in a container."""
@@ -105,31 +150,33 @@ class LocalToolConfig:
     def build_command(self) -> list[str]:
         """Build the command to execute inside the container."""
         if self.registry_type == "npm" or "npx" in (self.runtime_hint or "").lower():
-            # Use shell form to ensure PATH is set and command works properly
-            runtime_hint_cmd = ""
-            if self.runtime_hint:
-                # Remove "npx" prefix if present in runtime_hint
-                hint_parts = self.runtime_hint.split()
-                if hint_parts[0].lower() == "npx":
-                    hint_parts = hint_parts[1:]
-                runtime_hint_cmd = " ".join(hint_parts) + " "
+            # Clean package identifier if it accidentally includes npx prefix
+            pkg_id = self.identifier.strip()
+            if pkg_id.lower().startswith("npx "):
+                pkg_id = pkg_id[4:].strip()
+            if pkg_id.startswith("-y "):
+                pkg_id = pkg_id[3:].strip()
 
-            # Build the full command
-            full_cmd = f"npx -y {runtime_hint_cmd}{self.identifier}"
+            args = [shlex.quote(pkg_id)]
             if self.runtime_arguments:
-                full_cmd += " " + " ".join(self.runtime_arguments)
-
+                args.extend(shlex.quote(arg) for arg in self.runtime_arguments)
+            args_str = " ".join(args)
+            full_cmd = f"node -e '{NPM_RUNNER_SCRIPT}' -- {args_str}"
             return ["sh", "-c", full_cmd]
 
         if self.registry_type == "pip":
             # Use pipx run to install and execute in one step
-            full_cmd = f"pip install pipx && pipx run {self.identifier}"
+            full_cmd = f"pip install pipx && pipx run {shlex.quote(self.identifier)}"
             if self.runtime_arguments:
-                full_cmd += " " + " ".join(self.runtime_arguments)
+                full_cmd += " " + " ".join(shlex.quote(arg) for arg in self.runtime_arguments)
             return ["sh", "-c", full_cmd]
 
-        # Fallback: try npx
-        return ["sh", "-c", f"npx -y {self.identifier}"]
+        # Fallback for other tools: run via node runner
+        args = [shlex.quote(self.identifier)]
+        if self.runtime_arguments:
+            args.extend(shlex.quote(arg) for arg in self.runtime_arguments)
+        args_str = " ".join(args)
+        return ["sh", "-c", f"node -e '{NPM_RUNNER_SCRIPT}' -- {args_str}"]
 
 
 # ---------------------------------------------------------------------------
