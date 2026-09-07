@@ -9,6 +9,7 @@ import asyncio
 import base64
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -17,9 +18,9 @@ from app.artifacts import disk_cache
 
 
 # Extensions that are almost never useful to preview/inspect and are
-# frequently large (binaries, images, archives, lockfiles). Skipped during
-# the eager "download the whole repo" pass to save disk space and avoid
-# burning through the GitHub API rate limit on files nobody will open.
+# frequently large (binaries, images, archives, lockfiles). Retained for a
+# possible future prefetch policy; source files are currently cached only when
+# the user opens them, which avoids exhausting GitHub's public API quota.
 _SKIP_DOWNLOAD_EXTENSIONS = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg",
     ".pdf", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar",
@@ -181,7 +182,7 @@ async def _download_all_files(
 
             # Fetch from GitHub
             content = await fetch_github_file(owner, repo, file_path, branch)
-            if content:
+            if content is not None:
                 # Save to disk
                 disk_cache.write_cached_file(cache_path, content)
 
@@ -192,12 +193,15 @@ async def _download_all_files(
 async def fetch_github_tree(
     owner: str, repo: str, branch: str = "main"
 ) -> list[dict[str, Any]] | None:
-    """
-    Fetch repository tree from GitHub API.
-    Automatically tries common branch names if the specified branch fails.
+    """Fetch a repository tree, retaining the legacy list-only API."""
+    result = await fetch_github_tree_with_branch(owner, repo, branch)
+    return result[0] if result else None
 
-    Returns simplified tree structure or None on error.
-    """
+
+async def fetch_github_tree_with_branch(
+    owner: str, repo: str, branch: str = "main"
+) -> tuple[list[dict[str, Any]], str] | None:
+    """Fetch a tree and return the ref that GitHub actually accepted."""
     github_token = os.getenv("GITHUB_TOKEN", "")
     headers = {
         "Accept": "application/vnd.github.v3+json",
@@ -206,7 +210,6 @@ async def fetch_github_tree(
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
 
-    # Try provided branch first, then fallback to common alternatives
     branches_to_try = [branch]
     if branch == "main":
         branches_to_try.extend(["master", "HEAD"])
@@ -217,26 +220,25 @@ async def fetch_github_tree(
 
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         for try_branch in branches_to_try:
-            url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{try_branch}?recursive=1"
-
             try:
-                response = await client.get(url, headers=headers)
+                response = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/git/trees/{try_branch}",
+                    headers=headers,
+                    params={"recursive": "1"},
+                )
+                if response.status_code != 200:
+                    continue
 
-                if response.status_code == 200:
-                    data = response.json()
-                    tree = data.get("tree", [])
-
-                    # Simplify tree structure for frontend
-                    simplified_tree = []
-                    for item in tree:
-                        if item.get("type") in ("blob", "tree"):
-                            simplified_tree.append({
-                                "path": item["path"],
-                                "type": item["type"],  # "blob" = file, "tree" = directory
-                                "size": item.get("size"),
-                            })
-
-                    return simplified_tree
+                tree = response.json().get("tree", [])
+                return [
+                    {
+                        "path": item["path"],
+                        "type": item["type"],
+                        "size": item.get("size"),
+                    }
+                    for item in tree
+                    if item.get("type") in ("blob", "tree")
+                ], try_branch
             except Exception:
                 continue
 
@@ -259,28 +261,46 @@ async def fetch_github_file(
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
 
-    # URL-encode the file path
-    encoded_path = file_path.replace(" ", "%20")
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}?ref={branch}"
+    # Repositories still commonly use ``master`` as their default branch.
+    # ``fetch_github_tree`` already falls back across these refs, but this
+    # endpoint used to try only ``main``. That left a visible tree whose every
+    # file failed to load. Keep the same fallback behaviour for individual
+    # files (including old tree caches written before the resolved ref was
+    # known).
+    refs_to_try = [branch]
+    if branch == "main":
+        refs_to_try.extend(["master", "HEAD"])
+    elif branch == "master":
+        refs_to_try.extend(["main", "HEAD"])
+    else:
+        refs_to_try.extend(["main", "master", "HEAD"])
+
+    # Preserve directory separators while escaping all special characters in
+    # a filename (for example '#', '?', Unicode, and spaces).
+    encoded_path = quote(file_path, safe="/")
 
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
+            for ref in refs_to_try:
+                response = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}",
+                    headers=headers,
+                    params={"ref": ref},
+                )
 
-            if response.status_code != 200:
-                return None
+                if response.status_code != 200:
+                    continue
 
-            data = response.json()
+                data = response.json()
 
-            # GitHub returns base64-encoded content
-            if "content" in data and data.get("encoding") == "base64":
-                content_b64 = data["content"].replace("\n", "")
-                decoded = base64.b64decode(content_b64).decode("utf-8", errors="replace")
-                return decoded
-
-            return None
+                # GitHub returns base64-encoded content.
+                if "content" in data and data.get("encoding") == "base64":
+                    content_b64 = data["content"].replace("\n", "")
+                    return base64.b64decode(content_b64).decode("utf-8", errors="replace")
     except Exception:
         return None
+
+    return None
 
 
 async def get_repository_tree(item: Item) -> tuple[RepositoryTreeResult, str | None]:
@@ -317,29 +337,30 @@ async def get_repository_tree(item: Item) -> tuple[RepositoryTreeResult, str | N
         ), None
 
     owner, repo, branch = repo_info
-    tree = await fetch_github_tree(owner, repo, branch)
+    fetched_tree = await fetch_github_tree_with_branch(owner, repo, branch)
 
-    if not tree:
+    if not fetched_tree:
         return RepositoryTreeResult(
             available=False,
             note="Failed to fetch repository tree from GitHub.",
         ), None
+
+    tree, resolved_branch = fetched_tree
 
     # Save tree to disk cache
     new_cache_path = disk_cache.generate_cache_path(item.item_id, "source_tree", "json")
     cache_data = {
         "owner": owner,
         "repo": repo,
-        "branch": branch,
+        "branch": resolved_branch,
         "tree": tree,
     }
 
     disk_cache.write_cached_json(new_cache_path, cache_data)
 
-    # Download all files in the tree and cache them to disk right away, so
-    # that every subsequent /source/files/{path} call is served from disk
-    # instead of hitting GitHub again.
-    await _download_all_files(item, owner, repo, branch, tree)
+    # Files are fetched and cached on demand. Downloading an entire repository
+    # here easily exceeds GitHub's unauthenticated API limit before the user
+    # has opened even one file.
 
     return RepositoryTreeResult(available=True, tree=tree), new_cache_path
 
@@ -378,9 +399,17 @@ async def get_source_file(item: Item, file_path: str) -> SourceFileResult:
         )
 
     owner, repo, branch = repo_info
+    # A tree cache records the ref that worked (e.g. master instead of the
+    # assumed main). Reuse it so each selected file needs only one API call.
+    tree_cache_path = item.artifacts.source_tree_cache_path
+    if tree_cache_path:
+        tree_cache = disk_cache.read_cached_json(tree_cache_path)
+        cached_branch = tree_cache.get("branch") if tree_cache else None
+        if isinstance(cached_branch, str) and cached_branch:
+            branch = cached_branch
     content = await fetch_github_file(owner, repo, file_path, branch)
 
-    if not content:
+    if content is None:
         return SourceFileResult(
             available=False,
             note=f"Failed to fetch file '{file_path}' from GitHub.",
@@ -436,7 +465,7 @@ async def resolve_source(item: Item) -> tuple[SourcePreviewResult, str | None]:
         if repo_info:
             owner, repo, branch = repo_info
             readme_content = await fetch_github_file(owner, repo, "README.md", branch)
-            if readme_content:
+            if readme_content is not None:
                 new_cache_path = disk_cache.generate_cache_path(item.item_id, "readme", "md")
                 disk_cache.write_cached_file(new_cache_path, readme_content)
                 return SourcePreviewResult(

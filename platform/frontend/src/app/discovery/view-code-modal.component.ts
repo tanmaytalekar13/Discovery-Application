@@ -904,7 +904,8 @@ export class ViewCodeModalComponent implements OnInit, AfterViewInit, OnDestroy 
     this.service.getSourceFile(this.item.item.item_id, path).subscribe({
       next: (data) => {
         this.fileLoading.set(false);
-        if (data.available && data.content) {
+        // An empty file is still a successfully loaded source file.
+        if (data.available && data.content !== null && data.content !== undefined) {
           this.setEditorContent(data.content, data.language || this.getLanguageFromPath(path));
         } else {
           this.setEditorContent(

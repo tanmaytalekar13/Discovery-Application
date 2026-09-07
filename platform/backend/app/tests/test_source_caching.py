@@ -2,7 +2,6 @@
 Tests for source caching and resolution.
 """
 
-from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
@@ -13,11 +12,46 @@ from app.models import (
     DiscoveryMetadata,
     DiscoverySource,
     Item,
-    ItemStatus,
     ItemType,
     Reliability,
     SourceType,
 )
+
+
+@pytest.mark.asyncio
+async def test_fetch_github_file_falls_back_to_master(monkeypatch):
+    """A tree discovered on master must not make every file unavailable."""
+    calls: list[str] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict[str, str] | None = None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, *, headers, params):
+            calls.append(params["ref"])
+            if params["ref"] == "master":
+                return FakeResponse(200, {"encoding": "base64", "content": "cHJpbnQoJ29rJyk="})
+            return FakeResponse(404)
+
+    monkeypatch.setattr(source_resolver.httpx, "AsyncClient", lambda **_: FakeClient())
+
+    content = await source_resolver.fetch_github_file(
+        "owner", "repo", "src/file with spaces.py", "main"
+    )
+
+    assert content == "print('ok')"
+    assert calls == ["main", "master"]
 
 
 def create_test_item(source_url: str | None = None) -> Item:
