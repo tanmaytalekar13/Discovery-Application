@@ -21,6 +21,7 @@ A package whose transport URL is localhost/127.0.0.1/0.0.0.0 is
 treated as local even when its transport is HTTP-based, because the
 server still needs to be running on the user's own machine.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -70,8 +71,10 @@ def _build_remote_candidates(
 ) -> list[RemoteCandidate]:
     """Convert raw remotes into RemoteCandidate objects, dropping localhost.
 
-    Preserves order so the caller's preferred transport (streamable-http
-    first, sse second per the spec) is preserved.
+    Streamable HTTP is preferred because it is the current MCP transport;
+    legacy SSE candidates remain available as a fallback. The Registry does
+    not require publishers to put their remotes in preference order, so this
+    must not depend on the source-array order.
 
     Auth headers are extracted from the first required header entry in
     the remote's header list. The MCP registry uses 'x-api-key' for
@@ -106,7 +109,12 @@ def _build_remote_candidates(
                 auth_header=auth_header,
             )
         )
-    return candidates
+    # Python's sort is stable, retaining publisher order within each
+    # transport while placing the modern transport first.
+    return sorted(
+        candidates,
+        key=lambda candidate: candidate.type != "streamable-http",
+    )
 
 
 def _required_auth_header(entry: dict[str, Any]) -> str | None:
@@ -254,10 +262,14 @@ def classify_tool(item: Any) -> ClassificationResult:
                 # the package or its transport. Preserve this so a supplied
                 # API key is sent using e.g. x-api-key instead of always as a
                 # Bearer token.
-                auth_header = _required_auth_header(pkg) or _required_auth_header(transport)
-                remote_package_candidates.append(RemoteCandidate(
-                    type=transport_type, url=transport_url, auth_header=auth_header
-                ))
+                auth_header = _required_auth_header(pkg) or _required_auth_header(
+                    transport
+                )
+                remote_package_candidates.append(
+                    RemoteCandidate(
+                        type=transport_type, url=transport_url, auth_header=auth_header
+                    )
+                )
             else:
                 # stdio, or http/sse pointing at localhost -> local
                 local_packages.append(_summarize_package(pkg))

@@ -12,6 +12,7 @@ Tests cover:
 The actual HTTP round-trips to real servers are tested via the
 integration test in `test_integration/` if the env has real fixtures.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +22,7 @@ import pytest
 
 from app.sandbox.mcp_client import (
     AUTH_REASON_CONNECTION_ERROR,
+    AUTH_REASON_INCOMPATIBLE,
     AUTH_REASON_NOT_FOUND,
     AUTH_REASON_PAYMENT_REQUIRED,
     AUTH_REASON_RATE_LIMITED,
@@ -50,12 +52,19 @@ from exceptiongroup import BaseExceptionGroup, ExceptionGroup  # type: ignore
 # URL safety
 # ---------------------------------------------------------------------------
 
+
 class TestUrlValidation:
     def test_accepts_https(self):
-        assert _validate_url("https://mcp.example.com/mcp") == "https://mcp.example.com/mcp"
+        assert (
+            _validate_url("https://mcp.example.com/mcp")
+            == "https://mcp.example.com/mcp"
+        )
 
     def test_accepts_http(self):
-        assert _validate_url("http://internal.example.com/mcp") == "http://internal.example.com/mcp"
+        assert (
+            _validate_url("http://internal.example.com/mcp")
+            == "http://internal.example.com/mcp"
+        )
 
     def test_rejects_localhost_by_default(self):
         with pytest.raises(UnsafeURLError, match="non-public host"):
@@ -133,7 +142,7 @@ class TestIsUnsafeHost:
         assert _is_unsafe_host("192.168.1.1") is True
         assert _is_unsafe_host("172.16.0.1") is True
         assert _is_unsafe_host("fc00::1") is True  # ULA
-        assert _is_unsafe_host("fe80::1") is True   # link-local
+        assert _is_unsafe_host("fe80::1") is True  # link-local
 
     def test_public_hosts(self):
         for host in ("example.com", "api.openai.com", "mcp.waystation.ai"):
@@ -148,9 +157,12 @@ class TestIsUnsafeHost:
 # Transport selection
 # ---------------------------------------------------------------------------
 
+
 class TestPickTransport:
     def test_explicit_streamable_http(self):
-        assert _pick_transport("https://x.com/mcp", "streamable-http") == "streamable-http"
+        assert (
+            _pick_transport("https://x.com/mcp", "streamable-http") == "streamable-http"
+        )
 
     def test_explicit_sse(self):
         assert _pick_transport("https://x.com/mcp", "sse") == "sse"
@@ -166,6 +178,7 @@ class TestPickTransport:
 # ---------------------------------------------------------------------------
 # MCPTestClient construction
 # ---------------------------------------------------------------------------
+
 
 class TestMCPTestClientConstruction:
     def test_minimal_construction(self):
@@ -241,6 +254,7 @@ class TestMCPTestClientConstruction:
 # Result dataclasses
 # ---------------------------------------------------------------------------
 
+
 class TestConnectResult:
     def test_default_is_error_state(self):
         r = ConnectResult()
@@ -314,6 +328,7 @@ class TestInvokeResult:
 # Error class hierarchy
 # ---------------------------------------------------------------------------
 
+
 class TestErrorHierarchy:
     def test_client_error_is_base(self):
         assert issubclass(MCPTimeoutError, MCPClientError)
@@ -338,6 +353,7 @@ class TestErrorHierarchy:
 # RemoteToolInfo
 # ---------------------------------------------------------------------------
 
+
 class TestRemoteToolInfo:
     def test_minimal(self):
         t = RemoteToolInfo(name="foo")
@@ -359,6 +375,7 @@ class TestRemoteToolInfo:
 # ---------------------------------------------------------------------------
 # _unwrap_exception
 # ---------------------------------------------------------------------------
+
 
 class TestUnwrapException:
     def test_returns_direct_exception(self):
@@ -398,6 +415,7 @@ class TestUnwrapException:
 # ---------------------------------------------------------------------------
 # classify_connection_error — HTTP status scenarios
 # ---------------------------------------------------------------------------
+
 
 class _FakeResponse:
     """Minimal httpx.Response mock for HTTPStatusError."""
@@ -439,7 +457,10 @@ class TestClassifyHttpStatusErrors:
         assert info.auth_reason == AUTH_REASON_PAYMENT_REQUIRED
         assert info.show_token_input is False
         assert info.show_oauth_button is False
-        assert "paid" in info.user_message.lower() or "subscription" in info.user_message.lower()
+        assert (
+            "paid" in info.user_message.lower()
+            or "subscription" in info.user_message.lower()
+        )
 
     def test_payment_required_with_retry_after(self):
         exc = httpx.HTTPStatusError(
@@ -500,7 +521,10 @@ class TestClassifyHttpStatusErrors:
         assert info.auth_reason == AUTH_REASON_SERVER_ERROR
         assert info.show_token_input is False
         assert info.show_oauth_button is False
-        assert "unavailable" in info.user_message.lower() or "error" in info.user_message.lower()
+        assert (
+            "unavailable" in info.user_message.lower()
+            or "error" in info.user_message.lower()
+        )
 
     def test_other_4xx_falls_back_to_unknown(self):
         exc = httpx.HTTPStatusError(
@@ -526,7 +550,9 @@ class TestClassifyNetworkErrors:
         assert info.auth_reason == AUTH_REASON_CONNECTION_ERROR
         assert info.show_token_input is True
         assert info.show_oauth_button is True
-        assert "secure" in info.user_message.lower() or "tls" in info.user_message.lower()
+        assert (
+            "secure" in info.user_message.lower() or "tls" in info.user_message.lower()
+        )
 
     def test_dns_resolution_failure(self):
         exc = Exception("Name or service not known: unknownhost.example.com")
@@ -535,7 +561,10 @@ class TestClassifyNetworkErrors:
         assert info.auth_reason == AUTH_REASON_CONNECTION_ERROR
         assert info.show_token_input is True
         assert info.show_oauth_button is True
-        assert "resolve" in info.user_message.lower() or "address" in info.user_message.lower()
+        assert (
+            "resolve" in info.user_message.lower()
+            or "address" in info.user_message.lower()
+        )
 
     def test_connection_refused(self):
         exc = Exception("Connection refused: [Errno 111] ECONNREFUSED")
@@ -553,6 +582,24 @@ class TestClassifyNetworkErrors:
         assert info.auth_reason == AUTH_REASON_CONNECTION_ERROR
         assert info.show_token_input is True
         assert info.show_oauth_button is True
+
+
+class TestClassifyProtocolErrors:
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Unsupported protocol version: 2025-11-25",
+            "Incompatible protocol version",
+            "Invalid protocol version requested by client",
+        ],
+    )
+    def test_protocol_negotiation_failure_is_explicit(self, message):
+        info = classify_connection_error(MCPProtocolError(message))
+
+        assert info.auth_reason == AUTH_REASON_INCOMPATIBLE
+        assert info.show_token_input is False
+        assert info.show_oauth_button is False
+        assert "protocol" in info.user_message.lower()
 
 
 class TestClassifyTimeouts:

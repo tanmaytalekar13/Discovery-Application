@@ -6,7 +6,10 @@ pytest==8.4.1
 ruff==0.12.10
 black==25.1.0
 pytest-asyncio==1.2.0
-mcp==1.9.4
+# Keep the v1 SDK API used by the backend, but support the current
+# handshake-era MCP protocol revisions advertised by Registry remotes.
+# 1.9.4 predates those revisions and can fail during `initialize`.
+mcp>=1.29.1,<2
 starlette==0.47.2
 sse-starlette==2.4.1
 cryptography==45.0.0

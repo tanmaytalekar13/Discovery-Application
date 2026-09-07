@@ -10,9 +10,8 @@ Covers:
   - Order preservation: streamable-http preferred over sse
   - Invalid URLs treated as local (defensive)
 """
-from __future__ import annotations
 
-import pytest
+from __future__ import annotations
 
 from app.sandbox.classifier import classify_tool
 from app.sandbox.schemas import (
@@ -26,6 +25,7 @@ from app.sandbox.schemas import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _item(config_files: list[dict] | None) -> dict:
     return {"artifacts": {"config_files": config_files or []}}
 
@@ -33,6 +33,7 @@ def _item(config_files: list[dict] | None) -> dict:
 # ---------------------------------------------------------------------------
 # Pure remote (mcp_registry_remotes)
 # ---------------------------------------------------------------------------
+
 
 def test_remote_with_streamable_http_is_testable():
     item = _item(
@@ -58,9 +59,7 @@ def test_remote_with_sse_is_testable():
         [
             {
                 "kind": "mcp_registry_remotes",
-                "remotes": [
-                    {"type": "sse", "url": "https://mcp.example.com/sse"}
-                ],
+                "remotes": [{"type": "sse", "url": "https://mcp.example.com/sse"}],
             }
         ]
     )
@@ -108,6 +107,32 @@ def test_remote_preserves_input_order():
     ]
 
 
+def test_remote_prefers_streamable_http_when_registry_lists_sse_first():
+    """Registry ordering is publisher-controlled, not transport preference."""
+    item = _item(
+        [
+            {
+                "kind": "mcp_registry_remotes",
+                "remotes": [
+                    {"type": "sse", "url": "https://remote.example.com/sse"},
+                    {
+                        "type": "streamable-http",
+                        "url": "https://remote.example.com/mcp",
+                    },
+                ],
+            }
+        ]
+    )
+
+    result = classify_tool(item)
+
+    assert result.testable is True
+    assert [candidate.type for candidate in result.detail] == [
+        "streamable-http",
+        "sse",
+    ]
+
+
 def test_remote_mixed_localhost_and_remote_keeps_only_remote():
     item = _item(
         [
@@ -146,6 +171,7 @@ def test_remote_skips_unknown_transport_types():
 # ---------------------------------------------------------------------------
 # Remote via package (mcp_registry_packages)
 # ---------------------------------------------------------------------------
+
 
 def test_remote_via_package_streamable_http():
     item = _item(
@@ -259,6 +285,7 @@ def test_mixed_remote_and_stdio_packages_prefers_remote():
 # Local stdio packages
 # ---------------------------------------------------------------------------
 
+
 def test_local_stdio_package():
     item = _item(
         [
@@ -292,18 +319,22 @@ def test_local_stdio_package():
 
 def test_remote_package_preserves_required_custom_auth_header():
     item = _item(
-        [{
-            "kind": "mcp_registry_packages",
-            "packages": [{
-                "registryType": "npm",
-                "identifier": "keyed-remote-server",
-                "transport": {
-                    "type": "streamable-http",
-                    "url": "https://example.com/mcp",
-                    "headers": [{"name": "x-api-key", "isRequired": True}],
-                },
-            }],
-        }]
+        [
+            {
+                "kind": "mcp_registry_packages",
+                "packages": [
+                    {
+                        "registryType": "npm",
+                        "identifier": "keyed-remote-server",
+                        "transport": {
+                            "type": "streamable-http",
+                            "url": "https://example.com/mcp",
+                            "headers": [{"name": "x-api-key", "isRequired": True}],
+                        },
+                    }
+                ],
+            }
+        ]
     )
 
     result = classify_tool(item)
@@ -349,12 +380,16 @@ def test_local_oci_package_uses_docker():
     )
     result = classify_tool(item)
     assert result.mode == "local_stdio"
-    assert result.detail[0].install_command == "docker run -i --rm ghcr.io/example/mcp:latest"
+    assert (
+        result.detail[0].install_command
+        == "docker run -i --rm ghcr.io/example/mcp:latest"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Not testable
 # ---------------------------------------------------------------------------
+
 
 def test_no_config_files_is_not_testable():
     result = classify_tool(_item(None))
@@ -397,14 +432,13 @@ def test_empty_remotes_array_falls_through():
 # Robustness / malformed input
 # ---------------------------------------------------------------------------
 
+
 def test_malformed_url_in_remotes_is_treated_as_local():
     item = _item(
         [
             {
                 "kind": "mcp_registry_remotes",
-                "remotes": [
-                    {"type": "streamable-http", "url": "not-a-valid-url"}
-                ],
+                "remotes": [{"type": "streamable-http", "url": "not-a-valid-url"}],
             }
         ]
     )
@@ -581,6 +615,7 @@ def test_auth_header_preserved_across_multiple_remotes():
 # ---------------------------------------------------------------------------
 # Multiple kinds: remotes present but only localhost
 # ---------------------------------------------------------------------------
+
 
 def test_remotes_only_localhost_falls_through_to_packages_local():
     item = _item(

@@ -16,8 +16,10 @@ The wrapper adds:
 
 This module is transport-agnostic at the API level: callers pass a
 URL and we pick streamable-http or SSE based on the URL or an
-explicit hint. The `mcp` library handles the wire format for both.
+explicit hint. The supported `mcp` SDK range is kept current with the
+handshake-era protocol revisions used by official Registry remotes.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -58,6 +60,7 @@ DEFAULT_SSE_READ_TIMEOUT = 60.0
 # ---------------------------------------------------------------------------
 # Data classes - public contract
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RemoteToolInfo:
@@ -126,8 +129,9 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
     while True:
         if isinstance(root_cause, (ExceptionGroup, BaseExceptionGroup)):
             root_cause = _unwrap_exception(root_cause)
-        elif (isinstance(root_cause, MCPClientError)
-              and root_cause.__cause__ is not None):
+        elif (
+            isinstance(root_cause, MCPClientError) and root_cause.__cause__ is not None
+        ):
             root_cause = root_cause.__cause__
         else:
             break
@@ -141,7 +145,7 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
             return ConnectionErrorInfo(
                 auth_reason=AUTH_REASON_UNAUTHORIZED,
                 user_message="This MCP server requires credentials. "
-                             "Provide your API key or bearer token to continue.",
+                "Provide your API key or bearer token to continue.",
                 show_token_input=True,
                 show_oauth_button=True,  # OAuth discovery done by caller if needed
             )
@@ -152,7 +156,9 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
             if retry_after:
                 msg += f"Rate limit: retry after {retry_after}."
             else:
-                msg += "Set up an account or subscription on the provider's website first."
+                msg += (
+                    "Set up an account or subscription on the provider's website first."
+                )
             return ConnectionErrorInfo(
                 auth_reason=AUTH_REASON_PAYMENT_REQUIRED,
                 user_message=msg,
@@ -164,7 +170,7 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
             return ConnectionErrorInfo(
                 auth_reason=AUTH_REASON_NOT_FOUND,
                 user_message="MCP endpoint not found. The URL may be incorrect "
-                             "or the server may no longer be hosted at this address.",
+                "or the server may no longer be hosted at this address.",
                 show_token_input=False,
                 show_oauth_button=False,
             )
@@ -187,7 +193,7 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
             return ConnectionErrorInfo(
                 auth_reason=AUTH_REASON_SERVER_ERROR,
                 user_message="The tool's server is temporarily unavailable "
-                             "(internal error). Try again later.",
+                "(internal error). Try again later.",
                 show_token_input=False,
                 show_oauth_button=False,
             )
@@ -196,7 +202,7 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
         return ConnectionErrorInfo(
             auth_reason=AUTH_REASON_UNKNOWN,
             user_message=f"Server rejected the request (HTTP {status}). "
-                         "If credentials are needed, try providing them below.",
+            "If credentials are needed, try providing them below.",
             show_token_input=True,
             show_oauth_button=True,
         )
@@ -206,64 +212,96 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
     exc_msg = str(root_cause).lower()
 
     # SSL/TLS errors
-    if any(tag in exc_type.lower() for tag in ("ssl", "tls", "certificate")) \
-       or any(tag in exc_msg for tag in ("ssl", "tls", "certificate", "sslerror")):
+    if any(tag in exc_type.lower() for tag in ("ssl", "tls", "certificate")) or any(
+        tag in exc_msg for tag in ("ssl", "tls", "certificate", "sslerror")
+    ):
         return ConnectionErrorInfo(
             auth_reason=AUTH_REASON_CONNECTION_ERROR,
             user_message="Secure connection failed. The server may be misconfigured "
-                         "or using an invalid TLS certificate.",
+            "or using an invalid TLS certificate.",
             show_token_input=True,
             show_oauth_button=True,
         )
 
     # DNS resolution failures
-    if any(tag in exc_msg for tag in ("name or service not known",
-                                       "no address associated",
-                                       "getaddrinfo failed",
-                                       "dns")) \
-       or "dns" in exc_type.lower():
+    if (
+        any(
+            tag in exc_msg
+            for tag in (
+                "name or service not known",
+                "no address associated",
+                "getaddrinfo failed",
+                "dns",
+            )
+        )
+        or "dns" in exc_type.lower()
+    ):
         return ConnectionErrorInfo(
             auth_reason=AUTH_REASON_CONNECTION_ERROR,
             user_message="Server address could not be resolved. "
-                         "The URL may be incorrect.",
+            "The URL may be incorrect.",
             show_token_input=True,
             show_oauth_button=True,
         )
 
     # Connection refused / reset / unreachable
-    if any(tag in exc_msg for tag in ("connection refused", "connection reset",
-                                       "connection closed", "cannot connect",
-                                       "network unreachable", "host unreachable")):
+    if any(
+        tag in exc_msg
+        for tag in (
+            "connection refused",
+            "connection reset",
+            "connection closed",
+            "cannot connect",
+            "network unreachable",
+            "host unreachable",
+        )
+    ):
         return ConnectionErrorInfo(
             auth_reason=AUTH_REASON_CONNECTION_ERROR,
             user_message="Could not connect to the server. "
-                         "The server may be down or the URL may be incorrect.",
+            "The server may be down or the URL may be incorrect.",
             show_token_input=True,
             show_oauth_button=True,
         )
 
     # Timeout — no HTTP response received at all
-    if isinstance(root_cause, (asyncio.TimeoutError, asyncio.CancelledError,
-                               httpx.TimeoutException,
-                               TimeoutError, TimeoutError)) \
-       or any(tag in exc_type.lower() for tag in ("timeout", "cancelled")) \
-       or "timeout" in exc_msg or "timed out" in exc_msg:
+    if (
+        isinstance(
+            root_cause,
+            (
+                asyncio.TimeoutError,
+                asyncio.CancelledError,
+                httpx.TimeoutException,
+                TimeoutError,
+                TimeoutError,
+            ),
+        )
+        or any(tag in exc_type.lower() for tag in ("timeout", "cancelled"))
+        or "timeout" in exc_msg
+        or "timed out" in exc_msg
+    ):
         return ConnectionErrorInfo(
             auth_reason=AUTH_REASON_TIMEOUT,
             user_message="Server is not responding. This may be an authentication "
-                         "issue or the server may be temporarily offline.",
+            "issue or the server may be temporarily offline.",
             show_token_input=True,
             show_oauth_button=True,
         )
 
-    # MCP protocol version mismatch — server uses an incompatible version
-    if exc_msg and ("protocol version" in exc_msg
-                    or "unsupported protocol" in exc_msg
-                    or "mcp" in exc_msg and ("version" in exc_msg or "protocol" in exc_msg)):
+    # MCP protocol version mismatch — especially likely for a remote returned
+    # by the Registry when a client SDK is older than the server's revision.
+    if exc_msg and (
+        "protocol version" in exc_msg
+        or "unsupported protocol" in exc_msg
+        or "incompatible protocol" in exc_msg
+        or "invalid protocol" in exc_msg
+        or ("mcp" in exc_msg and ("version" in exc_msg or "protocol" in exc_msg))
+    ):
         return ConnectionErrorInfo(
             auth_reason=AUTH_REASON_INCOMPATIBLE,
-            user_message="This MCP server uses an incompatible protocol version. "
-                         "It may have been updated since this tool was registered.",
+            user_message="This MCP server and this application could not negotiate "
+            "a compatible MCP protocol version. Try the server's "
+            "alternate transport if one is listed, or update the server.",
             show_token_input=False,
             show_oauth_button=False,
         )
@@ -272,7 +310,7 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
     return ConnectionErrorInfo(
         auth_reason=AUTH_REASON_UNKNOWN,
         user_message="Connection failed. If this tool requires credentials, "
-                     "provide your API key or bearer token below.",
+        "provide your API key or bearer token below.",
         show_token_input=True,
         show_oauth_button=True,
     )
@@ -340,6 +378,7 @@ class InvokeResult:
 # Errors
 # ---------------------------------------------------------------------------
 
+
 class MCPClientError(Exception):
     """Base error for MCP client failures."""
 
@@ -381,7 +420,7 @@ _BLOCKED_HOST_PATTERNS = {
     "0.0.0.0",
     "::1",
     "metadata.google.internal",  # GCP metadata
-    "169.254.169.254",           # AWS / Azure / GCP metadata
+    "169.254.169.254",  # AWS / Azure / GCP metadata
 }
 
 # Private / loopback IP ranges we never dial.
@@ -389,13 +428,26 @@ _BLOCKED_HOST_PATTERNS = {
 # this should be replaced with `ipaddress.ip_address(...).is_private`.
 _PRIVATE_HOST_PREFIXES = (
     "10.",
-    "172.16.", "172.17.", "172.18.", "172.19.",
-    "172.20.", "172.21.", "172.22.", "172.23.",
-    "172.24.", "172.25.", "172.26.", "172.27.",
-    "172.28.", "172.29.", "172.30.", "172.31.",
+    "172.16.",
+    "172.17.",
+    "172.18.",
+    "172.19.",
+    "172.20.",
+    "172.21.",
+    "172.22.",
+    "172.23.",
+    "172.24.",
+    "172.25.",
+    "172.26.",
+    "172.27.",
+    "172.28.",
+    "172.29.",
+    "172.30.",
+    "172.31.",
     "192.168.",
-    "fc", "fd",   # IPv6 ULA
-    "fe80",       # IPv6 link-local
+    "fc",
+    "fd",  # IPv6 ULA
+    "fe80",  # IPv6 link-local
 )
 
 
@@ -426,9 +478,7 @@ def _validate_url(url: str, *, allow_local: bool = False) -> str:
         raise UnsafeURLError(f"Malformed URL: {url!r}") from exc
 
     if parsed.scheme not in ("http", "https"):
-        raise UnsafeURLError(
-            f"Unsupported scheme {parsed.scheme!r} (only http/https)"
-        )
+        raise UnsafeURLError(f"Unsupported scheme {parsed.scheme!r} (only http/https)")
 
     if not parsed.hostname:
         raise UnsafeURLError("URL has no hostname")
@@ -476,6 +526,7 @@ def _is_auth_required_response(
 # Transport selection
 # ---------------------------------------------------------------------------
 
+
 def _pick_transport(url: str, preferred: str | None) -> str:
     """Pick a transport name for reporting purposes.
 
@@ -492,6 +543,7 @@ def _pick_transport(url: str, preferred: str | None) -> str:
 # ---------------------------------------------------------------------------
 # Low-level: dial and run an MCP session
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def _open_session(
@@ -581,6 +633,7 @@ async def _open_session(
 # Public API
 # ---------------------------------------------------------------------------
 
+
 class MCPTestClient:
     """High-level MCP client for the Test Tool flow.
 
@@ -607,7 +660,9 @@ class MCPTestClient:
         self._timeout = timeout
         self._max_retries = max_retries
         self._transport_name = _pick_transport(self._url, preferred_transport)
-        self._auth_header = auth_header  # e.g. "x-api-key" (None = use Authorization: Bearer)
+        self._auth_header = (
+            auth_header  # e.g. "x-api-key" (None = use Authorization: Bearer)
+        )
 
     # ---- headers ---------------------------------------------------------
 
@@ -642,7 +697,10 @@ class MCPTestClient:
                 await asyncio.sleep(0.5 * (attempt + 1))
                 logger.info(
                     "MCP %s: retrying after %s (attempt %d/%d)",
-                    op_name, exc, attempt + 2, self._max_retries + 1,
+                    op_name,
+                    exc,
+                    attempt + 2,
+                    self._max_retries + 1,
                 )
         # Shouldn't reach here, but be explicit.
         if last_exc:
@@ -679,7 +737,9 @@ class MCPTestClient:
                 root = _unwrap_exception(exc)
                 if isinstance(root, httpx.HTTPStatusError):
                     raise root from exc
-                raise MCPClientError(f"Unhandled exception during connect: {root}") from exc
+                raise MCPClientError(
+                    f"Unhandled exception during connect: {root}"
+                ) from exc
             except httpx.HTTPStatusError as exc:
                 if _is_auth_required_response(None, exc):
                     return ConnectResult(
@@ -691,9 +751,7 @@ class MCPTestClient:
                     f"HTTP {exc.response.status_code} during initialize"
                 ) from exc
             except httpx.TimeoutException as exc:
-                raise MCPTimeoutError(
-                    f"Timed out connecting to {self._url}"
-                ) from exc
+                raise MCPTimeoutError(f"Timed out connecting to {self._url}") from exc
             except httpx.RequestError as exc:
                 if _is_auth_required_response(None, exc):
                     return ConnectResult(
@@ -725,8 +783,10 @@ class MCPTestClient:
                 transport=transport,
                 tools=tools,
                 server_info={
-                    "name": getattr(init_result, "serverInfo", None) and init_result.serverInfo.name,
-                    "version": getattr(init_result, "serverInfo", None) and init_result.serverInfo.version,
+                    "name": getattr(init_result, "serverInfo", None)
+                    and init_result.serverInfo.name,
+                    "version": getattr(init_result, "serverInfo", None)
+                    and init_result.serverInfo.version,
                     "protocol_version": getattr(init_result, "protocolVersion", None),
                 },
             )
@@ -759,7 +819,9 @@ class MCPTestClient:
 
     # ---- public: invoke --------------------------------------------------
 
-    async def invoke(self, tool_name: str, arguments: dict[str, Any] | None = None) -> InvokeResult:
+    async def invoke(
+        self, tool_name: str, arguments: dict[str, Any] | None = None
+    ) -> InvokeResult:
         """Run tools/call on the remote server."""
         if not tool_name:
             return InvokeResult(status="error", error="tool_name is required")
@@ -783,7 +845,9 @@ class MCPTestClient:
                 root = _unwrap_exception(exc)
                 if isinstance(root, httpx.HTTPStatusError):
                     raise root from exc
-                raise MCPClientError(f"Unhandled exception during invoke: {root}") from exc
+                raise MCPClientError(
+                    f"Unhandled exception during invoke: {root}"
+                ) from exc
             except httpx.HTTPStatusError as exc:
                 if _is_auth_required_response(None, exc):
                     return InvokeResult(
@@ -834,10 +898,16 @@ class MCPTestClient:
             if structured is not None:
                 if isinstance(structured, dict):
                     err_val = structured.get("error", "")
-                    if isinstance(err_val, str) and "connection_required" in err_val.lower():
+                    if (
+                        isinstance(err_val, str)
+                        and "connection_required" in err_val.lower()
+                    ):
                         auth_required = True
                         auth_message = structured.get("message") or err_val
-                elif isinstance(structured, str) and "connection_required" in structured.lower():
+                elif (
+                    isinstance(structured, str)
+                    and "connection_required" in structured.lower()
+                ):
                     auth_required = True
                     auth_message = structured
 
@@ -875,8 +945,9 @@ class MCPTestClient:
                     error=auth_message or "Authentication required",
                     requires_auth=True,
                     auth_reason=AUTH_REASON_UNAUTHORIZED,
-                    user_message=auth_message or "This tool requires credentials. "
-                                                "Provide your API key or bearer token to continue.",
+                    user_message=auth_message
+                    or "This tool requires credentials. "
+                    "Provide your API key or bearer token to continue.",
                     show_token_input=True,
                     show_oauth_button=True,
                     duration_ms=duration,
@@ -891,7 +962,12 @@ class MCPTestClient:
 
         try:
             return await self._with_retries("invoke", _do_invoke)
-        except (MCPTimeoutError, MCPTransportError, MCPProtocolError, MCPClientError) as exc:
+        except (
+            MCPTimeoutError,
+            MCPTransportError,
+            MCPProtocolError,
+            MCPClientError,
+        ) as exc:
             info = classify_connection_error(exc)
             return InvokeResult(
                 status="error",
@@ -907,6 +983,7 @@ class MCPTestClient:
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
 
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
@@ -949,21 +1026,23 @@ def _extract_error_message(call_result: Any) -> str:
 
 
 # Auth-related keywords in error text that indicate a missing/invalid API key
-_AUTH_ERROR_KEYWORDS = frozenset((
-    "api key",
-    "api-key",
-    "apikey",
-    "auth",
-    "authorization",
-    "bearer",
-    "credential",
-    "invalid token",
-    "missing token",
-    "missing api",
-    "no api",
-    "unauthorized",
-    "invalid api",
-))
+_AUTH_ERROR_KEYWORDS = frozenset(
+    (
+        "api key",
+        "api-key",
+        "apikey",
+        "auth",
+        "authorization",
+        "bearer",
+        "credential",
+        "invalid token",
+        "missing token",
+        "missing api",
+        "no api",
+        "unauthorized",
+        "invalid api",
+    )
+)
 
 
 def _is_auth_error_text(text: str) -> bool:
@@ -976,7 +1055,10 @@ def _is_auth_error_text(text: str) -> bool:
     return (
         any(kw in lowered for kw in _AUTH_ERROR_KEYWORDS)
         # e.g. \"Add headers: {\\"Authorization\\": \\"Bearer ...\\"}\"
-        or ("add headers" in lowered and ("bearer" in lowered or "authorization" in lowered))
+        or (
+            "add headers" in lowered
+            and ("bearer" in lowered or "authorization" in lowered)
+        )
         # e.g. \"Keys are free at https://...\"
         or ("keys are free" in lowered or "get your api key" in lowered)
         or ("sign up" in lowered and "api" in lowered)
