@@ -832,6 +832,15 @@ class MCPTestClient:
                     auth_required = True
                     auth_message = auth_message or extracted
 
+            # Detect auth-related errors from text content.
+            # Some servers (e.g. PennyOCR) return the error as a plain text
+            # block rather than HTTP 401 — check for common auth patterns.
+            if is_error and not auth_required:
+                extracted = _extract_error_message(call_result)
+                if extracted and _is_auth_error_text(extracted):
+                    auth_required = True
+                    auth_message = auth_message or extracted
+
             if is_error and not auth_required:
                 return InvokeResult(
                     status="error",
@@ -843,11 +852,17 @@ class MCPTestClient:
 
             if auth_required:
                 # Either isError+connection_required, or structuredContent carries
-                # connection_required — treat as an auth-required response.
+                # connection_required, or text content describes an auth error.
+                # Treat as an auth-required response so the UI shows the token input.
                 return InvokeResult(
                     status="error",
                     error=auth_message or "Authentication required",
                     requires_auth=True,
+                    auth_reason=AUTH_REASON_UNAUTHORIZED,
+                    user_message=auth_message or "This tool requires credentials. "
+                                                "Provide your API key or bearer token to continue.",
+                    show_token_input=True,
+                    show_oauth_button=True,
                     duration_ms=duration,
                 )
 
@@ -915,3 +930,38 @@ def _extract_error_message(call_result: Any) -> str:
         if text:
             chunks.append(str(text))
     return " | ".join(chunks) if chunks else "Tool returned an error"
+
+
+# Auth-related keywords in error text that indicate a missing/invalid API key
+_AUTH_ERROR_KEYWORDS = frozenset((
+    "api key",
+    "api-key",
+    "apikey",
+    "auth",
+    "authorization",
+    "bearer",
+    "credential",
+    "invalid token",
+    "missing token",
+    "missing api",
+    "no api",
+    "unauthorized",
+    "invalid api",
+))
+
+
+def _is_auth_error_text(text: str) -> bool:
+    """Return True if `text` describes an auth/credentials problem.
+
+    Detects common patterns from MCP servers that return auth errors
+    as plain text responses rather than HTTP 401/403.
+    """
+    lowered = text.lower()
+    return (
+        any(kw in lowered for kw in _AUTH_ERROR_KEYWORDS)
+        # e.g. \"Add headers: {\\"Authorization\\": \\"Bearer ...\\"}\"
+        or ("add headers" in lowered and ("bearer" in lowered or "authorization" in lowered))
+        # e.g. \"Keys are free at https://...\"
+        or ("keys are free" in lowered or "get your api key" in lowered)
+        or ("sign up" in lowered and "api" in lowered)
+    )
