@@ -290,6 +290,27 @@ def test_local_stdio_package():
     assert result.detail[0].environment_variables[0]["name"] == "GMAIL_OAUTH_CLIENT_ID"
 
 
+def test_remote_package_preserves_required_custom_auth_header():
+    item = _item(
+        [{
+            "kind": "mcp_registry_packages",
+            "packages": [{
+                "registryType": "npm",
+                "identifier": "keyed-remote-server",
+                "transport": {
+                    "type": "streamable-http",
+                    "url": "https://example.com/mcp",
+                    "headers": [{"name": "x-api-key", "isRequired": True}],
+                },
+            }],
+        }]
+    )
+
+    result = classify_tool(item)
+    assert result.mode == "remote_via_package"
+    assert result.detail[0].auth_header == "x-api-key"
+
+
 def test_local_pypi_package_uses_uvx():
     item = _item(
         [

@@ -82,6 +82,10 @@ class ContainerSession:
     created_at: float
     expires_at: float
     status: str = "starting"  # "starting" | "ready" | "running" | "expired" | "stopped"
+    # The STDIO process is stateful. Keep the client that completed
+    # initialize/tools-list for the lifetime of this sandbox session so a
+    # later tools/call goes to that same running server.
+    mcp_client: Any | None = field(default=None, repr=False, compare=False)
 
     @property
     def is_expired(self) -> bool:
@@ -286,6 +290,13 @@ class ContainerManager:
                 return False
 
             session.status = "stopped"
+
+        if session.mcp_client is not None:
+            try:
+                await session.mcp_client.disconnect()
+            except Exception as exc:
+                logger.debug("Error closing MCP client for session %s: %s", session_id, exc)
+            session.mcp_client = None
 
         # Remove container in executor
         try:

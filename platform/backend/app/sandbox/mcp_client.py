@@ -743,12 +743,10 @@ class MCPTestClient:
             info = classify_connection_error(exc)
             # Auth errors (401/403) that come through the outer handler
             # (wrapped in ExceptionGroup) should still surface as auth_required.
-            auth_required = info.auth_reason in (
-                AUTH_REASON_UNAUTHORIZED,
-                AUTH_REASON_CONNECTION_ERROR,
-                AUTH_REASON_TIMEOUT,
-                AUTH_REASON_UNKNOWN,
-            )
+            # A failed network connection, timeout, or malformed endpoint is
+            # not evidence that a token will help. Only surface credentials
+            # for an actual auth classification.
+            auth_required = info.auth_reason == AUTH_REASON_UNAUTHORIZED
             return ConnectResult(
                 error=info.user_message,
                 transport=transport,

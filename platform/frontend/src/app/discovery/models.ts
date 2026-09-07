@@ -344,6 +344,8 @@ export interface LocalConnectResponse {
   error?: string;
   auth_reason?: AuthReason;
   user_message?: string;
+  required_env_vars?: string[];
+  show_token_input?: boolean;
   show_retry?: boolean;
 }
 
@@ -359,6 +361,9 @@ export interface LocalInvokeResponse {
   error?: string;
   duration_ms?: number;
   user_message?: string;
+  requires_auth?: boolean;
+  auth_reason?: AuthReason;
+  show_token_input?: boolean;
 }
 
 export interface LocalDisconnectRequest {

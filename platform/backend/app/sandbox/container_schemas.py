@@ -104,6 +104,14 @@ class LocalConnectResponse(BaseModel):
         default=None,
         description="Machine-readable error classification",
     )
+    required_env_vars: list[str] = Field(
+        default_factory=list,
+        description="Credential environment variable names inferred from server diagnostics",
+    )
+    show_token_input: bool = Field(
+        default=False,
+        description="Whether the UI should offer an additional credential input",
+    )
     user_message: str | None = Field(
         default=None,
         description="Human-readable error message safe for display",

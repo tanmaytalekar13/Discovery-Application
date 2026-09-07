@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import re
-import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -48,6 +47,7 @@ class LocalConnectResult:
     error: str | None = None
     auth_reason: str | None = None
     user_message: str | None = None
+    required_env_vars: list[str] = field(default_factory=list)
     server_info: dict[str, Any] | None = None
 
 
@@ -78,9 +78,8 @@ class LocalMCPClient:
         self._request_id: int = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
-        self._stderr_reader: threading.Thread | None = None
+        self._stderr_task: asyncio.Task | None = None
         self._stderr_lines: list[str] = []
-        self._stderr_lock = threading.Lock()
         self._buffer: str = ""  # For handling partial JSON responses
         self._startup_done: bool = False
 
@@ -129,18 +128,24 @@ class LocalMCPClient:
             self._reader_task = asyncio.create_task(self._read_stdout())
             self._start_stderr_reader()
 
-            # Give the process time to start and download packages
-            # npx needs time to download the package from npm
-            # Poll for up to INITIAL_STARTUP_TIMEOUT for the process to be ready
-            ready = await self._wait_for_process_ready(INITIAL_STARTUP_TIMEOUT)
-
-            if not ready:
+            # A compliant stdio server remains silent until the client sends
+            # `initialize`; waiting for stdout here delays every connection and
+            # makes a normal server look hung. Only give immediately-failing
+            # commands a brief chance to exit, then start the MCP handshake.
+            await asyncio.sleep(0.15)
+            if self._process.returncode is not None:
                 stderr_text = self._get_stderr_text()
-                user_msg = self._analyze_error(stderr_text, self._process.returncode)
+                user_msg, auth_reason, required_env_vars = self._analyze_error(
+                    stderr_text, self._process.returncode
+                )
                 return LocalConnectResult(
                     connected=False,
-                    error=f"Process exited with code {self._process.returncode}: {stderr_text}",
+                    # stderr can include provider-specific details; keep it in
+                    # server logs and return the safe diagnosis separately.
+                    error=f"MCP server exited with code {self._process.returncode}",
                     user_message=user_msg,
+                    auth_reason=auth_reason,
+                    required_env_vars=required_env_vars,
                 )
 
             # Send initialize request with full MCP 1.0 protocol
@@ -159,10 +164,15 @@ class LocalMCPClient:
                 )
             except asyncio.TimeoutError:
                 stderr_text = self._get_stderr_text()
+                user_msg, auth_reason, required_env_vars = self._analyze_error(
+                    stderr_text, self._process.returncode
+                )
                 return LocalConnectResult(
                     connected=False,
                     error="MCP server did not respond to initialize",
-                    user_message=self._analyze_error(stderr_text, self._process.returncode) or "The MCP server did not respond to the initialize request.",
+                    user_message=user_msg or "The MCP server did not respond to the initialize request.",
+                    auth_reason=auth_reason,
+                    required_env_vars=required_env_vars,
                 )
 
             if init_result.get("error"):
@@ -186,10 +196,15 @@ class LocalMCPClient:
                 )
             except asyncio.TimeoutError:
                 stderr_text = self._get_stderr_text()
+                user_msg, auth_reason, required_env_vars = self._analyze_error(
+                    stderr_text, self._process.returncode
+                )
                 return LocalConnectResult(
                     connected=False,
                     error="MCP server did not respond to tools/list",
-                    user_message=self._analyze_error(stderr_text, self._process.returncode) or "The MCP server did not list its tools.",
+                    user_message=user_msg or "The MCP server did not list its tools.",
+                    auth_reason=auth_reason,
+                    required_env_vars=required_env_vars,
                 )
 
             if tools_result.get("error"):
@@ -235,11 +250,16 @@ class LocalMCPClient:
             )
         except Exception as exc:
             logger.error("Failed to connect to local MCP server: %s", exc)
+            stderr_text = self._get_stderr_text()
+            returncode = self._process.returncode if self._process else None
+            user_msg, auth_reason, required_env_vars = self._analyze_error(stderr_text, returncode)
             await self._cleanup()
             return LocalConnectResult(
                 connected=False,
                 error=str(exc),
-                user_message=f"Failed to start MCP server: {exc}",
+                user_message=user_msg or f"Failed to start MCP server: {exc}",
+                auth_reason=auth_reason,
+                required_env_vars=required_env_vars,
             )
 
     def _build_docker_exec_command(
@@ -425,25 +445,25 @@ class LocalMCPClient:
             logger.error("Error reading stdout: %s", exc)
 
     def _start_stderr_reader(self) -> None:
-        """Start a background thread to read stderr for error messages."""
-        def _read_stderr():
-            if not self._process or not self._process.stderr:
-                return
-            try:
-                for line in self._process.stderr:
-                    with self._stderr_lock:
-                        self._stderr_lines.append(line.decode('utf-8', errors='replace'))
-                    logger.debug("MCP stderr: %s", line.decode('utf-8', errors='replace').strip())
-            except Exception as exc:
-                logger.debug("Stderr reader ended: %s", exc)
+        """Capture server stderr without blocking its stdout JSON-RPC stream."""
+        self._stderr_task = asyncio.create_task(self._read_stderr())
 
-        self._stderr_reader = threading.Thread(target=_read_stderr, daemon=True)
-        self._stderr_reader.start()
+    async def _read_stderr(self) -> None:
+        if not self._process or not self._process.stderr:
+            return
+        try:
+            while line := await self._process.stderr.readline():
+                text = line.decode("utf-8", errors="replace")
+                self._stderr_lines.append(text)
+                logger.debug("MCP stderr: %s", text.strip())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Stderr reader ended: %s", exc)
 
     def _get_stderr_text(self) -> str:
         """Get all captured stderr text."""
-        with self._stderr_lock:
-            return "".join(self._stderr_lines)
+        return "".join(self._stderr_lines)
 
     async def _wait_for_process_ready(self, timeout: float) -> bool:
         """Wait for the process to be ready for JSON-RPC communication.
@@ -466,9 +486,24 @@ class LocalMCPClient:
             return False
         return True
 
-    def _analyze_error(self, stderr: str, returncode: int | None) -> str | None:
+    def _analyze_error(
+        self, stderr: str, returncode: int | None
+    ) -> tuple[str | None, str | None, list[str]]:
         """Analyze stderr text to generate a user-friendly error message."""
         stderr_lower = stderr.lower()
+        required_env_vars = self._extract_required_env_vars(stderr)
+
+        # Packages frequently validate their API key on startup and exit 1.
+        # Treat those as an actionable credentials request, not a generic crash.
+        auth_markers = ("api key", "apikey", "api-key", "access token", "bearer token",
+                        "authentication", "authorization", "credential", "unauthorized")
+        if any(marker in stderr_lower for marker in auth_markers) or required_env_vars:
+            names = ", ".join(required_env_vars) if required_env_vars else "the required credential"
+            return (
+                f"This MCP server needs credentials ({names}). Add them and try again.",
+                "unauthorized",
+                required_env_vars,
+            )
 
         # Process exited
         if returncode is not None:
@@ -481,22 +516,35 @@ class LocalMCPClient:
                             # Clean up the error line
                             error_msg = line.strip()
                             if len(error_msg) > 10:
-                                return f"MCP server error: {error_msg[:200]}"
-                    return f"MCP server exited with error code {returncode}."
+                                return f"MCP server error: {error_msg[:300]}", None, []
+                    return f"The MCP server exited with code {returncode}. Check the package configuration and try again.", None, []
 
             if returncode == 0 and stderr:
                 # Process exited cleanly but with output - might have config issues
                 if "missing" in stderr_lower or "required" in stderr_lower or "not found" in stderr_lower:
-                    return "The MCP server requires configuration or missing credentials."
-                return None  # Clean exit
+                    return "The MCP server requires configuration or missing credentials.", None, required_env_vars
+                return None, None, []  # Clean exit
 
         # Process still running but no output - might need more time
         if not stderr and self._startup_done:
-            return "The MCP server started but did not respond."
+            return "The MCP server started but did not respond.", None, []
 
-        return None
+        return None, None, []
+
+    @staticmethod
+    def _extract_required_env_vars(stderr: str) -> list[str]:
+        """Extract likely environment variable names from safe server diagnostics."""
+        candidates = re.findall(r"\b[A-Z][A-Z0-9_]*(?:API|TOKEN|KEY|SECRET|AUTH)[A-Z0-9_]*\b", stderr)
+        return list(dict.fromkeys(candidates))[:5]
 
     async def _cleanup(self) -> None:
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except asyncio.CancelledError:
+                pass
+            self._stderr_task = None
         """Clean up process and task resources."""
         if self._reader_task:
             self._reader_task.cancel()

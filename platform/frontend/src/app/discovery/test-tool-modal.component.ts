@@ -58,7 +58,7 @@ type ModalState =
             <span class="protocol-chip">MCP</span>
             <h2 class="modal-title">{{ result.item.name }}</h2>
           </div>
-          <button class="close-btn" (click)="close.emit()" aria-label="Close">
+          <button class="close-btn" (click)="closeModal()" aria-label="Close">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
               <line x1="18" y1="6" x2="6" y2="18"></line>
               <line x1="6" y1="6" x2="18" y2="18"></line>
@@ -438,7 +438,7 @@ type ModalState =
 
               <div class="result-actions">
                 <button class="btn btn--secondary" (click)="backToTools()">Try Another Tool</button>
-                <button class="btn btn--ghost" (click)="close.emit()">Close</button>
+                <button class="btn btn--ghost" (click)="closeModal()">Close</button>
               </div>
             </div>
           }
@@ -630,6 +630,11 @@ type ModalState =
                 <p class="error-panel-message">{{ localConnectError() }}</p>
               </div>
               <div class="error-panel-actions">
+                @if (localAuthRequired()) {
+                  <button class="btn btn--primary" (click)="addLocalCredentialFields()">
+                    Add credentials
+                  </button>
+                }
                 <button class="btn btn--primary" (click)="retryLocalConnect()">Try Again</button>
                 <button class="btn btn--secondary" (click)="cancelLocalTest()">Cancel</button>
               </div>
@@ -1234,6 +1239,8 @@ export class TestToolModalComponent implements OnInit {
   localEnvValues: Record<string, string> = {};
   localConnecting = signal(false);
   localConnectError = signal<string>('');
+  localAuthRequired = signal(false);
+  localRequiredEnvVars = signal<string[]>([]);
 
   // ---------------------------------------------------------------------------
   // Form fields (derived from selected tool's inputSchema)
@@ -1459,7 +1466,7 @@ export class TestToolModalComponent implements OnInit {
     this.invokeResult.set(null);
     this.invokeError.set('');
     this.pendingInvokeForRetry = null;
-    this.state.set('tools-ready');
+    this.state.set(this.localSessionId() ? 'local-connected' : 'tools-ready');
   }
 
   private buildFormFields(tool: ToolInfo): void {
@@ -1542,7 +1549,10 @@ export class TestToolModalComponent implements OnInit {
     }
 
     const itemId = this.result.item.item_id;
-    const isLocalSession = this.state() === 'local-connected';
+    // Selecting a local tool changes the modal state to `tool-form`, so the
+    // presence of the sandbox session (not the current view) determines the
+    // endpoint to use.
+    const isLocalSession = !!this.localSessionId();
 
     // Use local invoke endpoint if we're in a local session
     if (isLocalSession) {
@@ -1578,6 +1588,9 @@ export class TestToolModalComponent implements OnInit {
       error: res.error,
       duration_ms: res.duration_ms,
       user_message: res.user_message,
+      requires_auth: res.requires_auth,
+      auth_reason: res.auth_reason,
+      show_token_input: res.show_token_input,
     };
     this.invokeResult.set(normalized);
     this.state.set('result');
@@ -1633,6 +1646,8 @@ export class TestToolModalComponent implements OnInit {
     this.state.set('local-prepare');
     this.localConnecting.set(false);
     this.localConnectError.set('');
+    this.localAuthRequired.set(false);
+    this.localRequiredEnvVars.set([]);
 
     this.service.prepareLocalTest(itemId).subscribe({
       next: (res) => {
@@ -1657,6 +1672,8 @@ export class TestToolModalComponent implements OnInit {
     this.localPrepare.set(null);
     this.localEnvValues = {};
     this.localConnectError.set('');
+    this.localAuthRequired.set(false);
+    this.localRequiredEnvVars.set([]);
     this.state.set('local-stdio');
   }
 
@@ -1693,6 +1710,8 @@ export class TestToolModalComponent implements OnInit {
     }
 
     // Connection failed
+    this.localAuthRequired.set(res.auth_reason === 'unauthorized' || !!res.show_token_input);
+    this.localRequiredEnvVars.set(res.required_env_vars ?? []);
     this.state.set('local-error');
     this.localConnectError.set(
       res.user_message ?? res.error ?? 'Failed to connect to local MCP server.'
@@ -1706,6 +1725,36 @@ export class TestToolModalComponent implements OnInit {
     // Reset env values to what they were
     this.localConnectError.set('');
     this.submitLocalCredentials();
+  }
+
+  /** Return to the credential form and add names inferred from server stderr. */
+  addLocalCredentialFields(): void {
+    const prepare = this.localPrepare();
+    if (!prepare) {
+      this.startLocalTest();
+      return;
+    }
+
+    const existing = new Set(prepare.environment_variables.map((field) => field.name));
+    const inferred = this.localRequiredEnvVars().filter((name) => !existing.has(name));
+    // A server may only say "API key required" without naming its variable.
+    // Still provide a conventional field that the user can amend if needed.
+    const names = inferred.length ? inferred : ['API_KEY'];
+    this.localPrepare.set({
+      ...prepare,
+      environment_variables: [
+        ...prepare.environment_variables,
+        ...names.map((name) => ({
+          name,
+          description: 'Credential required by the MCP server.',
+          is_secret: true,
+          is_required: true,
+        })),
+      ],
+    });
+    for (const name of names) this.localEnvValues[name] ??= '';
+    this.localConnectError.set('');
+    this.state.set('local-prepare');
   }
 
   /**
@@ -1735,6 +1784,17 @@ export class TestToolModalComponent implements OnInit {
         this.close.emit();
       },
     });
+  }
+
+  /** Close without leaving a live sandbox container behind. */
+  closeModal(): void {
+    if (this.localSessionId()) {
+      this.disconnectLocal();
+    } else if (this.sessionId()) {
+      this.disconnect();
+    } else {
+      this.close.emit();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1777,7 +1837,7 @@ export class TestToolModalComponent implements OnInit {
 
   onBackdropClick(event: MouseEvent): void {
     if ((event.target as HTMLElement).classList.contains('modal-backdrop')) {
-      this.close.emit();
+      this.closeModal();
     }
   }
 }

@@ -578,10 +578,13 @@ async def connect_local(
                 error=connect_result.error,
                 auth_reason=connect_result.auth_reason,
                 user_message=connect_result.user_message,
+                required_env_vars=connect_result.required_env_vars,
+                show_token_input=connect_result.auth_reason == "unauthorized",
             )
 
         # Update session status
         session.status = "running"
+        session.mcp_client = mcp_client
 
         return LocalConnectResponse(
             connected=True,
@@ -642,15 +645,15 @@ async def invoke_local(
             detail="Session does not belong to this item.",
         )
 
-    # Get tool config for this session
-    config = LocalToolConfig(
-        registry_type=session.registry_type,
-        identifier=session.identifier,
-    )
-
-    # Connect to the MCP server
-    command = config.build_command()
-    mcp_client = LocalMCPClient()
+    mcp_client = session.mcp_client
+    if mcp_client is None:
+        # This should only occur for sessions created before the server was
+        # initialized, or after an unexpected worker restart.
+        return LocalInvokeResponse(
+            status="error",
+            error="Sandbox MCP connection is no longer available",
+            user_message="The sandbox server was restarted or disconnected. Please connect again.",
+        )
 
     try:
         result = await mcp_client.invoke(
@@ -673,8 +676,6 @@ async def invoke_local(
             error=str(exc),
             user_message=f"Tool invocation failed: {exc}",
         )
-    finally:
-        await mcp_client.disconnect()
 
 
 # ---------------------------------------------------------------------------

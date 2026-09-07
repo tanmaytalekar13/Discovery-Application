@@ -109,6 +109,19 @@ def _build_remote_candidates(
     return candidates
 
 
+def _required_auth_header(entry: dict[str, Any]) -> str | None:
+    """Return the required custom auth header declared by a registry entry."""
+    headers = entry.get("headers") or []
+    if not isinstance(headers, list):
+        return None
+    for header in headers:
+        if isinstance(header, dict) and header.get("isRequired") is True:
+            name = header.get("name")
+            if isinstance(name, str) and name:
+                return name
+    return None
+
+
 def _summarize_package(pkg: dict[str, Any]) -> LocalPackageHint:
     """Pull only the fields the 'Run Locally' UI needs."""
     transport = pkg.get("transport") or {}
@@ -237,9 +250,14 @@ def classify_tool(item: Any) -> ClassificationResult:
                 and transport_url
                 and not _is_local_host(transport_url)
             ):
-                remote_package_candidates.append(
-                    RemoteCandidate(type=transport_type, url=transport_url)
-                )
+                # Package-based remote entries can declare headers either on
+                # the package or its transport. Preserve this so a supplied
+                # API key is sent using e.g. x-api-key instead of always as a
+                # Bearer token.
+                auth_header = _required_auth_header(pkg) or _required_auth_header(transport)
+                remote_package_candidates.append(RemoteCandidate(
+                    type=transport_type, url=transport_url, auth_header=auth_header
+                ))
             else:
                 # stdio, or http/sse pointing at localhost -> local
                 local_packages.append(_summarize_package(pkg))
