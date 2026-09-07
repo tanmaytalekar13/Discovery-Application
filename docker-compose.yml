@@ -63,6 +63,8 @@ services:
       # source code. DB (ArcadeDB) only stores a pointer (relative path)
       # into this volume.
       - agentic_discovery_platform_source_cache:/data/discovery_cache
+      # Docker socket for spawning sandbox containers (local MCP tool testing)
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8000:8000"
     depends_on:

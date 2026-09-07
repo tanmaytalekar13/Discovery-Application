@@ -31,8 +31,20 @@ from app.api.schemas import (
 )
 from app.db.repositories import ItemRepository
 from app.sandbox.classifier import classify_tool
+from app.sandbox.container_manager import get_container_manager, LocalToolConfig
+from app.sandbox.container_schemas import (
+    EnvironmentVariableSchema,
+    LocalConnectRequest,
+    LocalConnectResponse,
+    LocalDisconnectRequest,
+    LocalDisconnectResponse,
+    LocalInvokeRequest,
+    LocalInvokeResponse,
+    LocalPrepareResponse,
+)
+from app.sandbox.local_mcp_client import LocalMCPClient
 from app.sandbox.mcp_client import MCPTestClient
-from app.sandbox.schemas import RemoteCandidate
+from app.sandbox.schemas import LocalPackageHint, RemoteCandidate
 from app.sandbox.session import get_session_store, SessionStore
 
 router = APIRouter(prefix="/api/items", tags=["tool-test"])
@@ -411,3 +423,306 @@ async def submit_manual_token(
         "session_id": session.session_id,
         "message": "Token stored. You can now call /test/connect with this session_id.",
     }
+
+
+# ---------------------------------------------------------------------------
+# Local STDIO MCP Tool Testing Endpoints
+# ---------------------------------------------------------------------------
+
+async def _require_local_testable(
+    item_id: UUID,
+    repository: ItemRepository,
+) -> LocalPackageHint:
+    """Classify an item and return the local package hint.
+
+    Raises HTTPException(400) if the item is not a local STDIO tool.
+    """
+    item = await _require_item(item_id, repository)
+    classification = classify_tool(item)
+
+    if classification.mode != "local_stdio":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                classification.reason
+                or "This tool cannot be tested as a local STDIO server."
+            ),
+        )
+
+    if not classification.detail or not isinstance(classification.detail[0], LocalPackageHint):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Local STDIO item has no package hint",
+        )
+
+    return classification.detail[0]
+
+
+# ---------------------------------------------------------------------------
+# POST /items/{item_id}/test/local/prepare
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{item_id}/test/local/prepare",
+    response_model=LocalPrepareResponse,
+    summary="Prepare local tool test - get environment variable schema",
+)
+async def prepare_local_test(
+    item_id: UUID,
+    repository: ItemRepository = Depends(get_item_repository),
+):
+    """Return the environment variable schema for a local MCP tool.
+
+    This endpoint is called before the user fills in credentials.
+    It returns:
+    - registry_type: "npm" or "pip"
+    - identifier: the package name
+    - install_command: suggested command to install/run
+    - environment_variables: schema for required/optional env vars
+
+    The frontend uses this to render the credential form.
+    """
+    hint = await _require_local_testable(item_id, repository)
+
+    # Build install command
+    if hint.registry_type == "npm":
+        install_command = f"npx -y {hint.identifier}"
+    else:
+        install_command = f"pip install {hint.identifier}"
+        if hint.runtime_hint and "uvx" in hint.runtime_hint.lower():
+            install_command = f"uvx {hint.identifier}"
+
+    # Convert environment variables to schema format
+    env_vars = [
+        EnvironmentVariableSchema(
+            name=var["name"],
+            description=var.get("description"),
+            is_secret=var.get("is_secret", False),
+            is_required=var.get("is_required", True),
+        )
+        for var in hint.environment_variables
+    ]
+
+    return LocalPrepareResponse(
+        item_id=item_id,
+        registry_type=hint.registry_type,
+        identifier=hint.identifier,
+        install_command=install_command,
+        environment_variables=env_vars,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /items/{item_id}/test/local/connect
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{item_id}/test/local/connect",
+    response_model=LocalConnectResponse,
+    summary="Connect to a local STDIO MCP server",
+)
+async def connect_local(
+    item_id: UUID,
+    body: LocalConnectRequest,
+    repository: ItemRepository = Depends(get_item_repository),
+):
+    """Create a container, install the package, and connect to the MCP server.
+
+    This endpoint:
+    1. Creates an ephemeral Docker container
+    2. Installs the npm/pip package inside it
+    3. Spawns the MCP server as a STDIO process
+    4. Runs initialize + tools/list
+
+    Returns the session_id for subsequent invoke/disconnect calls,
+    plus the list of available tools.
+    """
+    hint = await _require_local_testable(item_id, repository)
+
+    # Build tool config
+    config = LocalToolConfig(
+        registry_type=hint.registry_type,
+        identifier=hint.identifier,
+        runtime_hint=hint.runtime_hint,
+        runtime_arguments=hint.runtime_arguments,
+    )
+
+    container_manager = get_container_manager()
+
+    try:
+        # Create container
+        session = await container_manager.create_container(
+            item_id=item_id,
+            config=config,
+            env_vars=body.env_vars,
+            allowed_domains=hint.allowed_domains,
+        )
+
+        # Connect to MCP server inside container
+        command = config.build_command()
+        mcp_client = LocalMCPClient()
+
+        # Run connect (this runs the command inside the Docker container)
+        connect_result = await mcp_client.connect(
+            command=command,
+            env_vars=body.env_vars,
+            timeout=60.0,
+            container_id=session.container_id,
+        )
+
+        if not connect_result.connected:
+            # Clean up container on failure
+            await container_manager.destroy_container(session.session_id)
+            return LocalConnectResponse(
+                connected=False,
+                error=connect_result.error,
+                auth_reason=connect_result.auth_reason,
+                user_message=connect_result.user_message,
+            )
+
+        # Update session status
+        session.status = "running"
+
+        return LocalConnectResponse(
+            connected=True,
+            session_id=session.session_id,
+            tools=[tool.to_dict() for tool in connect_result.tools],
+        )
+
+    except ValueError as exc:
+        # Session limit exceeded
+        return LocalConnectResponse(
+            connected=False,
+            error=str(exc),
+            user_message=str(exc),
+            show_retry=False,
+        )
+    except Exception as exc:
+        return LocalConnectResponse(
+            connected=False,
+            error=str(exc),
+            user_message=f"Failed to start local MCP server: {exc}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /items/{item_id}/test/local/invoke
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{item_id}/test/local/invoke",
+    response_model=LocalInvokeResponse,
+    summary="Invoke a tool on a local STDIO MCP server",
+)
+async def invoke_local(
+    item_id: UUID,
+    body: LocalInvokeRequest,
+    repository: ItemRepository = Depends(get_item_repository),
+):
+    """Invoke a tool on an existing local MCP session.
+
+    The session_id must be from a previous /test/local/connect call.
+    This endpoint calls the MCP server's tools/call method.
+    """
+    # Validate item exists
+    await _require_item(item_id, repository)
+
+    container_manager = get_container_manager()
+    session = container_manager.get_session(body.session_id)
+
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found or expired. Please connect again.",
+        )
+
+    if str(session.item_id) != str(item_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session does not belong to this item.",
+        )
+
+    # Get tool config for this session
+    config = LocalToolConfig(
+        registry_type=session.registry_type,
+        identifier=session.identifier,
+    )
+
+    # Connect to the MCP server
+    command = config.build_command()
+    mcp_client = LocalMCPClient()
+
+    try:
+        result = await mcp_client.invoke(
+            tool_name=body.tool_name,
+            arguments=body.arguments,
+            timeout=30.0,
+        )
+
+        return LocalInvokeResponse(
+            status=result.status,
+            result=result.result,
+            error=result.error,
+            duration_ms=result.duration_ms,
+            user_message=result.user_message,
+        )
+
+    except Exception as exc:
+        return LocalInvokeResponse(
+            status="error",
+            error=str(exc),
+            user_message=f"Tool invocation failed: {exc}",
+        )
+    finally:
+        await mcp_client.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# POST /items/{item_id}/test/local/disconnect
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{item_id}/test/local/disconnect",
+    response_model=LocalDisconnectResponse,
+    summary="Disconnect and destroy a local STDIO MCP session",
+)
+async def disconnect_local(
+    item_id: UUID,
+    body: LocalDisconnectRequest,
+    repository: ItemRepository = Depends(get_item_repository),
+):
+    """Destroy the container and clean up the session.
+
+    This endpoint:
+    1. Stops and removes the Docker container
+    2. Cleans up any temporary files
+    3. Invalidates the session_id
+
+    The user must connect again if they want to test more tools.
+    """
+    # Validate item exists
+    await _require_item(item_id, repository)
+
+    container_manager = get_container_manager()
+    session = container_manager.get_session(body.session_id)
+
+    if session is None:
+        # Already disconnected or expired - that's fine
+        return LocalDisconnectResponse(
+            status="ok",
+            message="Session already cleaned up.",
+        )
+
+    if str(session.item_id) != str(item_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session does not belong to this item.",
+        )
+
+    # Destroy the container
+    await container_manager.destroy_container(body.session_id)
+
+    return LocalDisconnectResponse(
+        status="ok",
+        message="Session disconnected and container destroyed.",
+    )

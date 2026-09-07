@@ -16,6 +16,13 @@ import {
   ToolInvokeResponse,
   OAuthStartResponse,
   OAuthCallbackResponse,
+  LocalPrepareResponse,
+  LocalConnectRequest,
+  LocalConnectResponse,
+  LocalInvokeRequest,
+  LocalInvokeResponse,
+  LocalDisconnectRequest,
+  LocalDisconnectResponse,
 } from './models';
 
 export type DiscoveryResult = SearchResponse | DiscoveryError;
@@ -194,6 +201,63 @@ export class DiscoveryService {
       `${this.apiBase}/items/${itemId}/test/manual-token`,
       null,
       { params },
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Local STDIO MCP Tool Testing (Phase 15 - Backend Sandbox)
+  // -------------------------------------------------------------------------
+
+  /**
+   * POST /api/items/{item_id}/test/local/prepare
+   * Get environment variable schema for a local MCP tool.
+   */
+  prepareLocalTest(itemId: string): Observable<LocalPrepareResponse> {
+    return this.http.post<LocalPrepareResponse>(
+      `${this.apiBase}/items/${itemId}/test/local/prepare`,
+      null,
+    );
+  }
+
+  /**
+   * POST /api/items/{item_id}/test/local/connect
+   * Create container, install package, and connect to local MCP server.
+   */
+  connectLocal(
+    itemId: string,
+    body: LocalConnectRequest,
+  ): Observable<LocalConnectResponse> {
+    return this.http.post<LocalConnectResponse>(
+      `${this.apiBase}/items/${itemId}/test/local/connect`,
+      body,
+    );
+  }
+
+  /**
+   * POST /api/items/{item_id}/test/local/invoke
+   * Invoke a tool on an existing local MCP session.
+   */
+  invokeLocal(
+    itemId: string,
+    body: LocalInvokeRequest,
+  ): Observable<LocalInvokeResponse> {
+    return this.http.post<LocalInvokeResponse>(
+      `${this.apiBase}/items/${itemId}/test/local/invoke`,
+      body,
+    );
+  }
+
+  /**
+   * POST /api/items/{item_id}/test/local/disconnect
+   * Destroy container and clean up the session.
+   */
+  disconnectLocal(
+    itemId: string,
+    body: LocalDisconnectRequest,
+  ): Observable<LocalDisconnectResponse> {
+    return this.http.post<LocalDisconnectResponse>(
+      `${this.apiBase}/items/${itemId}/test/local/disconnect`,
+      body,
     );
   }
 

@@ -33,6 +33,8 @@ class LocalPackageHint(BaseModel):
     runtime_hint: str | None = Field(default=None, alias="runtimeHint")
     transport_type: str | None = Field(default=None, alias="transportType")
     install_command: str | None = Field(default=None, alias="installCommand")
+    runtime_arguments: list[str] = Field(default_factory=list, alias="runtimeArguments")
+    allowed_domains: list[str] = Field(default_factory=list, alias="allowedDomains")
 
     environment_variables: list[dict[str, Any]] = Field(
         default_factory=list, alias="environmentVariables"

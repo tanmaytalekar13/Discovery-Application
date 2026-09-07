@@ -19,21 +19,30 @@ import {
   ToolInfo,
   ToolInvokeResponse,
   AuthReason,
+  LocalPrepareResponse,
+  LocalConnectResponse,
+  LocalInvokeResponse,
+  LocalDisconnectResponse,
+  EnvironmentVariableSchema,
 } from './models';
 
 // ---------------------------------------------------------------------------
 // Modal states
 // ---------------------------------------------------------------------------
 type ModalState =
-  | 'idle'          // Initial loading
-  | 'connecting'    // POST /connect in-flight
-  | 'auth-required' // 401/403 received — offer OAuth or manual token
-  | 'tools-ready'   // Connected, showing tool list
-  | 'tool-form'    // Tool selected — show dynamic input form
-  | 'invoking'     // POST /invoke in-flight
-  | 'result'       // Invoke result shown
-  | 'error'        // Connection error
-  | 'local-stdio'; // local_stdio mode — show install instructions
+  | 'idle'              // Initial loading
+  | 'connecting'        // POST /connect in-flight
+  | 'auth-required'     // 401/403 received — offer OAuth or manual token
+  | 'tools-ready'       // Connected, showing tool list
+  | 'tool-form'         // Tool selected — show dynamic input form
+  | 'invoking'          // POST /invoke in-flight
+  | 'result'            // Invoke result shown
+  | 'error'             // Connection error
+  | 'local-stdio'       // local_stdio mode — show install instructions
+  | 'local-prepare'     // Showing env var form for local tool
+  | 'local-installing'  // Installing package / connecting to local MCP
+  | 'local-connected'   // Connected to local MCP, showing tool list
+  | 'local-error';      // Local connection error
 
 @Component({
   selector: 'app-test-tool-modal',
@@ -445,8 +454,8 @@ type ModalState =
               </div>
               <p class="stdio-title">Run this tool locally</p>
               <p class="stdio-desc">
-                This is a local <code>stdio</code> tool. Live testing requires
-                running the MCP server on your machine.
+                This is a local <code>stdio</code> tool. Live testing runs
+                the package in a sandboxed container on the server.
               </p>
 
               @if (localHint()?.installCommand) {
@@ -475,25 +484,183 @@ type ModalState =
                 </div>
               }
 
-              <p class="stdio-note">
-                Sandbox execution for local tools is planned for a future update.
-              </p>
+              <button class="btn btn--primary" (click)="startLocalTest()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                </svg>
+                Run in Sandbox
+              </button>
+            </div>
+          }
+
+          <!-- local-prepare: env var form -->
+          @if (state() === 'local-prepare') {
+            <div class="env-form-panel">
+              <div class="env-form-header">
+                <div class="env-form-icon">
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                  </svg>
+                </div>
+                <div>
+                  <p class="env-form-title">Configure Credentials</p>
+                  <p class="env-form-subtitle">
+                    @if (localPrepare()?.registry_type === 'npm') {
+                      npm package — credentials stay in the sandbox
+                    } @else {
+                      pip package — credentials stay in the sandbox
+                    }
+                  </p>
+                </div>
+              </div>
+
+              @if (localPrepare()?.install_command) {
+                <div class="install-block">
+                  <p class="install-label">Install command:</p>
+                  <pre class="install-cmd">{{ localPrepare()?.install_command }}</pre>
+                </div>
+              }
+
+              @if (localPrepare()?.environment_variables?.length) {
+                <form class="dynamic-form" (ngSubmit)="submitLocalCredentials()">
+                  @for (field of localPrepare()?.environment_variables; track field.name) {
+                    <div class="form-field">
+                      <label class="form-label" [for]="'local-env-' + field.name">
+                        {{ field.name }}
+                        @if (field.is_secret) {
+                          <span class="env-secret-chip">secret</span>
+                        }
+                        @if (!field.is_required) {
+                          <span class="form-label-optional">(optional)</span>
+                        }
+                      </label>
+                      @if (field.description) {
+                        <p class="form-hint">{{ field.description }}</p>
+                      }
+                      <input
+                        [id]="'local-env-' + field.name"
+                        class="form-input"
+                        [type]="field.is_secret ? 'password' : 'text'"
+                        [(ngModel)]="localEnvValues[field.name]"
+                        [name]="'local-env-' + field.name"
+                        [placeholder]="field.name"
+                      />
+                    </div>
+                  }
+
+                  @if (localConnectError()) {
+                    <p class="form-error">{{ localConnectError() }}</p>
+                  }
+
+                  <div class="form-actions">
+                    <button type="submit" class="btn btn--primary" [disabled]="localConnecting()">
+                      @if (localConnecting()) {
+                        <span class="btn-spinner"></span> Connecting…
+                      } @else {
+                        Install &amp; Connect
+                      }
+                    </button>
+                    <button type="button" class="btn btn--ghost" (click)="cancelLocalTest()">Cancel</button>
+                  </div>
+                </form>
+              } @else {
+                <div class="form-actions">
+                  <button class="btn btn--primary" (click)="submitLocalCredentials()">
+                    Install &amp; Connect
+                  </button>
+                  <button class="btn btn--ghost" (click)="cancelLocalTest()">Cancel</button>
+                </div>
+              }
+            </div>
+          }
+
+          <!-- local-installing: loading state -->
+          @if (state() === 'local-installing') {
+            <div class="state-container">
+              <span class="spinner"></span>
+              <p>Installing package and starting server…</p>
+              <p class="install-note">This may take 30-45 seconds</p>
+            </div>
+          }
+
+          <!-- local-connected: tools list (same as tools-ready but different source) -->
+          @if (state() === 'local-connected') {
+            <div class="tools-panel">
+              <div class="sandbox-badge">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                </svg>
+                <span>Sandbox session</span>
+              </div>
+              <p class="tools-count">{{ tools().length }} tool{{ tools().length !== 1 ? 's' : '' }} available</p>
+              <div class="tools-list">
+                @for (tool of tools(); track tool.name) {
+                  <button class="tool-card" (click)="selectTool(tool)">
+                    <div class="tool-card-header">
+                      <span class="tool-name">{{ tool.name }}</span>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="9 18 15 12 9 6"></polyline>
+                      </svg>
+                    </div>
+                    @if (tool.description) {
+                      <p class="tool-desc">{{ tool.description }}</p>
+                    }
+                  </button>
+                }
+              </div>
+            </div>
+          }
+
+          <!-- local-error: error state -->
+          @if (state() === 'local-error') {
+            <div class="error-panel">
+              <div class="error-panel-icon error-panel-icon--connection_error">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <line x1="1" y1="1" x2="23" y2="23"></line>
+                  <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"></path>
+                  <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"></path>
+                  <path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path>
+                  <line x1="12" y1="20" x2="12.01" y2="20"></line>
+                </svg>
+              </div>
+              <div class="error-panel-content">
+                <p class="error-panel-title">Connection failed</p>
+                <p class="error-panel-message">{{ localConnectError() }}</p>
+              </div>
+              <div class="error-panel-actions">
+                <button class="btn btn--primary" (click)="retryLocalConnect()">Try Again</button>
+                <button class="btn btn--secondary" (click)="cancelLocalTest()">Cancel</button>
+              </div>
             </div>
           }
 
         </div>
 
         <!-- Footer: disconnect when session is active -->
-        @if (sessionId() && state() !== 'idle' && state() !== 'connecting') {
+        @if ((sessionId() || localSessionId()) && state() !== 'idle' && state() !== 'connecting' && state() !== 'local-prepare' && state() !== 'local-installing') {
           <footer class="modal-footer">
             <span class="session-info">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="10"></circle>
-                <polyline points="12 6 12 12 16 14"></polyline>
-              </svg>
-              Test session active
+              @if (localSessionId()) {
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                </svg>
+                Sandbox session active
+              } @else {
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <polyline points="12 6 12 12 16 14"></polyline>
+                </svg>
+                Test session active
+              }
             </span>
-            <button class="disconnect-btn" (click)="disconnect()">Disconnect</button>
+            @if (localSessionId()) {
+              <button class="disconnect-btn" (click)="disconnectLocal()">Disconnect</button>
+            } @else {
+              <button class="disconnect-btn" (click)="disconnect()">Disconnect</button>
+            }
           </footer>
         }
       </div>
@@ -963,6 +1130,40 @@ type ModalState =
       }
       .env-desc { font-size: 0.8125rem; }
       .stdio-note { font-size: 0.8125rem; opacity: 0.7; margin: 0; font-style: italic; }
+      /* Sandbox badge */
+      .sandbox-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.375rem;
+        padding: 0.25rem 0.625rem;
+        background: #fffbeb;
+        border: 1px solid #fde68a;
+        border-radius: 999px;
+        font: 600 0.6875rem/1.2 var(--font-mono);
+        color: #92400e;
+      }
+      @media (prefers-color-scheme: dark) {
+        .sandbox-badge {
+          background: #292524;
+          border-color: #44403c;
+          color: #fde68a;
+        }
+      }
+      /* Env form panel */
+      .env-form-panel { display: flex; flex-direction: column; gap: 1rem; }
+      .env-form-header {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.75rem;
+        padding: 0.75rem;
+        background: var(--color-ground);
+        border-radius: 8px;
+        border: 1px solid var(--color-border);
+      }
+      .env-form-icon { color: var(--color-accent); flex-shrink: 0; margin-top: 0.125rem; }
+      .env-form-title { font: 700 0.9375rem/1.2 var(--font-serif); color: var(--color-text); margin: 0; }
+      .env-form-subtitle { font-size: 0.8125rem; color: var(--color-text-muted); margin: 0.25rem 0 0; }
+      .install-note { font-size: 0.8125rem; opacity: 0.7; margin: 0; }
       /* Footer */
       .modal-footer {
         display: flex;
@@ -1024,6 +1225,15 @@ export class TestToolModalComponent implements OnInit {
   // When auth fails mid-invoke and user submits a token, we retry the invoke
   // automatically after re-connect. Stores (tool, args) for the pending retry.
   private pendingInvokeForRetry: { tool: ToolInfo; args: Record<string, unknown> } | null = null;
+
+  // ---------------------------------------------------------------------------
+  // Local STDIO testing state
+  // ---------------------------------------------------------------------------
+  localSessionId = signal<string | null>(null);
+  localPrepare = signal<LocalPrepareResponse | null>(null);
+  localEnvValues: Record<string, string> = {};
+  localConnecting = signal(false);
+  localConnectError = signal<string>('');
 
   // ---------------------------------------------------------------------------
   // Form fields (derived from selected tool's inputSchema)
@@ -1332,30 +1542,59 @@ export class TestToolModalComponent implements OnInit {
     }
 
     const itemId = this.result.item.item_id;
+    const isLocalSession = this.state() === 'local-connected';
+
+    // Use local invoke endpoint if we're in a local session
+    if (isLocalSession) {
+      const sessionId = this.localSessionId();
+      this.service.invokeLocal(itemId, {
+        session_id: sessionId ?? '',
+        tool_name: tool.name,
+        arguments: args,
+      }).subscribe({
+        next: (res) => this.handleInvokeResponse(res),
+        error: (err) => this.handleInvokeError(err),
+      });
+      return;
+    }
+
+    // Use remote invoke endpoint
     this.service.testInvoke(
       itemId,
       { tool_name: tool.name, arguments: args },
       this.sessionId() ?? undefined,
     ).subscribe({
-      next: (res) => {
-        this.invoking.set(false);
-        this.invokeResult.set(res);
-        this.state.set('result');
-      },
-      error: (err) => {
-        this.invoking.set(false);
-        if (this.isAuthError(err)) {
-          this.invokeResult.set({
-            status: 'error',
-            error: this.extractErrorMessage(err),
-            requires_auth: true,
-          });
-          this.state.set('result');
-        } else {
-          this.invokeError.set(this.extractErrorMessage(err) || 'Invocation failed.');
-        }
-      },
+      next: (res) => this.handleInvokeResponse(res as unknown as ToolInvokeResponse),
+      error: (err) => this.handleInvokeError(err),
     });
+  }
+
+  private handleInvokeResponse(res: ToolInvokeResponse | LocalInvokeResponse): void {
+    this.invoking.set(false);
+    // Normalize response to ToolInvokeResponse format
+    const normalized: ToolInvokeResponse = {
+      status: res.status,
+      result: res.result,
+      error: res.error,
+      duration_ms: res.duration_ms,
+      user_message: res.user_message,
+    };
+    this.invokeResult.set(normalized);
+    this.state.set('result');
+  }
+
+  private handleInvokeError(err: unknown): void {
+    this.invoking.set(false);
+    if (this.isAuthError(err)) {
+      this.invokeResult.set({
+        status: 'error',
+        error: this.extractErrorMessage(err),
+        requires_auth: true,
+      });
+      this.state.set('result');
+    } else {
+      this.invokeError.set(this.extractErrorMessage(err) || 'Invocation failed.');
+    }
   }
 
   goToAuth(): void {
@@ -1377,6 +1616,122 @@ export class TestToolModalComponent implements OnInit {
       error: () => {
         // Even on error, close the modal
         this.sessionId.set(null);
+        this.close.emit();
+      },
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Local STDIO testing methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start the local test flow: fetch the prepare response and show env form.
+   */
+  startLocalTest(): void {
+    const itemId = this.result.item.item_id;
+    this.state.set('local-prepare');
+    this.localConnecting.set(false);
+    this.localConnectError.set('');
+
+    this.service.prepareLocalTest(itemId).subscribe({
+      next: (res) => {
+        this.localPrepare.set(res);
+        // Pre-populate empty values
+        this.localEnvValues = {};
+        for (const field of res.environment_variables) {
+          this.localEnvValues[field.name] = '';
+        }
+      },
+      error: (err) => {
+        this.state.set('local-error');
+        this.localConnectError.set(this.extractErrorMessage(err) || 'Failed to load configuration.');
+      },
+    });
+  }
+
+  /**
+   * Cancel local test and go back to the install instructions.
+   */
+  cancelLocalTest(): void {
+    this.localPrepare.set(null);
+    this.localEnvValues = {};
+    this.localConnectError.set('');
+    this.state.set('local-stdio');
+  }
+
+  /**
+   * Submit credentials and attempt to connect to the local MCP server.
+   */
+  submitLocalCredentials(): void {
+    const prepare = this.localPrepare();
+    if (!prepare) return;
+
+    this.localConnecting.set(true);
+    this.localConnectError.set('');
+    this.state.set('local-installing');
+
+    const itemId = this.result.item.item_id;
+    this.service.connectLocal(itemId, { env_vars: this.localEnvValues }).subscribe({
+      next: (res) => this.handleLocalConnectResponse(res),
+      error: (err) => {
+        this.localConnecting.set(false);
+        this.state.set('local-error');
+        this.localConnectError.set(this.extractErrorMessage(err) || 'Connection failed.');
+      },
+    });
+  }
+
+  private handleLocalConnectResponse(res: LocalConnectResponse): void {
+    this.localConnecting.set(false);
+
+    if (res.connected) {
+      this.localSessionId.set(res.session_id ?? null);
+      this.tools.set(res.tools ?? []);
+      this.state.set('local-connected');
+      return;
+    }
+
+    // Connection failed
+    this.state.set('local-error');
+    this.localConnectError.set(
+      res.user_message ?? res.error ?? 'Failed to connect to local MCP server.'
+    );
+  }
+
+  /**
+   * Retry connecting with the same credentials.
+   */
+  retryLocalConnect(): void {
+    // Reset env values to what they were
+    this.localConnectError.set('');
+    this.submitLocalCredentials();
+  }
+
+  /**
+   * Disconnect from the local MCP session and destroy the container.
+   */
+  disconnectLocal(): void {
+    const sid = this.localSessionId();
+    if (!sid) {
+      this.localSessionId.set(null);
+      this.close.emit();
+      return;
+    }
+
+    const itemId = this.result.item.item_id;
+    this.service.disconnectLocal(itemId, { session_id: sid }).subscribe({
+      next: () => {
+        this.localSessionId.set(null);
+        this.localPrepare.set(null);
+        this.localEnvValues = {};
+        this.close.emit();
+      },
+      error: () => {
+        // Even on error, close the modal
+        this.localSessionId.set(null);
+        this.localPrepare.set(null);
+        this.localEnvValues = {};
         this.close.emit();
       },
     });

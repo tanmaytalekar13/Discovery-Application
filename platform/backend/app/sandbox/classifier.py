@@ -124,6 +124,26 @@ def _summarize_package(pkg: dict[str, Any]) -> LocalPackageHint:
     if not isinstance(env_vars, list):
         env_vars = []
 
+    # Extract runtime arguments if present
+    # MCP registry stores these as [{"value": "-y", "type": "positional"}, ...]
+    # but the backend expects a flat list of strings.
+    raw_runtime_args = pkg.get("runtimeArguments") or []
+    if not isinstance(raw_runtime_args, list):
+        raw_runtime_args = []
+    runtime_arguments: list[str] = []
+    for arg in raw_runtime_args:
+        if isinstance(arg, str):
+            runtime_arguments.append(arg)
+        elif isinstance(arg, dict):
+            value = arg.get("value")
+            if isinstance(value, str):
+                runtime_arguments.append(value)
+
+    # Extract allowed domains for network whitelisting
+    allowed_domains = pkg.get("allowedDomains") or []
+    if not isinstance(allowed_domains, list):
+        allowed_domains = []
+
     return LocalPackageHint(
         registryType=registry_type,
         identifier=identifier,
@@ -131,6 +151,8 @@ def _summarize_package(pkg: dict[str, Any]) -> LocalPackageHint:
         transportType=transport_type,
         installCommand=install_command,
         environmentVariables=env_vars,
+        runtimeArguments=runtime_arguments,
+        allowedDomains=allowed_domains,
     )
 
 

@@ -237,6 +237,8 @@ export interface LocalPackageHint {
   runtimeHint?: string;
   transportType?: string;
   installCommand?: string;
+  runtimeArguments?: string[];
+  allowedDomains?: string[];
   environmentVariables: EnvironmentVariableHint[];
 }
 
@@ -310,4 +312,60 @@ export interface OAuthStartResponse {
 export interface OAuthCallbackResponse {
   success: boolean;
   message: string;
+}
+
+// ---------------------------------------------------------------------------
+// Local STDIO MCP Tool Testing (Phase 15 - Backend Sandbox)
+// ---------------------------------------------------------------------------
+
+export interface EnvironmentVariableSchema {
+  name: string;
+  description?: string;
+  is_secret: boolean;
+  is_required: boolean;
+}
+
+export interface LocalPrepareResponse {
+  item_id: string;
+  registry_type: 'npm' | 'pip';
+  identifier: string;
+  install_command?: string;
+  environment_variables: EnvironmentVariableSchema[];
+}
+
+export interface LocalConnectRequest {
+  env_vars: Record<string, string>;
+}
+
+export interface LocalConnectResponse {
+  connected: boolean;
+  session_id?: string;
+  tools: ToolInfo[];
+  error?: string;
+  auth_reason?: AuthReason;
+  user_message?: string;
+  show_retry?: boolean;
+}
+
+export interface LocalInvokeRequest {
+  session_id: string;
+  tool_name: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface LocalInvokeResponse {
+  status: 'success' | 'error';
+  result?: unknown;
+  error?: string;
+  duration_ms?: number;
+  user_message?: string;
+}
+
+export interface LocalDisconnectRequest {
+  session_id: string;
+}
+
+export interface LocalDisconnectResponse {
+  status: 'ok' | 'error';
+  message?: string;
 }
