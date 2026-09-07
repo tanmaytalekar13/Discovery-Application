@@ -499,6 +499,7 @@ async def _open_session(
     transport: str,
     headers: dict[str, str],
     timeout: float,
+    auth_token: str | None = None,
 ):
     """Open an MCP client session, yielding a ClientSession bound to
     the chosen transport.
@@ -507,7 +508,24 @@ async def _open_session(
     the module don't pay the import cost, and so import errors are
     isolated to where they matter.
     """
+    from urllib.parse import urlencode, urlparse, parse_qs
+
     from mcp import ClientSession
+
+    # Append auth token as a URL query param if the URL doesn't already
+    # have one. Many MCP servers (e.g. PennyOCR) accept ?key=<token> or
+    # ?api_key=<token> in addition to / instead of Authorization headers.
+    if auth_token:
+        parsed = urlparse(url)
+        existing_params = parse_qs(parsed.query)
+        common_names = ("key", "api_key", "apikey", "token", "bearer")
+        if not any(name in existing_params for name in common_names):
+            existing_params["key"] = [auth_token]
+            new_query = urlencode(
+                {k: v[0] for k, v in existing_params.items()},
+                doseq=False,
+            )
+            url = parsed._replace(query=new_query).geturl()
 
     if transport == "streamable-http":
         from mcp.client.streamable_http import streamablehttp_client
@@ -646,7 +664,7 @@ class MCPTestClient:
         async def _do_connect() -> ConnectResult:
             try:
                 async with _open_session(
-                    self._url, transport, headers, self._timeout
+                    self._url, transport, headers, self._timeout, self._auth_token
                 ) as session:
                     init_result = await session.initialize()
                     tools_result = await session.list_tools()
@@ -755,7 +773,7 @@ class MCPTestClient:
         async def _do_invoke():
             try:
                 async with _open_session(
-                    self._url, transport, headers, self._timeout
+                    self._url, transport, headers, self._timeout, self._auth_token
                 ) as session:
                     await session.initialize()
                     call_result = await session.call_tool(tool_name, arguments)
