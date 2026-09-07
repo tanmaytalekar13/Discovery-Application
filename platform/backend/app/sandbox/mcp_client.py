@@ -96,6 +96,7 @@ AUTH_REASON_RATE_LIMITED = "rate_limited"
 AUTH_REASON_SERVER_ERROR = "server_error"
 AUTH_REASON_CONNECTION_ERROR = "connection_error"
 AUTH_REASON_TIMEOUT = "timeout"
+AUTH_REASON_INCOMPATIBLE = "incompatible"
 AUTH_REASON_UNKNOWN = "unknown"
 
 
@@ -253,6 +254,18 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
                          "issue or the server may be temporarily offline.",
             show_token_input=True,
             show_oauth_button=True,
+        )
+
+    # MCP protocol version mismatch — server uses an incompatible version
+    if exc_msg and ("protocol version" in exc_msg
+                    or "unsupported protocol" in exc_msg
+                    or "mcp" in exc_msg and ("version" in exc_msg or "protocol" in exc_msg)):
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_INCOMPATIBLE,
+            user_message="This MCP server uses an incompatible protocol version. "
+                         "It may have been updated since this tool was registered.",
+            show_token_input=False,
+            show_oauth_button=False,
         )
 
     # Fallback: unknown / unexpected exception
@@ -702,7 +715,13 @@ class MCPTestClient:
 
         try:
             return await self._with_retries("connect", _do_connect)
-        except (MCPTimeoutError, MCPTransportError, MCPClientError) as exc:
+        except (
+            MCPTimeoutError,
+            MCPTransportError,
+            MCPClientError,
+            httpx.HTTPStatusError,
+            RuntimeError,
+        ) as exc:
             info = classify_connection_error(exc)
             # Auth errors (401/403) that come through the outer handler
             # (wrapped in ExceptionGroup) should still surface as auth_required.
