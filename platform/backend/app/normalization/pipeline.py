@@ -653,6 +653,14 @@ def _artifact_config_files(candidate: CandidateReference) -> list[dict[str, Any]
             }
         )
 
+    # GitHub MCP repositories often publish connection instructions only in
+    # their README (for example an explicit HTTPS /mcp endpoint or an npx/uvx
+    # command). Preserve that source-backed data as structured test metadata;
+    # the sandbox classifier deliberately parses only those documented forms.
+    readme = getattr(raw, "readme", None)
+    if repository and isinstance(readme, str) and readme.strip():
+        config.append({"kind": "github_readme", "content": readme})
+
     root_entries = tuple(getattr(raw, "root_entries", ()) or ())
     if root_entries:
         config.append({"kind": "github_root_entries", "entries": list(root_entries)})

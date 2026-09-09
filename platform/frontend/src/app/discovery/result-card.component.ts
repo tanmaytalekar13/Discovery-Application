@@ -86,7 +86,9 @@ import { SearchResultItem, ClassificationMode } from './models';
               <span class="skill-chip">{{ skill }}</span>
             }
             @if (result.item.agent.skills.length > 5) {
-              <span class="skill-chip skill-chip--more">+{{ result.item.agent.skills.length - 5 }}</span>
+              <span class="skill-chip skill-chip--more"
+                >+{{ result.item.agent.skills.length - 5 }}</span
+              >
             }
           </div>
         }
@@ -94,9 +96,7 @@ import { SearchResultItem, ClassificationMode } from './models';
 
       <!-- Action buttons -->
       <div class="card-actions">
-        <button class="action-btn" (click)="onViewCode($event)">
-          View Code
-        </button>
+        <button class="action-btn" (click)="onViewCode($event)">View Code</button>
         @if (result.item.type === 'tool') {
           @switch (testActionMode) {
             @case ('test') {
@@ -105,8 +105,21 @@ import { SearchResultItem, ClassificationMode } from './models';
               </button>
             }
             @case ('run-locally') {
-              <button class="action-btn action-btn--local" (click)="onTestTool($event)" title="This is a local stdio tool. Click for install instructions.">
+              <button
+                class="action-btn action-btn--local"
+                (click)="onTestTool($event)"
+                title="This is a local stdio tool. Click for install instructions."
+              >
                 Run Locally
+              </button>
+            }
+            @case ('test-source') {
+              <button
+                class="action-btn action-btn--local"
+                (click)="onTestTool($event)"
+                title="This tool's source is on GitHub — click to inspect the repo and run it in a sandbox."
+              >
+                Test Tool
               </button>
             }
             @case ('hidden') {
@@ -115,9 +128,7 @@ import { SearchResultItem, ClassificationMode } from './models';
           }
         }
         @if (result.item.type === 'agent') {
-          <button class="action-btn" disabled title="Available in Phase 16">
-            Test Agent
-          </button>
+          <button class="action-btn" disabled title="Available in Phase 16">Test Agent</button>
         }
       </div>
     </article>
@@ -132,7 +143,9 @@ import { SearchResultItem, ClassificationMode } from './models';
         display: flex;
         flex-direction: column;
         gap: 0.875rem;
-        transition: box-shadow 0.15s ease, border-color 0.15s ease;
+        transition:
+          box-shadow 0.15s ease,
+          border-color 0.15s ease;
       }
       .result-card:hover {
         border-color: var(--color-accent);
@@ -241,9 +254,15 @@ import { SearchResultItem, ClassificationMode } from './models';
       .reliability-bar-fill--high {
         background: var(--color-green);
       }
-      .freshness-value--fresh { color: var(--color-green); }
-      .freshness-value--aging { color: var(--color-amber); }
-      .freshness-value--stale { color: var(--color-red); }
+      .freshness-value--fresh {
+        color: var(--color-green);
+      }
+      .freshness-value--aging {
+        color: var(--color-amber);
+      }
+      .freshness-value--stale {
+        color: var(--color-red);
+      }
       .source-badges {
         display: flex;
         flex-wrap: wrap;
@@ -321,7 +340,10 @@ import { SearchResultItem, ClassificationMode } from './models';
         font: 600 0.8125rem/1 var(--font-mono);
         cursor: pointer;
         opacity: 1;
-        transition: border-color 0.15s, color 0.15s, background 0.15s;
+        transition:
+          border-color 0.15s,
+          color 0.15s,
+          background 0.15s;
       }
       .action-btn:hover:not(:disabled) {
         border-color: var(--color-accent);
@@ -372,11 +394,13 @@ export class ResultCardComponent {
   }
 
   /** Determines which test button variant to show based on classification.mode. */
-  get testActionMode(): 'test' | 'run-locally' | 'hidden' {
+  // Getter update — teesra case add karo:
+  get testActionMode(): 'test' | 'run-locally' | 'test-source' | 'hidden' {
     const cls = this.result.classification;
     if (!cls) return 'hidden';
     if (cls.mode === 'remote' || cls.mode === 'remote_via_package') return 'test';
     if (cls.mode === 'local_stdio') return 'run-locally';
+    if (cls.mode === 'local_source') return 'test-source'; // NEW
     return 'hidden'; // not_testable
   }
 

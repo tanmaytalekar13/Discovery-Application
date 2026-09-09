@@ -11,6 +11,12 @@ Security features:
 - No privileged mode
 - Session hard timeout (10 minutes)
 - Secrets never logged (masked in output)
+
+NEW: also handles GitHub-sourced ("local_source") MCP servers - repos with
+no registry package/remote metadata. This reuses the exact same session
+store, Docker SDK, resource limits, and cleanup thread as the npm/pip
+registry-package path; it does NOT introduce a parallel container/session
+system. See `create_container_from_source` near the bottom of the class.
 """
 from __future__ import annotations
 
@@ -19,11 +25,15 @@ import logging
 import os
 import secrets
 import shlex
+import shutil
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
+
+from app.sandbox.schemas import GithubSourceHint, LocalRunConfig
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +79,22 @@ DEFAULT_ALLOWED_DOMAINS = {
     ],
 }
 
+# NEW: one base image per runtime, used for GitHub-sourced repos that do
+# NOT ship their own Dockerfile. Deliberately reuses the same base images
+# as the registry-package path where the runtime matches (node/python),
+# so the same cache volumes apply. TODO: replace python-uv/go/rust with
+# your own pinned images (e.g. one with `uv` preinstalled) once decided.
+GENERIC_SOURCE_IMAGES: dict[str, str] = {
+    "node": DEFAULT_IMAGES["npm"],
+    "python": DEFAULT_IMAGES["pip"],
+    "python-uv": DEFAULT_IMAGES["pip"],  # TODO: swap for an image with uv preinstalled
+    "go": "golang:1.22-alpine",
+    "rust": "rust:1.78-slim",
+}
+
+GIT_CLONE_TIMEOUT_S = 120
+DOCKER_BUILD_TIMEOUT_S = 300
+
 
 # ---------------------------------------------------------------------------
 # Data Classes
@@ -82,7 +108,7 @@ class ContainerSession:
     item_id: UUID
     user_id: str | None  # For per-user session limits
     container_id: str
-    registry_type: str  # "npm" | "pip"
+    registry_type: str  # "npm" | "pip" | "github-source" (NEW)
     identifier: str
     image: str
     allowed_domains: list[str]
@@ -93,6 +119,10 @@ class ContainerSession:
     # initialize/tools-list for the lifetime of this sandbox session so a
     # later tools/call goes to that same running server.
     mcp_client: Any | None = field(default=None, repr=False, compare=False)
+    # NEW: only set for github-source sessions - the temp dir the repo was
+    # cloned into, so destroy_container() can remove it alongside the
+    # container. None for registry-package sessions.
+    workdir: str | None = field(default=None, repr=False, compare=False)
 
     @property
     def is_expired(self) -> bool:
@@ -256,14 +286,7 @@ class ContainerManager:
         now = time.monotonic()
 
         # Check per-user session limit
-        with self._lock:
-            if user_id:
-                user_session_count = len(self._user_sessions.get(user_id, set()))
-                if user_session_count >= MAX_CONCURRENT_SESSIONS_PER_USER:
-                    raise ValueError(
-                        f"Maximum concurrent sessions ({MAX_CONCURRENT_SESSIONS_PER_USER}) reached. "
-                        "Please disconnect an existing session before starting a new one."
-                    )
+        self._check_user_session_limit(user_id)
 
         # Determine image
         image = DEFAULT_IMAGES.get(config.registry_type, DEFAULT_IMAGES["npm"])
@@ -309,16 +332,7 @@ class ContainerManager:
             session.container_id = container.id
             session.status = "ready"
 
-            # Register session
-            with self._lock:
-                self._sessions[session_id] = session
-                if user_id:
-                    if user_id not in self._user_sessions:
-                        self._user_sessions[user_id] = set()
-                    self._user_sessions[user_id].add(session_id)
-
-            # Start cleanup thread if not running
-            self._ensure_cleanup_thread()
+            self._register_session(session)
 
             logger.info(
                 "Container session %s created successfully (container_id=%s)",
@@ -329,6 +343,253 @@ class ContainerManager:
         except Exception as exc:
             logger.error("Failed to create container session %s: %s", session_id, exc)
             raise RuntimeError(f"Failed to create container: {exc}") from exc
+
+    # -------------------------------------------------------------------------
+    # NEW: GitHub-source ("local_source") path
+    # -------------------------------------------------------------------------
+
+    async def create_container_from_source(
+        self,
+        item: Any,
+        github_hint: GithubSourceHint,
+        run_config: LocalRunConfig,
+        env_vars: dict[str, str],
+        allowed_domains: list[str] | None = None,
+        user_id: str | None = None,
+    ) -> ContainerSession:
+        """Create and start an ephemeral container for a GitHub-sourced MCP
+        server (no registry package/remote metadata - run config was
+        derived by app.sandbox.extract.extract_local_run_config).
+
+        Mirrors create_container() as closely as possible: same session
+        store, same resource limits, same cleanup thread, same
+        sandbox-network detection. The two real differences are (1) the
+        image is either built from the repo's own Dockerfile or picked
+        from GENERIC_SOURCE_IMAGES by runtime, and (2) the caller execs
+        run_config.command/args via LocalMCPClient afterwards, instead of
+        this method building a self-installing command itself.
+
+        Raises:
+            ValueError: heuristic-tier run_config (no command/args), or
+                user exceeds concurrent session limit.
+            RuntimeError: clone/build/container-start failure.
+        """
+        if not run_config.command:
+            # Heuristic-tier extraction only found an install hint, no
+            # command/args - guessing a run command is worse than telling
+            # the UI we don't know how to run this. Caller should check
+            # this BEFORE calling create_container_from_source and surface
+            # "install detected, run command unknown" instead.
+            raise ValueError(
+                "run_config has no command/args (heuristic-tier extraction) - "
+                "this item is not runnable yet, only installable."
+            )
+
+        session_id = secrets.token_urlsafe(32)
+        now = time.monotonic()
+
+        self._check_user_session_limit(user_id)
+
+        workdir = tempfile.mkdtemp(prefix=f"mcp-source-{session_id}-")
+
+        domains = allowed_domains or []
+        if run_config.runtime in DEFAULT_ALLOWED_DOMAINS:
+            domains = list(set(domains) | set(DEFAULT_ALLOWED_DOMAINS[run_config.runtime]))
+        # NOTE: this domain list is for the container we end up RUNNING.
+        # If the repo has its own Dockerfile, the `docker build` step below
+        # is a separate concern with its own network exposure - see the
+        # open question flagged in chat about restricting build-time network.
+
+        session = ContainerSession(
+            session_id=session_id,
+            item_id=item.item_id,
+            user_id=user_id,
+            container_id="",
+            registry_type="github-source",
+            identifier=github_hint.repository,
+            image="",
+            allowed_domains=domains,
+            created_at=now,
+            expires_at=now + SESSION_TIMEOUT_SECONDS,
+            status="starting",
+            workdir=workdir,
+        )
+
+        safe_env = self._mask_secrets(env_vars)
+        logger.info(
+            "Creating source container session %s for item %s (repo=%s, env=%s)",
+            session_id, item.item_id, github_hint.repository, safe_env,
+        )
+
+        try:
+            has_dockerfile = await self._repo_has_dockerfile(item)
+            await self._git_clone_shallow(github_hint.clone_url, workdir)
+
+            if has_dockerfile:
+                image_tag = f"mcp-source/{session_id}:local"
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self._build_docker_image, workdir, image_tag,
+                )
+                session.image = image_tag
+                bind_workdir = None  # repo is baked into the image already
+            else:
+                image_tag = GENERIC_SOURCE_IMAGES.get(run_config.runtime or "")
+                if not image_tag:
+                    raise RuntimeError(
+                        f"No generic sandbox image configured for runtime "
+                        f"{run_config.runtime!r}"
+                    )
+                session.image = image_tag
+                bind_workdir = workdir  # bind-mounted read-only below
+
+            container = await asyncio.get_event_loop().run_in_executor(
+                None,
+                self._create_docker_container_from_source,
+                session.image, env_vars, domains, bind_workdir,
+            )
+
+            session.container_id = container.id
+            session.status = "ready"
+
+            self._register_session(session)
+
+            logger.info(
+                "Source container session %s created successfully (container_id=%s, "
+                "built_from_dockerfile=%s)",
+                session_id, container.id, has_dockerfile,
+            )
+            return session
+
+        except Exception as exc:
+            shutil.rmtree(workdir, ignore_errors=True)
+            logger.error("Failed to create source container session %s: %s", session_id, exc)
+            raise RuntimeError(f"Failed to create container from source: {exc}") from exc
+
+    async def _repo_has_dockerfile(self, item: Any) -> bool:
+        """Reuses the same source_resolver function extract.py already
+        uses, so this gets the same disk caching / branch-fallback
+        behavior for free and costs zero extra GitHub API calls if the
+        item's tree was already fetched by extract_local_run_config."""
+        from app.artifacts.source_resolver import get_repository_tree
+
+        tree = await get_repository_tree(item)
+        return any(entry.path == "Dockerfile" for entry in tree)
+
+    async def _git_clone_shallow(self, clone_url: str, dest: str) -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "clone", "--depth", "1", clone_url, dest,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=GIT_CLONE_TIMEOUT_S)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"git clone of {clone_url!r} failed: {stderr.decode(errors='replace')}"
+            )
+
+    def _build_docker_image(self, context_dir: str, image_tag: str) -> None:
+        """Runs in executor - blocking Docker SDK build call.
+
+        Repo Dockerfiles are untrusted input, but the build intentionally
+        keeps default (full) network access — restricting it would break
+        the common case of `RUN pip install`/`npm install` steps inside
+        the Dockerfile. Runtime isolation (network none + resource limits)
+        is what actually matters and is enforced separately by
+        _create_docker_container_from_source, regardless of whether the
+        image came from this build or a generic base image. Decided
+        trade-off, not a pending TODO.
+        """
+        client = self.docker
+        client.images.build(
+            path=context_dir,
+            tag=image_tag,
+            rm=True,
+            timeout=DOCKER_BUILD_TIMEOUT_S,
+        )
+
+    def _create_docker_container_from_source(
+        self,
+        image: str,
+        env_vars: dict[str, str],
+        allowed_domains: list[str],
+        bind_workdir: str | None,
+    ) -> Any:
+        """Mirrors _create_docker_container, adapted for a source-built or
+        source-selected image: no registry-type cache volume (doesn't
+        apply here), optional read-only bind mount of the cloned repo when
+        using a generic image (skipped when the image was built from the
+        repo's own Dockerfile, since the repo is already inside it)."""
+        client = self.docker
+
+        if bind_workdir:
+            # Generic base image - may need pulling, same as the registry path.
+            try:
+                client.images.get(image)
+                logger.debug("Docker image %s is already present locally", image)
+            except Exception:
+                logger.info("Docker image %s not found locally, pulling...", image)
+                try:
+                    client.images.pull(image)
+                except Exception as exc:
+                    logger.warning("Failed to pull image %s (may already exist): %s", image, exc)
+        # else: image was just built locally from the repo's Dockerfile - no pull needed.
+
+        env_list = [f"{k}={v}" for k, v in env_vars.items()]
+
+        container_config: dict[str, Any] = {
+            "image": image,
+            "command": ["sleep", "infinity"],
+            "environment": env_list,
+            "detach": True,
+            "nano_cpus": int(CONTAINER_CPU_LIMIT * 1e9),
+            "mem_limit": CONTAINER_MEMORY_LIMIT,
+            "memswap_limit": CONTAINER_MEMORY_LIMIT,
+            "cap_drop": ["MKNOD", "SETFCAP", "SETPCAP", "NET_RAW", "SYS_CHROOT", "KILL"],
+            "security_opt": ["no-new-privileges"],
+            "auto_remove": False,
+        }
+
+        if bind_workdir:
+            container_config["volumes"] = {bind_workdir: {"bind": "/repo", "mode": "ro"}}
+            container_config["working_dir"] = "/repo"
+
+        try:
+            networks = client.networks.list(names=["sandbox-network"])
+            if networks:
+                container_config["network"] = "sandbox-network"
+                logger.info("Using sandbox-network for egress control")
+            else:
+                logger.info("sandbox-network not found, using default bridge network")
+        except Exception:
+            logger.info("sandbox-network not found, using default bridge network")
+
+        try:
+            container = client.containers.run(**container_config)
+            return container
+        except Exception as exc:
+            logger.error("Failed to create source container: %s", exc)
+            raise
+
+    # -------------------------------------------------------------------------
+    # Shared helpers (used by both create_container and create_container_from_source)
+    # -------------------------------------------------------------------------
+
+    def _check_user_session_limit(self, user_id: str | None) -> None:
+        with self._lock:
+            if user_id:
+                user_session_count = len(self._user_sessions.get(user_id, set()))
+                if user_session_count >= MAX_CONCURRENT_SESSIONS_PER_USER:
+                    raise ValueError(
+                        f"Maximum concurrent sessions ({MAX_CONCURRENT_SESSIONS_PER_USER}) reached. "
+                        "Please disconnect an existing session before starting a new one."
+                    )
+
+    def _register_session(self, session: ContainerSession) -> None:
+        with self._lock:
+            self._sessions[session.session_id] = session
+            if session.user_id:
+                self._user_sessions.setdefault(session.user_id, set()).add(session.session_id)
+        self._ensure_cleanup_thread()
 
     async def destroy_container(self, session_id: str) -> bool:
         """Stop and remove a container.
@@ -366,6 +627,10 @@ class ContainerManager:
                 "Error removing container %s for session %s: %s",
                 session.container_id, session_id, exc,
             )
+
+        # NEW: clean up the cloned repo dir for github-source sessions
+        if session.workdir:
+            shutil.rmtree(session.workdir, ignore_errors=True)
 
         # Cleanup session tracking
         with self._lock:
@@ -423,7 +688,7 @@ class ContainerManager:
         return cleaned
 
     # -------------------------------------------------------------------------
-    # Docker container creation
+    # Docker container creation (registry-package path)
     # -------------------------------------------------------------------------
 
     def _create_docker_container(

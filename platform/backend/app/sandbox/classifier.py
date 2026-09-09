@@ -14,7 +14,10 @@ Decision tree (first match wins):
   3. mcp_registry_packages entry with stdio transport, or http/sse
      transport pointing at localhost
      -> local_stdio
-  4. anything else (web search articles, blog posts, comparisons)
+  4. github_repository entry with no registry remote/package info
+     -> local_source (repo coordinates only; run config is extracted
+     lazily on 'Test Tool' click, not here - see sandbox.extract)
+  5. anything else (web search articles, blog posts, comparisons)
      -> not_testable
 
 A package whose transport URL is localhost/127.0.0.1/0.0.0.0 is
@@ -29,6 +32,7 @@ from urllib.parse import urlparse
 
 from app.sandbox.schemas import (
     ClassificationResult,
+    GithubSourceHint,
     LocalPackageHint,
     RemoteCandidate,
 )
@@ -203,6 +207,28 @@ def _build_install_command(
     return identifier
 
 
+def _build_github_source_hint(entry: dict[str, Any]) -> GithubSourceHint | None:
+    """Pull repo coordinates out of a github_repository config entry.
+
+    This is intentionally thin: classify_tool only decides *whether*
+    the item is testable and *which* mode to use. The actual run
+    config (runtime, install command, entrypoint, required env vars)
+    is derived later, lazily, from the repo's file tree - see
+    sandbox.extract.extract_local_run_config. That step needs network
+    calls (tree + blob fetch) so it must not run at classification
+    time, which is expected to stay fast and synchronous.
+    """
+    repository = entry.get("repository")
+    clone_url = entry.get("clone_url")
+    if not repository or not clone_url:
+        return None
+    return GithubSourceHint(
+        repository=repository,
+        clone_url=clone_url,
+        default_branch=entry.get("default_branch"),
+    )
+
+
 def classify_tool(item: Any) -> ClassificationResult:
     """Classify a single discovered tool item for live testing.
 
@@ -222,6 +248,7 @@ def classify_tool(item: Any) -> ClassificationResult:
 
     remotes_entry = _find_config_entry(config_files, "mcp_registry_remotes")
     packages_entry = _find_config_entry(config_files, "mcp_registry_packages")
+    github_entry = _find_config_entry(config_files, "github_repository")
 
     # --- 1. Pure remote (mcp_registry_remotes entry) ----------------------
     if remotes_entry:
@@ -293,7 +320,22 @@ def classify_tool(item: Any) -> ClassificationResult:
                 ),
             )
 
-    # --- 4. Fallback ------------------------------------------------------
+    # --- 4. GitHub-sourced item, no registry package/remote info ----------
+    # These items only carry repo coordinates (repository, clone_url,
+    # default_branch) - there's no transport/runtime/env info to read
+    # here. We mark them testable (the sandbox *can* run them) but the
+    # actual run config is unresolved until the 'Test Tool' click
+    # triggers tree + file extraction.
+    if github_entry:
+        hint = _build_github_source_hint(github_entry)
+        if hint:
+            return ClassificationResult(
+                testable=True,
+                mode="local_source",
+                detail=hint,
+            )
+
+    # --- 5. Fallback --------------------------------------------------------
     return ClassificationResult(
         testable=False,
         mode="not_testable",

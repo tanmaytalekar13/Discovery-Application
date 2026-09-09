@@ -496,6 +496,56 @@ def test_remote_candidates_have_correct_shape():
     assert isinstance(result.detail[0], RemoteCandidate)
 
 
+# ---------------------------------------------------------------------------
+# GitHub README-backed MCP servers
+# ---------------------------------------------------------------------------
+
+def test_github_readme_with_public_mcp_endpoint_is_testable_remotely():
+    item = _item([
+        {"kind": "github_repository", "repository": "acme/weather-mcp"},
+        {
+            "kind": "github_readme",
+            "content": "Connect your MCP client to https://api.acme.test/mcp using streamable HTTP.",
+        },
+    ])
+
+    result = classify_tool(item)
+
+    assert result.testable is True
+    assert result.mode == "remote"
+    assert result.detail[0].url == "https://api.acme.test/mcp"
+
+
+def test_github_readme_with_npx_command_runs_in_local_sandbox():
+    item = _item([
+        {"kind": "github_repository", "repository": "acme/weather-mcp"},
+        {
+            "kind": "github_readme",
+            "content": "```sh\nnpx -y @acme/weather-mcp\n```\nSet WEATHER_API_KEY first.",
+        },
+    ])
+
+    result = classify_tool(item)
+
+    assert result.testable is False
+    assert result.mode == "local_stdio"
+    assert result.detail[0].identifier == "@acme/weather-mcp"
+    assert result.detail[0].environment_variables[0]["name"] == "WEATHER_API_KEY"
+
+
+def test_github_readme_with_uvx_command_uses_pip_sandbox():
+    item = _item([
+        {"kind": "github_repository", "repository": "acme/weather-mcp"},
+        {"kind": "github_readme", "content": "Run `uvx weather-mcp-server`."},
+    ])
+
+    result = classify_tool(item)
+
+    assert result.mode == "local_stdio"
+    assert result.detail[0].registry_type == "pypi"
+    assert result.detail[0].identifier == "weather-mcp-server"
+
+
 def test_auth_header_extracted_from_required_header():
     """When a remote has isRequired=True headers, the first one becomes auth_header."""
     item = _item(

@@ -24,6 +24,8 @@ import {
   LocalInvokeResponse,
   LocalDisconnectResponse,
   EnvironmentVariableSchema,
+  SourcePrepareResponse,
+  SourceConnectResponse,
 } from './models';
 
 // ---------------------------------------------------------------------------
@@ -42,7 +44,12 @@ type ModalState =
   | 'local-prepare'     // Showing env var form for local tool
   | 'local-installing'  // Installing package / connecting to local MCP
   | 'local-connected'   // Connected to local MCP, showing tool list
-  | 'local-error';      // Local connection error
+  | 'local-error'       // Local connection error
+  | 'source-loading'       // local_source — extracting run config from repo
+  | 'source-not-runnable'  // extraction found no runnable command
+  | 'source-auth'          // extraction found env vars — show credential form
+  | 'source-connecting'    // building/starting sandbox for GitHub-source repo
+  | 'source-error';        // GitHub-source connection error
 
 @Component({
   selector: 'app-test-tool-modal',
@@ -432,7 +439,9 @@ type ModalState =
               @if (invokeResult()?.requires_auth) {
                 <div class="auth-retry-banner">
                   <p>This tool requires authentication to use. Connect your account or provide a token to retry.</p>
-                  <button class="btn btn--secondary" (click)="goToAuth()">Provide Token</button>
+                  <button class="btn btn--secondary" (click)="goToAuth()">
+                    {{ localSessionId() ? 'Add credentials' : 'Provide Token' }}
+                  </button>
                 </div>
               }
 
@@ -641,10 +650,129 @@ type ModalState =
             </div>
           }
 
+          <!-- source-loading: extracting run config from repo -->
+          @if (state() === 'source-loading') {
+            <div class="state-container">
+              <span class="spinner"></span>
+              <p>Inspecting repository…</p>
+            </div>
+          }
+
+          <!-- source-not-runnable: extraction found no runnable command -->
+          @if (state() === 'source-not-runnable') {
+            <div class="stdio-panel">
+              <div class="stdio-icon">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+                  <circle cx="11" cy="11" r="8"></circle>
+                  <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  <line x1="11" y1="8" x2="11" y2="11"></line>
+                  <line x1="11" y1="14" x2="11.01" y2="14"></line>
+                </svg>
+              </div>
+              <p class="stdio-title">Can't run this tool yet</p>
+              <p class="stdio-desc">
+                {{ sourcePrepare()?.reason || sourceConnectError() || 'Could not determine how to run this repository.' }}
+              </p>
+
+              @if (sourcePrepare()?.install_command) {
+                <div class="install-block">
+                  <p class="install-label">Detected install command:</p>
+                  <pre class="install-cmd">{{ sourcePrepare()?.install_command }}</pre>
+                </div>
+              }
+
+              <button class="btn btn--secondary" (click)="closeModal()">Close</button>
+            </div>
+          }
+
+          <!-- source-auth: env var form for a GitHub-source repo -->
+          @if (state() === 'source-auth') {
+            <div class="env-form-panel">
+              <div class="env-form-header">
+                <div class="env-form-icon">
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                  </svg>
+                </div>
+                <div>
+                  <p class="env-form-title">Configure Credentials</p>
+                  <p class="env-form-subtitle">
+                    Detected from {{ sourcePrepare()?.source }} — runs in the sandbox
+                  </p>
+                </div>
+              </div>
+
+              @if (sourcePrepare()?.install_command) {
+                <div class="install-block">
+                  <p class="install-label">Install command:</p>
+                  <pre class="install-cmd">{{ sourcePrepare()?.install_command }}</pre>
+                </div>
+              }
+
+              <form class="dynamic-form" (ngSubmit)="connectSource()">
+                @for (name of sourcePrepare()?.environment_variables; track name) {
+                  <div class="form-field">
+                    <label class="form-label" [for]="'source-env-' + name">{{ name }}</label>
+                    <input
+                      [id]="'source-env-' + name"
+                      class="form-input"
+                      type="password"
+                      [(ngModel)]="sourceEnvValues[name]"
+                      [name]="'source-env-' + name"
+                      [placeholder]="name"
+                    />
+                  </div>
+                }
+
+                @if (sourceConnectError()) {
+                  <p class="form-error">{{ sourceConnectError() }}</p>
+                }
+
+                <div class="form-actions">
+                  <button type="submit" class="btn btn--primary">Install &amp; Connect</button>
+                  <button type="button" class="btn btn--ghost" (click)="cancelSourceTest()">Cancel</button>
+                </div>
+              </form>
+            </div>
+          }
+
+          <!-- source-connecting: building/starting the sandbox -->
+          @if (state() === 'source-connecting') {
+            <div class="state-container">
+              <span class="spinner"></span>
+              <p>Building sandbox and starting server…</p>
+              <p class="install-note">This may take 30-60 seconds</p>
+            </div>
+          }
+
+          <!-- source-error: GitHub-source connection error -->
+          @if (state() === 'source-error') {
+            <div class="error-panel">
+              <div class="error-panel-icon error-panel-icon--connection_error">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <line x1="1" y1="1" x2="23" y2="23"></line>
+                  <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"></path>
+                  <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"></path>
+                  <path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path>
+                  <line x1="12" y1="20" x2="12.01" y2="20"></line>
+                </svg>
+              </div>
+              <div class="error-panel-content">
+                <p class="error-panel-title">Connection failed</p>
+                <p class="error-panel-message">{{ sourceConnectError() }}</p>
+              </div>
+              <div class="error-panel-actions">
+                <button class="btn btn--primary" (click)="retrySourceConnect()">Try Again</button>
+                <button class="btn btn--secondary" (click)="cancelSourceTest()">Cancel</button>
+              </div>
+            </div>
+          }
+
         </div>
 
         <!-- Footer: disconnect when session is active -->
-        @if ((sessionId() || localSessionId()) && state() !== 'idle' && state() !== 'connecting' && state() !== 'local-prepare' && state() !== 'local-installing') {
+        @if ((sessionId() || localSessionId()) && state() !== 'idle' && state() !== 'connecting' && state() !== 'local-prepare' && state() !== 'local-installing' && state() !== 'source-loading' && state() !== 'source-auth' && state() !== 'source-connecting') {
           <footer class="modal-footer">
             <span class="session-info">
               @if (localSessionId()) {
@@ -1243,6 +1371,16 @@ export class TestToolModalComponent implements OnInit {
   localRequiredEnvVars = signal<string[]>([]);
 
   // ---------------------------------------------------------------------------
+  // GitHub-source ("local_source") testing state
+  // Connect flow is different (prepare -> connect with a build/clone step),
+  // but once connected it reuses localSessionId / invokeLocal / disconnectLocal
+  // unmodified, since the backend uses the same ContainerSession store.
+  // ---------------------------------------------------------------------------
+  sourcePrepare = signal<SourcePrepareResponse | null>(null);
+  sourceEnvValues: Record<string, string> = {};
+  sourceConnectError = signal<string>('');
+
+  // ---------------------------------------------------------------------------
   // Form fields (derived from selected tool's inputSchema)
   // ---------------------------------------------------------------------------
   formFields = signal<FormField[]>([]);
@@ -1255,7 +1393,7 @@ export class TestToolModalComponent implements OnInit {
 
   remoteCandidate = computed((): RemoteCandidate | null => {
     const cls = this.classification();
-    if (!cls || cls.mode === 'local_stdio' || cls.mode === 'not_testable') return null;
+    if (!cls || cls.mode === 'local_stdio' || cls.mode === 'local_source' || cls.mode === 'not_testable') return null;
     const detail = cls.detail;
     if (!Array.isArray(detail) || detail.length === 0) return null;
     const first = detail[0];
@@ -1311,6 +1449,11 @@ export class TestToolModalComponent implements OnInit {
 
     if (cls.mode === 'local_stdio') {
       this.state.set('local-stdio');
+      return;
+    }
+
+    if (cls.mode === 'local_source') {
+      this.startSourceTest();
       return;
     }
 
@@ -1551,10 +1694,12 @@ export class TestToolModalComponent implements OnInit {
     const itemId = this.result.item.item_id;
     // Selecting a local tool changes the modal state to `tool-form`, so the
     // presence of the sandbox session (not the current view) determines the
-    // endpoint to use.
+    // endpoint to use. This also covers GitHub-source ("local_source")
+    // sessions — they set localSessionId on connect too (see connectSource
+    // below), so this branch is shared by local_stdio and local_source.
     const isLocalSession = !!this.localSessionId();
 
-    // Use local invoke endpoint if we're in a local session
+    // Use local invoke endpoint if we're in a local (or source) session
     if (isLocalSession) {
       const sessionId = this.localSessionId();
       this.service.invokeLocal(itemId, {
@@ -1611,7 +1756,24 @@ export class TestToolModalComponent implements OnInit {
   }
 
   goToAuth(): void {
+    // A sandboxed stdio server receives credentials as environment variables,
+    // not an HTTP bearer header. Return to the local credential form so the
+    // user can enter an API key/token after a tool-level auth failure.
+    if (this.localSessionId()) {
+      this.localAuthRequired.set(true);
+      const sessionId = this.localSessionId()!;
+      this.service.disconnectLocal(this.result.item.item_id, { session_id: sessionId }).subscribe({
+        next: () => this.reopenLocalCredentialForm(),
+        error: () => this.reopenLocalCredentialForm(),
+      });
+      return;
+    }
     this.state.set('auth-required');
+  }
+
+  private reopenLocalCredentialForm(): void {
+    this.localSessionId.set(null);
+    this.addLocalCredentialFields();
   }
 
   // ---------------------------------------------------------------------------
@@ -1759,6 +1921,8 @@ export class TestToolModalComponent implements OnInit {
 
   /**
    * Disconnect from the local MCP session and destroy the container.
+   * Shared by both local_stdio and local_source (GitHub-source) sessions,
+   * since both use the same ContainerSession store on the backend.
    */
   disconnectLocal(): void {
     const sid = this.localSessionId();
@@ -1784,6 +1948,94 @@ export class TestToolModalComponent implements OnInit {
         this.close.emit();
       },
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // GitHub-source ("local_source") testing methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start the GitHub-source test flow: extract the run config from the repo
+   * (manifest/README/heuristic) via /test/source/prepare, then branch on
+   * the returned status.
+   */
+  private startSourceTest(): void {
+    const itemId = this.result.item.item_id;
+    this.state.set('source-loading');
+    this.sourceConnectError.set('');
+
+    this.service.prepareSourceTest(itemId).subscribe({
+      next: (res) => {
+        this.sourcePrepare.set(res);
+
+        if (res.status === 'not_runnable') {
+          this.state.set('source-not-runnable');
+          return;
+        }
+
+        this.sourceEnvValues = {};
+        for (const name of res.environment_variables) {
+          this.sourceEnvValues[name] = '';
+        }
+
+        if (res.status === 'ready') {
+          this.connectSource();
+          return;
+        }
+
+        // needs_auth
+        this.state.set('source-auth');
+      },
+      error: (err) => {
+        this.state.set('source-not-runnable');
+        this.sourceConnectError.set(this.extractErrorMessage(err) || 'Failed to inspect repository.');
+      },
+    });
+  }
+
+  /**
+   * Build/select the sandbox image and connect. On success this stores the
+   * session in the SAME localSessionId signal used by local_stdio, so the
+   * existing tools-list / invoke / disconnect UI and endpoints work
+   * unmodified — the backend shares one ContainerSession store for both.
+   */
+  connectSource(): void {
+    const itemId = this.result.item.item_id;
+    this.state.set('source-connecting');
+    this.sourceConnectError.set('');
+
+    this.service.connectSource(itemId, { env_vars: this.sourceEnvValues }).subscribe({
+      next: (res) => this.handleSourceConnectResponse(res),
+      error: (err) => {
+        this.state.set('source-error');
+        this.sourceConnectError.set(this.extractErrorMessage(err) || 'Connection failed.');
+      },
+    });
+  }
+
+  private handleSourceConnectResponse(res: SourceConnectResponse): void {
+    if (res.connected) {
+      this.localSessionId.set(res.session_id ?? null);
+      this.tools.set(res.tools ?? []);
+      this.state.set('local-connected');
+      return;
+    }
+
+    this.state.set('source-error');
+    this.sourceConnectError.set(res.user_message ?? res.error ?? 'Failed to connect to the sandboxed server.');
+  }
+
+  /** Retry connecting with the same credentials already entered. */
+  retrySourceConnect(): void {
+    this.connectSource();
+  }
+
+  /** Cancel the GitHub-source test flow (no session was ever created yet). */
+  cancelSourceTest(): void {
+    this.sourcePrepare.set(null);
+    this.sourceEnvValues = {};
+    this.sourceConnectError.set('');
+    this.close.emit();
   }
 
   /** Close without leaving a live sandbox container behind. */

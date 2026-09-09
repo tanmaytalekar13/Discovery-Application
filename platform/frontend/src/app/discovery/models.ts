@@ -217,6 +217,7 @@ export type ClassificationMode =
   | 'remote'
   | 'remote_via_package'
   | 'local_stdio'
+  | 'local_source'
   | 'not_testable';
 
 export interface RemoteCandidate {
@@ -245,7 +246,7 @@ export interface LocalPackageHint {
 export interface ClassificationResult {
   testable: boolean;
   mode: ClassificationMode;
-  detail?: RemoteCandidate[] | LocalPackageHint[];
+  detail?: RemoteCandidate[] | LocalPackageHint[] | GithubSourceHint;
   reason?: string;
 }
 
@@ -373,4 +374,50 @@ export interface LocalDisconnectRequest {
 export interface LocalDisconnectResponse {
   status: 'ok' | 'error';
   message?: string;
+}
+// ---------------------------------------------------------------------------
+// GitHub-Source Tool Test (Phase 15 — repo-derived run config)
+// Mirrors backend/app/sandbox/schemas.py GithubSourceHint / LocalRunConfig
+// and backend/app/sandbox/container_schemas.py SourcePrepareResponse etc.
+// ---------------------------------------------------------------------------
+
+export interface GithubSourceHint {
+  repository: string;
+  clone_url: string;
+  default_branch?: string;
+}
+
+export type RunConfigSource = 'manifest' | 'readme' | 'heuristic';
+
+export interface LocalRunConfig {
+  source: RunConfigSource;
+  runtime?: string;
+  install_command?: string;
+  command?: string;
+  args: string[];
+  env_vars: string[]; // names only, never values
+}
+
+export interface SourcePrepareResponse {
+  item_id: string;
+  status: 'not_runnable' | 'needs_auth' | 'ready';
+  source: RunConfigSource;
+  runtime?: string;
+  install_command?: string;
+  environment_variables: string[]; // names only
+  reason?: string;
+}
+
+export interface SourceConnectRequest {
+  env_vars: Record<string, string>;
+}
+
+export interface SourceConnectResponse {
+  connected: boolean;
+  session_id?: string;
+  tools: ToolInfo[];
+  error?: string;
+  user_message?: string;
+  show_token_input?: boolean;
+  show_retry?: boolean;
 }

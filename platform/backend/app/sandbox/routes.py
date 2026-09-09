@@ -1,12 +1,23 @@
 """Tool-test API routes.
 
-Implements the five endpoints needed for the Test Tool flow:
+Implements the endpoints needed for the Test Tool flow:
 
   POST /items/{item_id}/test/connect
   POST /items/{item_id}/test/invoke
   POST /items/{item_id}/test/authorize/start
   GET  /items/{item_id}/test/authorize/callback
   POST /items/{item_id}/test/disconnect
+  POST /items/{item_id}/test/manual-token
+
+  POST /items/{item_id}/test/local/prepare
+  POST /items/{item_id}/test/local/connect
+  POST /items/{item_id}/test/local/invoke
+  POST /items/{item_id}/test/local/disconnect
+
+  POST /items/{item_id}/test/source/prepare
+  POST /items/{item_id}/test/source/connect
+  (source sessions reuse /test/local/invoke and /test/local/disconnect —
+   see note above those two routes)
 
 These endpoints live in a separate router under /api/items/{item_id}/test
 to keep them co-located with the tool-test logic and cleanly separated
@@ -41,10 +52,14 @@ from app.sandbox.container_schemas import (
     LocalInvokeRequest,
     LocalInvokeResponse,
     LocalPrepareResponse,
+    SourceConnectRequest,
+    SourceConnectResponse,
+    SourcePrepareResponse,
 )
+from app.sandbox.extract import extract_local_run_config
 from app.sandbox.local_mcp_client import LocalMCPClient
 from app.sandbox.mcp_client import MCPTestClient
-from app.sandbox.schemas import LocalPackageHint, RemoteCandidate
+from app.sandbox.schemas import GithubSourceHint, LocalPackageHint, LocalRunConfig, RemoteCandidate
 from app.sandbox.session import get_session_store, SessionStore
 
 router = APIRouter(prefix="/api/items", tags=["tool-test"])
@@ -485,7 +500,8 @@ async def prepare_local_test(
     hint = await _require_local_testable(item_id, repository)
 
     # Build install command
-    if hint.registry_type == "npm":
+    registry_type = "pip" if hint.registry_type == "pypi" else hint.registry_type
+    if registry_type == "npm":
         install_command = f"npx -y {hint.identifier}"
     else:
         install_command = f"pip install {hint.identifier}"
@@ -497,15 +513,15 @@ async def prepare_local_test(
         EnvironmentVariableSchema(
             name=var["name"],
             description=var.get("description"),
-            is_secret=var.get("is_secret", False),
-            is_required=var.get("is_required", True),
+            is_secret=var.get("is_secret", var.get("isSecret", False)),
+            is_required=var.get("is_required", var.get("isRequired", True)),
         )
         for var in hint.environment_variables
     ]
 
     return LocalPrepareResponse(
         item_id=item_id,
-        registry_type=hint.registry_type,
+        registry_type=registry_type,
         identifier=hint.identifier,
         install_command=install_command,
         environment_variables=env_vars,
@@ -541,7 +557,7 @@ async def connect_local(
 
     # Build tool config
     config = LocalToolConfig(
-        registry_type=hint.registry_type,
+        registry_type="pip" if hint.registry_type == "pypi" else hint.registry_type,
         identifier=hint.identifier,
         runtime_hint=hint.runtime_hint,
         runtime_arguments=hint.runtime_arguments,
@@ -624,7 +640,12 @@ async def invoke_local(
 ):
     """Invoke a tool on an existing local MCP session.
 
-    The session_id must be from a previous /test/local/connect call.
+    The session_id must be from a previous /test/local/connect OR
+    /test/source/connect call — both create the exact same
+    ContainerSession shape in the same session store, so this endpoint
+    works unmodified for GitHub-source-tested sessions too. There is
+    no separate /test/source/invoke endpoint.
+
     This endpoint calls the MCP server's tools/call method.
     """
     # Validate item exists
@@ -668,6 +689,9 @@ async def invoke_local(
             error=result.error,
             duration_ms=result.duration_ms,
             user_message=result.user_message,
+            requires_auth=result.requires_auth,
+            auth_reason=result.auth_reason,
+            show_token_input=result.requires_auth,
         )
 
     except Exception as exc:
@@ -699,6 +723,9 @@ async def disconnect_local(
     2. Cleans up any temporary files
     3. Invalidates the session_id
 
+    Works unmodified for sessions from /test/source/connect too, for the
+    same reason as invoke_local above — same ContainerSession store.
+
     The user must connect again if they want to test more tools.
     """
     # Validate item exists
@@ -727,3 +754,218 @@ async def disconnect_local(
         status="ok",
         message="Session disconnected and container destroyed.",
     )
+
+
+# ---------------------------------------------------------------------------
+# GitHub-Source MCP Tool Testing Endpoints (no registry package/remote info —
+# run config is derived lazily from the repo itself via extract_local_run_config)
+# ---------------------------------------------------------------------------
+
+# NEW-ASSUMPTION: naive per-worker cache. Registry hints (local_stdio /
+# remote) are cheap/sync so they don't need this, but extraction here hits
+# the GitHub API, so it's worth caching across prepare -> connect calls for
+# the same item. If the app runs multiple workers/processes this will be
+# inconsistent per-worker; acceptable for now (worst case = re-extraction,
+# not wrong behavior). Swap for a shared cache (redis) if one already exists.
+_run_config_cache: dict[str, LocalRunConfig] = {}
+
+
+async def _require_source_testable(
+    item_id: UUID,
+    repository: ItemRepository,
+) -> GithubSourceHint:
+    """Classify an item and return the GithubSourceHint.
+
+    Raises HTTPException(400) if the item is not a bare GitHub-source tool.
+    """
+    item = await _require_item(item_id, repository)
+    classification = classify_tool(item)
+
+    if classification.mode != "local_source":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                classification.reason
+                or "This tool cannot be tested as a GitHub-source server."
+            ),
+        )
+
+    if not classification.detail or not isinstance(classification.detail, GithubSourceHint):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="GitHub-source item has no source hint",
+        )
+
+    return classification.detail
+
+
+async def _get_or_extract_run_config(item_id: UUID, item) -> LocalRunConfig:
+    run_config = _run_config_cache.get(str(item_id))
+    if run_config is None:
+        run_config = await extract_local_run_config(item)
+        _run_config_cache[str(item_id)] = run_config
+    return run_config
+
+
+# ---------------------------------------------------------------------------
+# POST /items/{item_id}/test/source/prepare
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{item_id}/test/source/prepare",
+    response_model=SourcePrepareResponse,
+    summary="Prepare GitHub-source tool test - extract run config, get env var names",
+)
+async def prepare_source_test(
+    item_id: UUID,
+    repository: ItemRepository = Depends(get_item_repository),
+):
+    """Classify + extract the run config for a bare GitHub-source item.
+
+    Unlike /test/local/prepare (where the registry already declares
+    install_command/env vars), here nothing is known upfront — this
+    endpoint runs extract_local_run_config(item), which reads the repo's
+    manifest / README / file tree (in that priority order, see
+    app/sandbox/extract.py) to derive it.
+
+    Returns one of three states for the frontend:
+    - "not_runnable": heuristic fallback only found an installable
+      runtime, no runnable command — show info panel, no Test button.
+    - "needs_auth": env var *names* were found (in manifest or README
+      config) — render the credential form, same as the local_stdio flow.
+    - "ready": no env vars required, frontend can call /test/source/connect
+      directly.
+    """
+    item = await _require_item(item_id, repository)
+    await _require_source_testable(item_id, repository)
+
+    run_config = await _get_or_extract_run_config(item_id, item)
+
+    if not run_config.command:
+        # Heuristic tier with install-only info, or nothing structured
+        # found at all — same "can install, can't run" case flagged in
+        # extract.py's heuristic tier docstring.
+        return SourcePrepareResponse(
+            item_id=item_id,
+            status="not_runnable",
+            source=run_config.source,
+            runtime=run_config.runtime,
+            install_command=run_config.install_command,
+            reason="Could not determine a run command for this repo from "
+                   "its manifest, README, or file tree.",
+        )
+
+    return SourcePrepareResponse(
+        item_id=item_id,
+        status="needs_auth" if run_config.env_vars else "ready",
+        source=run_config.source,
+        runtime=run_config.runtime,
+        install_command=run_config.install_command,
+        environment_variables=run_config.env_vars,  # names only, per schema
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /items/{item_id}/test/source/connect
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{item_id}/test/source/connect",
+    response_model=SourceConnectResponse,
+    summary="Connect to a GitHub-source MCP server (build/pull image, sandbox, MCP handshake)",
+)
+async def connect_source(
+    item_id: UUID,
+    body: SourceConnectRequest,
+    repository: ItemRepository = Depends(get_item_repository),
+):
+    """Build/select a sandbox image, start the container, and connect.
+
+    Mirrors connect_local() above almost exactly — same error handling,
+    same LocalMCPClient — the only difference is create_container_from_source
+    is used instead of create_container, since the run config here comes
+    from repo extraction (Dockerfile / manifest / README / heuristic)
+    rather than a registry package hint.
+
+    create_container_from_source internally:
+    - prefers the repo's own Dockerfile if present, else a generic
+      per-runtime base image
+    - runs the conditional install step (docker exec ... install_command)
+      when a manifest/heuristic command needs deps installed and no
+      Dockerfile build already handled it
+    - applies the same network/resource limits as the registry-package path
+
+    On success the returned session_id is used with the existing
+    /test/local/invoke and /test/local/disconnect endpoints — there is no
+    separate /test/source/invoke or /test/source/disconnect.
+    """
+    item = await _require_item(item_id, repository)
+    hint = await _require_source_testable(item_id, repository)
+
+    run_config = await _get_or_extract_run_config(item_id, item)
+
+    if not run_config.command:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No runnable command was found for this repo. Call "
+                   "/test/source/prepare first to see why.",
+        )
+
+    missing = [v for v in run_config.env_vars if v not in body.env_vars]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Missing required env vars: {missing}",
+        )
+
+    container_manager = get_container_manager()
+
+    try:
+        session = await container_manager.create_container_from_source(
+            item=item,
+            github_hint=hint,
+            run_config=run_config,
+            env_vars=body.env_vars,
+        )
+
+        mcp_client = LocalMCPClient()
+        connect_result = await mcp_client.connect(
+            command=[run_config.command, *run_config.args],
+            env_vars=body.env_vars,
+            timeout=60.0,
+            container_id=session.container_id,
+        )
+
+        if not connect_result.connected:
+            await container_manager.destroy_container(session.session_id)
+            return SourceConnectResponse(
+                connected=False,
+                error=connect_result.error,
+                user_message=connect_result.user_message,
+                show_token_input=connect_result.auth_reason == "unauthorized",
+            )
+
+        session.status = "running"
+        session.mcp_client = mcp_client
+
+        return SourceConnectResponse(
+            connected=True,
+            session_id=session.session_id,
+            tools=[tool.to_dict() for tool in connect_result.tools],
+        )
+
+    except ValueError as exc:
+        # Session limit exceeded — same per-user concurrent-limit check
+        # create_container already enforces.
+        return SourceConnectResponse(
+            connected=False,
+            error=str(exc),
+            user_message=str(exc),
+            show_retry=False,
+        )
+    except Exception as exc:
+        return SourceConnectResponse(
+            connected=False,
+            error=str(exc),
+            user_message=f"Failed to start GitHub-source MCP server: {exc}",
+        )

@@ -66,3 +66,8 @@ def test_local_tool_config_builds_pip_command():
     assert cmd[0] == "sh"
     assert cmd[1] == "-c"
     assert "pipx run weather-ai-mcp" in cmd[2]
+
+
+def test_tool_level_auth_error_is_exposed_for_credential_retry():
+    assert LocalMCPClient()._looks_like_auth_error("API key is required") is True
+    assert LocalMCPClient()._looks_like_auth_error("Tool returned an invalid query") is False

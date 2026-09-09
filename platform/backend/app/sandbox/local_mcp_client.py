@@ -59,6 +59,8 @@ class LocalInvokeResult:
     error: str | None = None
     duration_ms: int = 0
     user_message: str | None = None
+    requires_auth: bool = False
+    auth_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +317,18 @@ class LocalMCPClient:
             duration_ms = int((time.monotonic() - start_time) * 1000)
 
             if result.get("error"):
+                error_text = str(result["error"])
+                requires_auth = self._looks_like_auth_error(error_text)
                 return LocalInvokeResult(
                     status="error",
-                    error=result["error"],
+                    error=error_text,
                     duration_ms=duration_ms,
-                    user_message=f"Tool invocation failed: {result['error']}",
+                    user_message=(
+                        "This tool needs credentials. Add the required token or API key and try again."
+                        if requires_auth else f"Tool invocation failed: {error_text}"
+                    ),
+                    requires_auth=requires_auth,
+                    auth_reason="unauthorized" if requires_auth else None,
                 )
 
             return LocalInvokeResult(
@@ -335,11 +344,27 @@ class LocalMCPClient:
                 user_message="The tool took too long to respond.",
             )
         except Exception as exc:
+            error_text = str(exc)
+            requires_auth = self._looks_like_auth_error(error_text)
             return LocalInvokeResult(
                 status="error",
-                error=str(exc),
-                user_message=f"Tool invocation failed: {exc}",
+                error=error_text,
+                user_message=(
+                    "This tool needs credentials. Add the required token or API key and try again."
+                    if requires_auth else f"Tool invocation failed: {error_text}"
+                ),
+                requires_auth=requires_auth,
+                auth_reason="unauthorized" if requires_auth else None,
             )
+
+    @staticmethod
+    def _looks_like_auth_error(message: str) -> bool:
+        text = message.lower()
+        return any(marker in text for marker in (
+            "unauthorized", "authentication required", "authentication failed",
+            "api key", "access token", "bearer token", "invalid token",
+            "missing token", "credentials required", "permission denied",
+        ))
 
     async def disconnect(self) -> None:
         """Disconnect from the MCP server and clean up."""

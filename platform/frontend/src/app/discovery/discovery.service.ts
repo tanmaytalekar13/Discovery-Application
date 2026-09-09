@@ -23,6 +23,9 @@ import {
   LocalInvokeResponse,
   LocalDisconnectRequest,
   LocalDisconnectResponse,
+  SourcePrepareResponse,
+  SourceConnectRequest,
+  SourceConnectResponse,
 } from './models';
 
 export type DiscoveryResult = SearchResponse | DiscoveryError;
@@ -278,4 +281,33 @@ export class DiscoveryService {
       });
     };
   }
+    /**
+   * POST /api/items/{item_id}/test/source/prepare
+   * Extract run config from the repo (manifest/README/heuristic) and
+   * report whether it's ready, needs env vars, or isn't runnable at all.
+   */
+  prepareSourceTest(itemId: string): Observable<SourcePrepareResponse> {
+    return this.http.post<SourcePrepareResponse>(
+      `${this.apiBase}/items/${itemId}/test/source/prepare`,
+      null,
+    );
+  }
+
+  /**
+   * POST /api/items/{item_id}/test/source/connect
+   * Build/select a sandbox image, start the container, and connect.
+   * Returns a session_id — use it with the EXISTING invokeLocal() and
+   * disconnectLocal() methods above, there is no separate source/invoke
+   * or source/disconnect endpoint (same session store on the backend).
+   */
+  connectSource(
+    itemId: string,
+    body: SourceConnectRequest,
+  ): Observable<SourceConnectResponse> {
+    return this.http.post<SourceConnectResponse>(
+      `${this.apiBase}/items/${itemId}/test/source/connect`,
+      body,
+    );
+  }
 }
+
