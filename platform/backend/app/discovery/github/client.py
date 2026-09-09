@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,22 +21,6 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_RESULTS = 20
 DEFAULT_MAX_CONCURRENT = 4
 
-# These words describe the protocol, not the service the user is looking for.
-# Keeping them out of the service portion of a GitHub query makes
-# ``google-calendar`` and ``Google Calendar MCP server`` converge on the same
-# repository search, while adding one MCP constraint below.
-_QUERY_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
-_PROTOCOL_QUERY_TERMS = {
-    "mcp",
-    "model",
-    "context",
-    "protocol",
-    "server",
-    "servers",
-    "tool",
-    "tools",
-}
-
 
 class GitHubDiscoveryError(RuntimeError):
     """Base error for GitHub discovery failures."""
@@ -49,19 +32,6 @@ class GitHubRateLimitError(GitHubDiscoveryError):
 
 class GitHubAPIError(GitHubDiscoveryError):
     """Raised for non-success GitHub API responses."""
-
-
-def github_mcp_search_query(query: str) -> str:
-    """Build a GitHub repository query that preserves service intent.
-
-    GitHub treats whitespace-separated terms as AND terms.  Normalising hyphens
-    and removing protocol boilerplate means all supported query spellings use
-    the same service terms, and the explicit ``mcp`` term prevents generic
-    Google/Slack repositories from consuming the result window.
-    """
-    tokens = _QUERY_TOKEN_PATTERN.findall(query.lower())
-    service_terms = [term for term in tokens if term not in _PROTOCOL_QUERY_TERMS]
-    return " ".join([*service_terms, "mcp"]) if service_terms else "mcp"
 
 
 @dataclass(frozen=True)
@@ -124,23 +94,28 @@ class GitHubDiscoveryAdapter:
         query: str,
         max_results: int = DEFAULT_MAX_RESULTS,
     ) -> list[GitHubCandidate]:
-        """Search repositories and return positively classified candidates."""
+        """Search repositories and return positively classified candidates.
+
+        Each repository is classified in isolation: if one repo's
+        classification fails (private repo, network timeout, secondary
+        rate limit, etc.) it must not discard results already obtained
+        for the other repositories in the batch. Only if *every*
+        attempted repository fails do we treat this as a hard failure
+        and propagate an error, since that pattern indicates a genuine
+        outage/rate-limit rather than one flaky repo.
+        """
         if not query.strip():
             raise ValueError("GitHub discovery query must not be empty")
 
         if max_results < 1:
             raise ValueError("max_results must be at least 1")
 
-        # Ask GitHub for a wider *retrieval* window than the requested result
-        # count. GitHub's popularity-biased API ordering must not decide which
-        # low-star but relevant server gets a chance to be protocol classified.
-        retrieval_limit = min(100, max(max_results, max_results * 3, 30))
         payload = await self._request(
             "GET",
             "/search/repositories",
             params={
-                "q": github_mcp_search_query(query),
-                "per_page": retrieval_limit,
+                "q": query,
+                "per_page": min(max_results, 100),
                 "page": 1,
             },
         )
@@ -148,26 +123,48 @@ class GitHubDiscoveryAdapter:
         repositories = payload.get("items", [])
 
         if not isinstance(repositories, list):
-            raise GitHubAPIError("GitHub search response has an invalid 'items' field")
+            raise GitHubAPIError(
+                "GitHub search response has an invalid 'items' field"
+            )
 
         semaphore = asyncio.Semaphore(self._max_concurrent)
 
         async def classify(
             repo: dict[str, Any],
-        ) -> GitHubCandidate | None:
+        ) -> GitHubCandidate | GitHubDiscoveryError | None:
             async with semaphore:
-                return await self._classify_repository(repo)
+                try:
+                    return await self._classify_repository(repo)
+                except GitHubDiscoveryError as exc:
+                    # Isolate this repo's failure so one bad repo
+                    # (404, timeout, rate limit, etc.) can't sink the
+                    # whole batch via asyncio.gather's fail-fast
+                    # behaviour.
+                    return exc
 
-        results = await asyncio.gather(
-            *(classify(repo) for repo in repositories[:retrieval_limit])
+        raw_results = await asyncio.gather(
+            *(classify(repo) for repo in repositories[:max_results])
         )
 
-        # ``repositories`` remains GitHub-ranked only for retrieval. Returning
-        # the first classified matches keeps the caller's limit intact; final
-        # cross-source relevance ranking happens after catalog merging.
-        return [candidate for candidate in results if candidate is not None][
-            :max_results
+        candidates = [
+            result
+            for result in raw_results
+            if isinstance(result, GitHubCandidate)
         ]
+
+        errors = [
+            result
+            for result in raw_results
+            if isinstance(result, GitHubDiscoveryError)
+        ]
+
+        # If every attempted repo failed, this is a genuine outage or
+        # rate-limit situation, not a one-off flaky repo. Surface the
+        # first error so callers can mark the source as failed.
+        if errors and not candidates:
+            raise errors[0]
+
+        return candidates
 
     async def discover_mcp(
         self,
@@ -212,7 +209,10 @@ class GitHubDiscoveryAdapter:
 
         return GitHubCandidate(
             repository=full_name,
-            name=str(repo.get("name") or full_name.rsplit("/", 1)[-1]),
+            name=str(
+                repo.get("name")
+                or full_name.rsplit("/", 1)[-1]
+            ),
             html_url=str(repo.get("html_url") or ""),
             clone_url=str(repo.get("clone_url") or ""),
             default_branch=repo.get("default_branch"),
@@ -239,9 +239,14 @@ class GitHubDiscoveryAdapter:
         root_entries = root_entries or []
 
         name = str(repo.get("name") or "").lower()
-        description = str(repo.get("description") or "").lower()
+        description = str(
+            repo.get("description") or ""
+        ).lower()
 
-        topics = " ".join(str(topic).lower() for topic in repo.get("topics", []) or [])
+        topics = " ".join(
+            str(topic).lower()
+            for topic in repo.get("topics", []) or []
+        )
 
         text = " ".join(
             (
@@ -252,7 +257,10 @@ class GitHubDiscoveryAdapter:
             )
         )
 
-        paths = [str(entry.get("path") or "").lower() for entry in root_entries]
+        paths = [
+            str(entry.get("path") or "").lower()
+            for entry in root_entries
+        ]
 
         mcp_evidence: list[str] = []
         a2a_evidence: list[str] = []
@@ -268,11 +276,15 @@ class GitHubDiscoveryAdapter:
             )
 
         if any(
-            "mcp" in path and path.endswith((".json", ".yaml", ".yml", ".toml", ".md"))
+            "mcp" in path
+            and path.endswith(
+                (".json", ".yaml", ".yml", ".toml", ".md")
+            )
             for path in paths
         ):
             mcp_evidence.append(
-                "repository contains an MCP-related " "configuration/documentation file"
+                "repository contains an MCP-related "
+                "configuration/documentation file"
             )
 
         if any(
@@ -284,22 +296,33 @@ class GitHubDiscoveryAdapter:
                 "@mcp.tool",
             )
         ):
-            mcp_evidence.append("documentation contains MCP protocol/tool evidence")
+            mcp_evidence.append(
+                "documentation contains MCP protocol/tool evidence"
+            )
 
         # ---------------------------------------------------------
         # A2A evidence
         # ---------------------------------------------------------
 
-        if "agent card" in text or "a2a agent" in text or "agent2agent" in text:
+        if (
+            "agent card" in text
+            or "a2a agent" in text
+            or "agent2agent" in text
+        ):
             a2a_evidence.append(
-                "repository metadata/documentation " "mentions A2A/Agent Card"
+                "repository metadata/documentation "
+                "mentions A2A/Agent Card"
             )
 
         if any(
-            "agent-card" in path or "agent_card" in path or "well-known" in path
+            "agent-card" in path
+            or "agent_card" in path
+            or "well-known" in path
             for path in paths
         ):
-            a2a_evidence.append("repository contains Agent Card/.well-known evidence")
+            a2a_evidence.append(
+                "repository contains Agent Card/.well-known evidence"
+            )
 
         if any(
             marker in text
@@ -309,7 +332,9 @@ class GitHubDiscoveryAdapter:
                 "protocolversion",
             )
         ):
-            a2a_evidence.append("documentation contains A2A protocol evidence")
+            a2a_evidence.append(
+                "documentation contains A2A protocol evidence"
+            )
 
         # ---------------------------------------------------------
         # Final classification
@@ -324,7 +349,8 @@ class GitHubDiscoveryAdapter:
         if mcp_evidence and a2a_evidence:
             return (
                 ItemType.TOOL,
-                mcp_evidence + ["repository also contains A2A evidence"],
+                mcp_evidence
+                + ["repository also contains A2A evidence"],
             )
 
         return None
@@ -361,15 +387,28 @@ class GitHubDiscoveryAdapter:
         self,
         full_name: str,
     ) -> list[dict[str, Any]]:
-        payload = await self._request(
-            "GET",
-            f"/repos/{full_name}/contents",
-        )
+        try:
+            payload = await self._request(
+                "GET",
+                f"/repos/{full_name}/contents",
+            )
+        except GitHubAPIError as exc:
+            if "HTTP 404" in str(exc):
+                # Empty repos, or repos whose default branch has no
+                # root contents, legitimately 404 here. This is not
+                # a discovery failure - just means no root entries.
+                return []
+
+            raise
 
         if not isinstance(payload, list):
             return []
 
-        return [entry for entry in payload if isinstance(entry, dict)]
+        return [
+            entry
+            for entry in payload
+            if isinstance(entry, dict)
+        ]
 
     async def _request(
         self,
@@ -388,17 +427,29 @@ class GitHubDiscoveryAdapter:
                 **kwargs,
             )
         except httpx.HTTPError as exc:
-            raise GitHubAPIError(f"GitHub request failed: {exc}") from exc
+            raise GitHubAPIError(
+                f"GitHub request failed: {exc}"
+            ) from exc
 
         if response.status_code in (403, 429):
-            remaining = response.headers.get("X-RateLimit-Remaining")
+            remaining = response.headers.get(
+                "X-RateLimit-Remaining"
+            )
 
-            if response.status_code == 429 or remaining == "0":
-                retry_after = response.headers.get(
-                    "Retry-After"
-                ) or response.headers.get("X-RateLimit-Reset")
+            if (
+                response.status_code == 429
+                or remaining == "0"
+            ):
+                retry_after = (
+                    response.headers.get("Retry-After")
+                    or response.headers.get("X-RateLimit-Reset")
+                )
 
-                suffix = f" Retry after: {retry_after}." if retry_after else ""
+                suffix = (
+                    f" Retry after: {retry_after}."
+                    if retry_after
+                    else ""
+                )
 
                 raise GitHubRateLimitError(
                     "GitHub API rate limit reached "
@@ -416,4 +467,6 @@ class GitHubDiscoveryAdapter:
         try:
             return response.json()
         except ValueError as exc:
-            raise GitHubAPIError("GitHub API returned invalid JSON") from exc
+            raise GitHubAPIError(
+                "GitHub API returned invalid JSON"
+            ) from exc
