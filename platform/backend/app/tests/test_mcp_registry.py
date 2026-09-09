@@ -145,6 +145,36 @@ async def test_search_handles_cursor_pagination():
     assert results[1].server_name == "io.github.example/search"
     assert len(calls) == 2
     assert calls[1].params["cursor"] == "next-page"
+    assert "search" not in calls[0].params
+    assert "version" not in calls[0].params
+
+
+@pytest.mark.asyncio
+async def test_search_filters_locally_and_keeps_the_latest_matching_version():
+    class MockTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            calendar = _server_entry(name="io.example/calendar", version="3.0.0")
+            calendar["server"]["title"] = "Calendar"
+            calendar["server"]["description"] = "Calendar MCP server"
+            return httpx.Response(
+                200,
+                json={
+                    "servers": [
+                        _server_entry(name="io.example/weather", version="1.0.0"),
+                        _server_entry(name="io.example/weather", version="2.0.0"),
+                        calendar,
+                    ],
+                    "metadata": {"count": 3, "nextCursor": None},
+                },
+            )
+
+    client = httpx.AsyncClient(transport=MockTransport())
+    async with MCPRegistryClient(httpx_client=client) as registry:
+        results = await registry.search("weather", max_results=10)
+
+    assert [(result.server_name, result.version) for result in results] == [
+        ("io.example/weather", "2.0.0")
+    ]
 
 
 @pytest.mark.asyncio

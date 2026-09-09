@@ -8,6 +8,7 @@ from app.discovery.github.client import (
     GitHubCandidate,
     GitHubDiscoveryAdapter,
     GitHubRateLimitError,
+    github_mcp_search_query,
 )
 from app.models import DiscoverySource, ItemType, SourceType
 
@@ -79,6 +80,25 @@ def test_rejects_false_positive_repository():
     )
 
     assert result is None
+
+
+@pytest.mark.parametrize(
+    ("raw_query", "expected"),
+    [
+        ("Google Calendar", "google calendar mcp"),
+        ("google calendar mcp", "google calendar mcp"),
+        ("google-calendar", "google calendar mcp"),
+        ("Google Calendar MCP server", "google calendar mcp"),
+        ("Google Meet", "google meet mcp"),
+        ("Slack", "slack mcp"),
+        ("GitHub", "github mcp"),
+        ("Google Drive", "google drive mcp"),
+    ],
+)
+def test_github_query_preserves_service_and_normalizes_protocol_words(
+    raw_query, expected
+):
+    assert github_mcp_search_query(raw_query) == expected
 
 
 def test_candidate_contains_github_provenance():
@@ -158,9 +178,7 @@ async def test_discovery_uses_search_and_repository_evidence():
         base_url="https://api.github.test",
     )
 
-    async with GitHubDiscoveryAdapter(
-        httpx_client=client
-    ) as adapter:
+    async with GitHubDiscoveryAdapter(httpx_client=client) as adapter:
         results = await adapter.discover(
             "mcp",
             max_results=5,
@@ -169,15 +187,14 @@ async def test_discovery_uses_search_and_repository_evidence():
     assert len(results) == 1
     assert results[0].item_type is ItemType.TOOL
     assert results[0].source.type is SourceType.GITHUB
-    assert (
-        results[0].source.id
-        == "example/mcp-server"
-    )
+    assert results[0].source.id == "example/mcp-server"
 
-    assert any(
-        "/search/repositories" in call
-        for call in calls
-    )
+    assert any("/search/repositories" in call for call in calls)
+    search_call = next(call for call in calls if "/search/repositories" in call)
+    assert "q=mcp" in search_call
+    # A wider retrieval window prevents GitHub popularity ordering from
+    # excluding low-star MCP repositories before classification.
+    assert "per_page=30" in search_call
 
 
 @pytest.mark.asyncio
@@ -189,9 +206,7 @@ async def test_rate_limit_is_explicit():
                 headers={
                     "X-RateLimit-Remaining": "0",
                 },
-                json={
-                    "message": "API rate limit exceeded"
-                },
+                json={"message": "API rate limit exceeded"},
             )
 
     client = httpx.AsyncClient(
@@ -199,9 +214,7 @@ async def test_rate_limit_is_explicit():
         base_url="https://api.github.test",
     )
 
-    async with GitHubDiscoveryAdapter(
-        httpx_client=client
-    ) as adapter:
+    async with GitHubDiscoveryAdapter(httpx_client=client) as adapter:
         with pytest.raises(GitHubRateLimitError):
             await adapter.discover(
                 "mcp",
@@ -215,9 +228,7 @@ async def test_api_error_is_explicit():
         async def handle_async_request(self, request):
             return httpx.Response(
                 500,
-                json={
-                    "message": "server error"
-                },
+                json={"message": "server error"},
             )
 
     client = httpx.AsyncClient(
@@ -225,9 +236,7 @@ async def test_api_error_is_explicit():
         base_url="https://api.github.test",
     )
 
-    async with GitHubDiscoveryAdapter(
-        httpx_client=client
-    ) as adapter:
+    async with GitHubDiscoveryAdapter(httpx_client=client) as adapter:
         with pytest.raises(GitHubAPIError):
             await adapter.discover(
                 "mcp",

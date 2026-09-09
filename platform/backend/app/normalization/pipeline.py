@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from app.config import Settings
@@ -429,9 +430,10 @@ class Phase10Pipeline:
     def _deduplicate(items: list[Item]) -> list[Item]:
         groups: dict[str, Item] = {}
         for item in items:
-            current = groups.get(item.canonical_id or str(item.item_id))
+            key = _item_deduplication_key(item)
+            current = groups.get(key)
             if current is None:
-                groups[item.canonical_id or str(item.item_id)] = item
+                groups[key] = item
                 continue
             current.provenance = _merge_sources(current.provenance, item.provenance)
             current.evidence = _merge_evidence(current.evidence, item.evidence)
@@ -746,3 +748,15 @@ def _candidate_version(candidate: CandidateReference) -> str | None:
 
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
+
+
+def _item_deduplication_key(item: Item) -> str:
+    """Prefer a source repository identity when two providers found the same tool."""
+    source_url = item.artifacts.source_url
+    if source_url:
+        parsed = urlsplit(str(source_url))
+        path = parsed.path.rstrip("/").removesuffix(".git")
+        repository = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+        tool_name = item.tool.tool_name.lower() if item.tool is not None else ""
+        return f"repository|{repository}|{item.type.value}|{tool_name}"
+    return item.canonical_id or str(item.item_id)

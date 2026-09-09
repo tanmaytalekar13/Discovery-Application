@@ -8,13 +8,17 @@ before entering the trusted catalog.
 Official API:
     https://registry.modelcontextprotocol.io/v0.1/servers
 
-The official registry exposes cursor-based pagination and supports search
-and latest-version filtering.
+The official registry exposes cursor-based pagination.  It does *not*
+support arbitrary ``search`` or ``version=latest`` list parameters; those
+parameters were added by an earlier implementation and make live registry
+discovery fail.  Query matching and latest-version selection therefore happen
+locally after reading valid list pages.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 import httpx
@@ -105,26 +109,19 @@ class MCPRegistryClient:
         query: str | None = None,
         max_results: int = DEFAULT_MCP_REGISTRY_MAX_RESULTS,
     ) -> list[MCPRegistryCandidate]:
-        """Search the registry using bounded cursor pagination.
-
-        ``version=latest`` prevents multiple historical versions of the same
-        server from flooding a discovery result set.
-        """
+        """Return query-matching latest servers from valid list pages."""
         if query is not None and not query.strip():
             raise ValueError("MCP Registry search query must not be empty")
         if max_results < 1:
             raise ValueError("max_results must be at least 1")
 
-        candidates: list[MCPRegistryCandidate] = []
+        candidates_by_name: dict[str, MCPRegistryCandidate] = {}
         cursor: str | None = None
 
         for _ in range(self._max_pages):
             params: dict[str, Any] = {
-                "limit": min(self._page_size, max_results - len(candidates)),
-                "version": "latest",
+                "limit": self._page_size,
             }
-            if query:
-                params["search"] = query.strip()
             if cursor:
                 params["cursor"] = cursor
 
@@ -138,10 +135,10 @@ class MCPRegistryClient:
 
             for entry in entries:
                 candidate = self._parse_candidate(entry)
-                if candidate is not None:
-                    candidates.append(candidate)
-                    if len(candidates) >= max_results:
-                        return candidates[:max_results]
+                if candidate is not None and self._matches_query(candidate, query):
+                    existing = candidates_by_name.get(candidate.server_name)
+                    if existing is None or self._is_newer(candidate, existing):
+                        candidates_by_name[candidate.server_name] = candidate
 
             metadata = payload.get("metadata")
             if not isinstance(metadata, dict):
@@ -157,7 +154,37 @@ class MCPRegistryClient:
 
             cursor = next_cursor
 
-        return candidates[:max_results]
+        return list(candidates_by_name.values())[:max_results]
+
+    @staticmethod
+    def _matches_query(candidate: MCPRegistryCandidate, query: str | None) -> bool:
+        """Match a user query without relying on unsupported API filters."""
+        if query is None:
+            return True
+        terms = [term for term in re.findall(r"[a-z0-9]+", query.lower()) if len(term) > 1]
+        if not terms:
+            return True
+        haystack = " ".join(
+            value.lower()
+            for value in (candidate.server_name, candidate.title or "", candidate.description)
+        )
+        return all(term in haystack for term in terms)
+
+    @staticmethod
+    def _is_newer(
+        candidate: MCPRegistryCandidate,
+        existing: MCPRegistryCandidate,
+    ) -> bool:
+        """Use a forgiving version key; registry versions are not always SemVer."""
+        def key(version: str) -> tuple[tuple[int, str], ...]:
+            import re
+
+            return tuple(
+                (int(part), "") if part.isdigit() else (-1, part.lower())
+                for part in re.findall(r"\d+|[A-Za-z]+", version)
+            )
+
+        return key(candidate.version) > key(existing.version)
 
     async def get_latest(
         self,

@@ -203,6 +203,43 @@ async def test_phase10_accepts_github_mcp_candidate_and_exposes_repository_artif
 
 
 @pytest.mark.asyncio
+async def test_phase10_merges_same_repository_from_multiple_discovery_sources():
+    repo = FakeRepository()
+    settings = Settings(
+        arcadedb_host="localhost",
+        arcadedb_database="test",
+        arcadedb_user="root",
+        arcadedb_password="root",
+    )
+    candidates = [
+        CandidateReference(
+            protocol="mcp",
+            item_type=ItemType.TOOL,
+            source_type=source_type,
+            source_provider=provider,
+            source_id=source_id,
+            url="https://github.com/A1-x-Tech/mcp-google-calendar",
+            repository_url="https://github.com/A1-x-Tech/mcp-google-calendar",
+            title="mcp-google-calendar",
+            description="Google Calendar Model Context Protocol server",
+            evidence=("repository explicitly identifies an MCP server",),
+        )
+        for source_type, provider, source_id in (
+            (SourceType.GITHUB, "GitHub", "A1-x-Tech/mcp-google-calendar"),
+            (SourceType.CONFIGURED, "MCP Registry", "io.github.A1-x-Tech/calendar"),
+        )
+    ]
+
+    result = await Phase10Pipeline(repo, settings).process(candidates)
+
+    assert len(result.approved) == 1
+    assert {source.provider for source in result.approved[0].provenance} == {
+        "GitHub",
+        "MCP Registry",
+    }
+
+
+@pytest.mark.asyncio
 async def test_phase10_accepts_mcp_registry_candidate_and_exposes_registry_artifacts():
     repo = FakeRepository()
     settings = Settings(

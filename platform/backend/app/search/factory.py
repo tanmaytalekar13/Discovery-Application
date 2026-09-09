@@ -19,18 +19,8 @@ from __future__ import annotations
 import httpx
 
 from app.config import Settings
-from app.discovery.a2a_registry.client import A2ARegistryClient
-from app.discovery.awesome_list.client import AwesomeListAdapter
 from app.discovery.github.client import GitHubDiscoveryAdapter
-from app.discovery.github_topics.client import GitHubTopicsAdapter
 from app.discovery.mcp_registry.client import MCPRegistryClient
-from app.discovery.npm.client import NpmDiscoveryAdapter
-from app.discovery.web_extraction.client import WebExtractionAdapter
-from app.discovery.web_search.client import (
-    FirecrawlWebSearchProvider,
-    WebSearchDiscoveryAdapter,
-)
-from app.search.a2a_adapter import A2ADiscoveryAdapter
 from app.search.mcp_adapter import MCPDiscoveryAdapter
 from app.search.orchestrator import DiscoveryOrchestrator
 
@@ -49,68 +39,21 @@ def build_mcp_adapter(
         else None
     )
 
-    github_topics = (
-        GitHubTopicsAdapter(
-            token=settings.github_token,
-            httpx_client=httpx_client,
-        )
-        if settings.enable_github_discovery
-        else None
-    )
-
     mcp_registry = (
         MCPRegistryClient(httpx_client=httpx_client)
         if settings.enable_mcp_registry_discovery
         else None
     )
 
-    npm = (
-        NpmDiscoveryAdapter(httpx_client=httpx_client)
-        if settings.enable_npm_discovery
-        else None
-    )
-
-    awesome_list = (
-        AwesomeListAdapter(httpx_client=httpx_client)
-        if settings.enable_awesome_list_discovery
-        else None
-    )
-
-    # Web search is built but passed to mcp_adapter as Tier 2 fallback.
-    # The mcp_adapter itself decides whether to run it based on Tier 1 results.
-    web_search = None
-    if settings.enable_web_search_discovery and settings.firecrawl_api_key:
-        provider = FirecrawlWebSearchProvider(
-            api_key=settings.firecrawl_api_key,
-            httpx_client=httpx_client,
-        )
-        web_search = WebSearchDiscoveryAdapter(provider)
-
-    web_extraction_urls = settings.web_extraction_url_list
-    web_extraction = _build_web_extraction_adapter(settings, httpx_client=httpx_client)
-
     if (
         github is None
-        and github_topics is None
         and mcp_registry is None
-        and npm is None
-        and awesome_list is None
-        and web_search is None
-        and (web_extraction is None or not web_extraction_urls)
-        and not settings.configured_mcp_endpoint_list
     ):
         return None
 
     return MCPDiscoveryAdapter(
         github=github,
-        github_topics=github_topics,
         mcp_registry=mcp_registry,
-        npm=npm,
-        awesome_list=awesome_list,
-        web_search=web_search,
-        web_extraction=web_extraction,
-        extraction_urls=web_extraction_urls,
-        configured_endpoints=settings.configured_mcp_endpoint_list,
     )
 
 
@@ -118,57 +61,13 @@ def build_a2a_adapter(
     settings: Settings,
     *,
     httpx_client: httpx.AsyncClient | None = None,
-) -> A2ADiscoveryAdapter | None:
-    github = (
-        GitHubDiscoveryAdapter(
-            token=settings.github_token,
-            httpx_client=httpx_client,
-        )
-        if settings.enable_github_discovery
-        else None
-    )
+) -> None:
+    """A2A and all web-derived discovery are deliberately disabled.
 
-    a2a_registries: tuple[A2ARegistryClient, ...] = ()
-    if settings.enable_a2a_registry_discovery:
-        a2a_registries = tuple(
-            A2ARegistryClient(base_url=base_url, httpx_client=httpx_client)
-            for base_url in settings.a2a_registry_base_url_list
-        )
-
-    web_search = None
-    if settings.enable_web_search_discovery and settings.firecrawl_api_key:
-        provider = FirecrawlWebSearchProvider(
-            api_key=settings.firecrawl_api_key,
-            httpx_client=httpx_client,
-        )
-        web_search = WebSearchDiscoveryAdapter(provider)
-
-    web_extraction_urls = settings.web_extraction_url_list
-    web_extraction = _build_web_extraction_adapter(settings, httpx_client=httpx_client)
-
-    well_known_hosts: tuple[str, ...] = ()
-    if settings.enable_well_known_a2a:
-        well_known_hosts = settings.well_known_agent_host_list
-
-    if (
-        github is None
-        and not a2a_registries
-        and web_search is None
-        and (web_extraction is None or not web_extraction_urls)
-        and not well_known_hosts
-        and not settings.configured_agent_card_url_list
-    ):
-        return None
-
-    return A2ADiscoveryAdapter(
-        github=github,
-        a2a_registries=a2a_registries,
-        web_search=web_search,
-        web_extraction=web_extraction,
-        extraction_urls=web_extraction_urls,
-        well_known_hosts=well_known_hosts,
-        configured_agent_card_urls=settings.configured_agent_card_url_list,
-    )
+    The product now uses only GitHub and the official MCP Registry.
+    Kept as a small compatibility boundary for callers importing this factory.
+    """
+    return None
 
 
 def build_orchestrator(
@@ -233,21 +132,4 @@ def build_application_search_service(settings: Settings, db_client):
         phase11=phase11,
         orchestrator=orchestrator,
         phase10_pipeline=phase10,
-    )
-
-
-def _build_web_extraction_adapter(
-    settings: Settings,
-    *,
-    httpx_client: httpx.AsyncClient | None,
-) -> WebExtractionAdapter | None:
-    if not settings.enable_web_extraction:
-        return None
-    return WebExtractionAdapter(
-        httpx_client=httpx_client,
-        timeout_seconds=settings.web_extraction_timeout_seconds,
-        max_redirects=settings.web_extraction_max_redirects,
-        max_response_bytes=settings.web_extraction_max_response_bytes,
-        user_agent=settings.web_extraction_user_agent,
-        respect_robots=settings.web_extraction_respect_robots,
     )

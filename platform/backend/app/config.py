@@ -30,59 +30,16 @@ class Settings(BaseSettings):
     # flag is left on, rather than attempted with empty configuration.
     enable_github_discovery: bool = False
     enable_mcp_registry_discovery: bool = False
-    enable_a2a_registry_discovery: bool = False
-    enable_npm_discovery: bool = False
-    enable_awesome_list_discovery: bool = False
-    enable_web_search_discovery: bool = False
-    enable_web_extraction: bool = False
-    enable_well_known_a2a: bool = True
+    # Only GitHub and the official MCP Registry are live discovery sources.
 
     github_token: str = ""
-    firecrawl_api_key: str = ""
-
-    # Comma-separated lists (kept as plain strings so `.env` stays
-    # simple - Section 32: "Provider URLs, credentials, limits and
-    # concurrency must be configuration-driven.").
-    a2a_registry_base_urls: str = ""
-    well_known_agent_hosts: str = ""
-    configured_mcp_endpoints: str = ""
-    configured_agent_card_urls: str = ""
-    web_extraction_urls: str = ""
-    web_extraction_timeout_seconds: float = Field(default=10.0, gt=0)
-    web_extraction_max_redirects: int = Field(default=5, ge=0)
-    web_extraction_max_response_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
-    web_extraction_respect_robots: bool = True
-    web_extraction_user_agent: str = "DiscoveryApplicationBot/0.1"
-
     discovery_max_results_per_source: int = Field(default=20, ge=1, le=100)
-
-    def _split_csv(self, value: str) -> tuple[str, ...]:
-        return tuple(item.strip() for item in value.split(",") if item.strip())
 
     @field_validator("discovery_mode")
     @classmethod
     def normalize_discovery_mode(cls, value: str) -> str:
         return "cached" if value == "mock" else value
 
-    @property
-    def a2a_registry_base_url_list(self) -> tuple[str, ...]:
-        return self._split_csv(self.a2a_registry_base_urls)
-
-    @property
-    def well_known_agent_host_list(self) -> tuple[str, ...]:
-        return self._split_csv(self.well_known_agent_hosts)
-
-    @property
-    def configured_mcp_endpoint_list(self) -> tuple[str, ...]:
-        return self._split_csv(self.configured_mcp_endpoints)
-
-    @property
-    def configured_agent_card_url_list(self) -> tuple[str, ...]:
-        return self._split_csv(self.configured_agent_card_urls)
-
-    @property
-    def web_extraction_url_list(self) -> tuple[str, ...]:
-        return self._split_csv(self.web_extraction_urls)
 
 
 @lru_cache

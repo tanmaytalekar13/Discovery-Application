@@ -14,50 +14,51 @@ def _make_serializable(obj: Any, max_depth: int = 10, current_depth: int = 0) ->
     """
     if current_depth > max_depth:
         return str(obj)
-    
+
     # Handle None and primitive types
     if obj is None:
         return None
-    
+
     if isinstance(obj, (str, int, float, bool)):
         return obj
-    
+
     # Handle datetime and UUID
     if isinstance(obj, (datetime, UUID)):
         return str(obj)
-    
+
     # Handle dicts
     if isinstance(obj, dict):
         return {
             str(k): _make_serializable(v, max_depth, current_depth + 1)
             for k, v in obj.items()
         }
-    
+
     # Handle lists and tuples
     if isinstance(obj, (list, tuple)):
         return [_make_serializable(item, max_depth, current_depth + 1) for item in obj]
-    
+
     # Handle Pydantic models
     if hasattr(obj, "model_dump"):
         try:
-            return _make_serializable(obj.model_dump(mode="json"), max_depth, current_depth + 1)
+            return _make_serializable(
+                obj.model_dump(mode="json"), max_depth, current_depth + 1
+            )
         except Exception:
             pass
-    
+
     # Handle enums
     if hasattr(obj, "value"):
         return _make_serializable(obj.value, max_depth, current_depth + 1)
-    
+
     # Handle objects with __dict__
     if hasattr(obj, "__dict__"):
         try:
             return _make_serializable(vars(obj), max_depth, current_depth + 1)
         except Exception:
             pass
-    
+
     # Fallback: convert to string
     return str(obj)
-
 
 
 def _prepare_value(value: Any) -> Any:
@@ -244,22 +245,47 @@ class ItemRepository:
             where_clauses.append("type = :type")
             params["type"] = item_type
 
+        # Protocol boilerplate should not make a service search narrower.  For
+        # example, a catalog item named "Google Calendar" remains eligible for
+        # "Google Calendar MCP server" even if its stored metadata omits those
+        # generic words.
+        generic_query_terms = {
+            "mcp",
+            "model",
+            "context",
+            "protocol",
+            "server",
+            "servers",
+            "tool",
+            "tools",
+            "agent",
+            "agents",
+        }
         cleaned_keywords = [
-            keyword.strip().lower() for keyword in keywords if keyword.strip()
+            keyword.strip().lower()
+            for keyword in keywords
+            if keyword.strip() and keyword.strip().lower() not in generic_query_terms
         ]
         if cleaned_keywords:
             keyword_clauses: list[str] = []
             for index, keyword in enumerate(cleaned_keywords[:10]):
                 key = f"keyword_{index}"
                 params[key] = f"%{keyword}%"
-                keyword_clauses.extend(
-                    [
-                        f"name.toLowerCase() LIKE :{key}",
-                        f"description.toLowerCase() LIKE :{key}",
-                        f"source_id.toLowerCase() LIKE :{key}",
-                    ]
+                keyword_clauses.append(
+                    "("
+                    + " OR ".join(
+                        [
+                            f"name.toLowerCase() LIKE :{key}",
+                            f"description.toLowerCase() LIKE :{key}",
+                            f"source_id.toLowerCase() LIKE :{key}",
+                        ]
+                    )
+                    + ")"
                 )
-            where_clauses.append(f"({' OR '.join(keyword_clauses)})")
+            # Require every service term, while allowing a term to appear in
+            # any indexed identity field. This prevents a popular Gmail entry
+            # from filling the candidate window for a Google Calendar query.
+            where_clauses.append(f"({' AND '.join(keyword_clauses)})")
 
         response = await self._db.command(
             "sql",
@@ -460,8 +486,12 @@ class ItemRepository:
             "source_url": str(rejection.source.url) if rejection.source.url else None,
             "provider": rejection.source.provider,
             "reason": rejection.reason,
-            "evidence": rejection.evidence if isinstance(rejection.evidence, list) else [],
-            "details": _make_serializable(rejection.details) if rejection.details else {},
+            "evidence": (
+                rejection.evidence if isinstance(rejection.evidence, list) else []
+            ),
+            "details": (
+                _make_serializable(rejection.details) if rejection.details else {}
+            ),
             "observed_at": _prepare_value(rejection.observed_at),
         }
         # Ensure the entire payload is JSON serializable
