@@ -2,6 +2,7 @@ import pytest
 
 from app.discovery.github.client import GitHubCandidate
 from app.discovery.mcp_registry.client import MCPRegistryCandidate
+from app.discovery.mcp_registry.service_adapter import MCPSearchResult
 from app.models import DiscoverySource, ItemType, SourceType
 from app.search.mcp_adapter import MCPDiscoveryAdapter
 
@@ -102,3 +103,19 @@ async def test_one_source_failure_does_not_break_the_others():
     assert by_source["mcp_registry"].succeeded is False
     assert by_source["mcp_registry"].candidates == ()
     assert "registry unavailable" in by_source["mcp_registry"].error
+
+
+@pytest.mark.asyncio
+async def test_service_discovery_enabled_flag():
+    """When enabled, the adapter stores the flag (outcomes depend on registry search)."""
+    github = FakeGitHub(candidates=[_github_candidate("scraper")])
+    registry = FakeMCPRegistry(candidates=[_registry_candidate("scraper-mcp")])
+
+    adapter = MCPDiscoveryAdapter(
+        github=github,
+        mcp_registry=registry,
+        enable_service_discovery=True,
+    )
+
+    # Verify the flag is stored
+    assert adapter._enable_service_discovery is True

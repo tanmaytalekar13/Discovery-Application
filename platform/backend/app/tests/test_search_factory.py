@@ -16,6 +16,7 @@ def _settings(**overrides) -> Settings:
         "arcadedb_password": "secret",
         "enable_github_discovery": False,
         "enable_mcp_registry_discovery": False,
+        "enable_mcp_service_discovery": False,
         "enable_a2a_registry_discovery": False,
         "enable_web_search_discovery": False,
         "enable_web_extraction": False,
@@ -62,6 +63,18 @@ def test_build_orchestrator_uses_only_the_mcp_adapter_when_configured():
     assert orchestrator is not None
     assert orchestrator._mcp_adapter is not None
     assert orchestrator._a2a_adapter is None
+
+
+def test_service_discovery_enabled_without_other_sources():
+    """Service discovery alone is enough to build an adapter."""
+    settings = _settings(enable_mcp_service_discovery=True)
+
+    adapter = build_mcp_adapter(settings)
+
+    assert adapter is not None
+    assert adapter._enable_service_discovery is True
+    assert adapter._github is None
+    assert adapter._mcp_registry is None
 
 
 def test_build_phase11_search_service_uses_local_embedding_dimensions():

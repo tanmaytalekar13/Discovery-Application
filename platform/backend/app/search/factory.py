@@ -48,12 +48,14 @@ def build_mcp_adapter(
     if (
         github is None
         and mcp_registry is None
+        and not settings.enable_mcp_service_discovery
     ):
         return None
 
     return MCPDiscoveryAdapter(
         github=github,
         mcp_registry=mcp_registry,
+        enable_service_discovery=settings.enable_mcp_service_discovery,
     )
 
 

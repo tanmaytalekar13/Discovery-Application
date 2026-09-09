@@ -38,22 +38,25 @@ from app.discovery.common.candidate import (
 )
 from app.discovery.github.client import GitHubDiscoveryAdapter
 from app.discovery.mcp_registry.client import MCPRegistryClient
+from app.discovery.mcp_registry.service_adapter import discover_services
 from app.search.concurrency import gather_source_outcomes
 
 DEFAULT_MAX_RESULTS = 20
 
 
 class MCPDiscoveryAdapter:
-    """Aggregate the only supported MCP discovery sources: Registry and GitHub."""
+    """Aggregate the supported MCP discovery sources: Registry, GitHub, and Service Search."""
 
     def __init__(
         self,
         *,
         github: GitHubDiscoveryAdapter | None = None,
         mcp_registry: MCPRegistryClient | None = None,
+        enable_service_discovery: bool = False,
     ) -> None:
         self._github = github
         self._mcp_registry = mcp_registry
+        self._enable_service_discovery = enable_service_discovery
 
     async def discover(
         self,
@@ -66,6 +69,11 @@ class MCPDiscoveryAdapter:
         source, i.e. constructor arg left `None`, is simply absent -
         not attempted, not failed).
 
+        When service discovery is enabled, performs an additional search
+        for official MCP servers matching the query against the MCP Registry's
+        search endpoint. This finds servers for specific services like
+        "Slack", "Figma", "Zoom", etc.
+
         """
         tier1_tasks: dict[str, object] = {}
 
@@ -74,6 +82,10 @@ class MCPDiscoveryAdapter:
 
         if self._mcp_registry is not None:
             tier1_tasks["mcp_registry"] = self._discover_registry(query, max_results)
+
+        if self._enable_service_discovery:
+            tier1_tasks["service"] = self._discover_service(query, max_results)
+
         return await gather_source_outcomes(tier1_tasks)
 
     async def _discover_github(
@@ -93,3 +105,12 @@ class MCPDiscoveryAdapter:
         assert self._mcp_registry is not None
         candidates = await self._mcp_registry.search(query, max_results)
         return [_from_mcp_registry(candidate) for candidate in candidates]
+
+    async def _discover_service(
+        self,
+        query: str,
+        max_results: int,
+    ) -> list[CandidateReference]:
+        """Search the official MCP Registry for servers matching a service name."""
+        candidates = await discover_services(query, max_results=max_results)
+        return list(candidates)

@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     # flag is left on, rather than attempted with empty configuration.
     enable_github_discovery: bool = False
     enable_mcp_registry_discovery: bool = False
-    # Only GitHub and the official MCP Registry are live discovery sources.
+    enable_mcp_service_discovery: bool = False
+    # Live discovery sources: GitHub, the official MCP Registry, and
+    # official MCP servers found via registry service search.
 
     github_token: str = ""
     discovery_max_results_per_source: int = Field(default=20, ge=1, le=100)
