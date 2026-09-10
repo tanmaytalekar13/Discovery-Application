@@ -424,6 +424,7 @@ class ContainerManager:
         try:
             has_dockerfile = await self._repo_has_dockerfile(item)
             await self._git_clone_shallow(github_hint.clone_url, workdir)
+            self._validate_source_command(run_config, workdir)
 
             if has_dockerfile:
                 image_tag = f"mcp-source/{session_id}:local"
@@ -449,6 +450,13 @@ class ContainerManager:
             )
 
             session.container_id = container.id
+            # The cloned repository is mounted only for generic images.  Run
+            # its separately-derived install command after the mount exists;
+            # a Dockerfile image owns its dependency installation itself.
+            if not has_dockerfile and run_config.install_command:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self._install_source_dependencies, container, run_config.install_command
+                )
             session.status = "ready"
 
             self._register_session(session)
@@ -472,8 +480,14 @@ class ContainerManager:
         item's tree was already fetched by extract_local_run_config."""
         from app.artifacts.source_resolver import get_repository_tree
 
-        tree = await get_repository_tree(item)
-        return any(entry.path == "Dockerfile" for entry in tree)
+        result = await get_repository_tree(item)
+        # source_resolver returns ``(tree_result, cache_path)``; tolerate a
+        # direct result too for callers/tests.
+        tree_result = result[0] if isinstance(result, tuple) else result
+        return any(
+            (entry.get("path") if isinstance(entry, dict) else getattr(entry, "path", None)) == "Dockerfile"
+            for entry in (getattr(tree_result, "tree", None) or [])
+        )
 
     async def _git_clone_shallow(self, clone_url: str, dest: str) -> None:
         proc = await asyncio.create_subprocess_exec(
@@ -486,6 +500,25 @@ class ContainerManager:
             raise RuntimeError(
                 f"git clone of {clone_url!r} failed: {stderr.decode(errors='replace')}"
             )
+
+    def _validate_source_command(self, run_config: LocalRunConfig, workdir: str) -> None:
+        """Defence in depth for a planner-selected source command.
+
+        Commands are argv, never shell input.  This check also catches the
+        exact class of failure where an extracted entrypoint does not exist in
+        the cloned repository before a container/process is started.
+        """
+        allowed = {"npm", "node", "python", "python3", "uv", "uvx"}
+        if run_config.command not in allowed:
+            raise RuntimeError(f"Invalid run command {run_config.command!r}; it is not a supported MCP runtime")
+        if run_config.command in {"node", "python", "python3"} and run_config.args:
+            entrypoint = run_config.args[0]
+            if entrypoint.startswith(("-", "/")):
+                return
+            path = os.path.realpath(os.path.join(workdir, entrypoint))
+            root = os.path.realpath(workdir) + os.sep
+            if not path.startswith(root) or not os.path.isfile(path):
+                raise RuntimeError(f"Invalid run command: entrypoint {entrypoint!r} does not exist in the cloned repository")
 
     def _build_docker_image(self, context_dir: str, image_tag: str) -> None:
         """Runs in executor - blocking Docker SDK build call.
@@ -550,7 +583,10 @@ class ContainerManager:
         }
 
         if bind_workdir:
-            container_config["volumes"] = {bind_workdir: {"bind": "/repo", "mode": "ro"}}
+            # The cloned temporary directory is private to this sandbox
+            # session. Dependencies must be installed there before stdio is
+            # started, so it cannot be read-only during setup.
+            container_config["volumes"] = {bind_workdir: {"bind": "/repo", "mode": "rw"}}
             container_config["working_dir"] = "/repo"
 
         try:
@@ -569,6 +605,21 @@ class ContainerManager:
         except Exception as exc:
             logger.error("Failed to create source container: %s", exc)
             raise
+
+    def _install_source_dependencies(self, container: Any, install_command: str) -> None:
+        """Install inferred dependencies inside the already-isolated container."""
+        result = container.exec_run(["sh", "-lc", install_command], workdir="/repo", demux=True)
+        exit_code = getattr(result, "exit_code", result[0] if isinstance(result, tuple) else 1)
+        if exit_code != 0:
+            output = getattr(result, "output", None)
+            # Never expose environment values; the command itself came from
+            # the validated planner and is safe to name in the diagnosis.
+            detail = ""
+            if isinstance(output, tuple):
+                output = output[1] or output[0]
+            if isinstance(output, bytes):
+                detail = output.decode(errors="replace").strip().splitlines()[-1:][0] if output.strip() else ""
+            raise RuntimeError(f"Dependency installation failed ({install_command}): {detail}".rstrip())
 
     # -------------------------------------------------------------------------
     # Shared helpers (used by both create_container and create_container_from_source)

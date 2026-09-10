@@ -387,7 +387,7 @@ export interface GithubSourceHint {
   default_branch?: string;
 }
 
-export type RunConfigSource = 'manifest' | 'readme' | 'heuristic';
+export type RunConfigSource = 'manifest' | 'readme' | 'package' | 'python' | 'docker' | 'heuristic';
 
 export interface LocalRunConfig {
   source: RunConfigSource;
@@ -400,12 +400,20 @@ export interface LocalRunConfig {
 
 export interface SourcePrepareResponse {
   item_id: string;
-  status: 'not_runnable' | 'needs_auth' | 'ready';
+  status: 'not_runnable' | 'needs_auth' | 'ready' | 'remote' | 'external_dependency';
   source: RunConfigSource;
   runtime?: string;
   install_command?: string;
   environment_variables: string[]; // names only
   reason?: string;
+  candidates: string[];
+  execution_type?: 'remote' | 'local' | 'both' | 'ambiguous';
+  transport?: string;
+  endpoint?: string;
+  required_configuration?: EnvironmentVariableSchema[];
+  external_dependencies?: string[];
+  evidence?: string[];
+  confidence?: number;
 }
 
 export interface SourceConnectRequest {

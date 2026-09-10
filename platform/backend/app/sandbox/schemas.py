@@ -98,7 +98,21 @@ class ClassificationResult(BaseModel):
     )
 
 
-RunSource = Literal["manifest", "readme", "heuristic"]
+RunSource = Literal["manifest", "readme", "package", "python", "docker", "heuristic"]
+ExecutionType = Literal["remote", "local", "both", "ambiguous"]
+
+
+class EnvironmentRequirement(BaseModel):
+    """A configuration value discovered from repository evidence.
+
+    Values are deliberately never part of an execution plan.  The UI can use
+    this metadata to collect them for one test session only.
+    """
+    name: str
+    description: str | None = None
+    is_secret: bool = False
+    is_required: bool = True
+    evidence: str | None = None
 
 
 class LocalRunConfig(BaseModel):
@@ -129,5 +143,18 @@ class LocalRunConfig(BaseModel):
         alias="envVars",
         description="Names only - values are collected from the user at test time, never stored here.",
     )
+    # A GitHub repository can publish a hosted MCP endpoint.  Keeping this
+    # alongside the local command lets the lazy source inspection decide the
+    # transport before anything is started in a container.
+    remote: RemoteCandidate | None = None
+    candidates: list[str] = Field(default_factory=list)
+    execution_type: ExecutionType = "ambiguous"
+    transport: str | None = None
+    working_directory: str = "."
+    required_env: list[EnvironmentRequirement] = Field(default_factory=list)
+    external_dependencies: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    rationale: str | None = None
 
     model_config = {"populate_by_name": True}

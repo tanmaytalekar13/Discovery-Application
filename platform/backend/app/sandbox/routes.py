@@ -79,6 +79,15 @@ async def _require_testable(
     """
     item = await _require_item(item_id, repository)
     classification = classify_tool(item)
+    # GitHub repositories are inspected lazily. A hosted endpoint discovered
+    # there uses the exact same remote client/auth flow as registry remotes;
+    # it must never be put in a sandbox.
+    if classification.mode == "local_source":
+        item = await _require_item(item_id, repository)
+        config = await _get_or_extract_run_config(item_id, item)
+        if config.remote:
+            return config.remote, config.remote.url
+
     if not classification.testable:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -841,27 +850,44 @@ async def prepare_source_test(
 
     run_config = await _get_or_extract_run_config(item_id, item)
 
+    response_fields = dict(
+        item_id=item_id,
+        source=run_config.source,
+        runtime=run_config.runtime,
+        install_command=run_config.install_command,
+        environment_variables=run_config.env_vars,
+        execution_type=run_config.execution_type,
+        transport=run_config.remote.type if run_config.remote else run_config.transport,
+        endpoint=run_config.remote.url if run_config.remote else None,
+        required_configuration=[
+            EnvironmentVariableSchema(name=value.name, description=value.description,
+                is_secret=value.is_secret, is_required=value.is_required)
+            for value in run_config.required_env
+        ],
+        external_dependencies=run_config.external_dependencies,
+        evidence=run_config.evidence,
+        confidence=run_config.confidence,
+    )
+    # For a repository supporting both modes, remote is preferred for a
+    # discovery test: it is the least invasive, already-running option.
+    if run_config.remote:
+        return SourcePrepareResponse(status="remote", **response_fields)
+
     if not run_config.command:
         # Heuristic tier with install-only info, or nothing structured
         # found at all — same "can install, can't run" case flagged in
         # extract.py's heuristic tier docstring.
         return SourcePrepareResponse(
-            item_id=item_id,
             status="not_runnable",
-            source=run_config.source,
-            runtime=run_config.runtime,
-            install_command=run_config.install_command,
-            reason="Could not determine a run command for this repo from "
-                   "its manifest, README, or file tree.",
+            reason="No safe server command was found from repository evidence. "
+                   "Review the repository's setup instructions before testing it.",
+            candidates=run_config.candidates,
+            **response_fields,
         )
 
     return SourcePrepareResponse(
-        item_id=item_id,
         status="needs_auth" if run_config.env_vars else "ready",
-        source=run_config.source,
-        runtime=run_config.runtime,
-        install_command=run_config.install_command,
-        environment_variables=run_config.env_vars,  # names only, per schema
+        **response_fields,
     )
 
 
@@ -903,6 +929,9 @@ async def connect_source(
     hint = await _require_source_testable(item_id, repository)
 
     run_config = await _get_or_extract_run_config(item_id, item)
+
+    if run_config.remote:
+        raise HTTPException(status_code=400, detail="Remote endpoint detected; use /test/connect so MCP is initialized over HTTP/SSE.")
 
     if not run_config.command:
         raise HTTPException(
@@ -967,5 +996,5 @@ async def connect_source(
         return SourceConnectResponse(
             connected=False,
             error=str(exc),
-            user_message=f"Failed to start GitHub-source MCP server: {exc}",
+            user_message=f"Sandbox startup failed: {exc}",
         )

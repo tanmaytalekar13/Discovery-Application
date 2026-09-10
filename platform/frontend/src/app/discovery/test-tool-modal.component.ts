@@ -669,7 +669,7 @@ type ModalState =
                   <line x1="11" y1="14" x2="11.01" y2="14"></line>
                 </svg>
               </div>
-              <p class="stdio-title">Can't run this tool yet</p>
+              <p class="stdio-title">Server command not verified</p>
               <p class="stdio-desc">
                 {{ sourcePrepare()?.reason || sourceConnectError() || 'Could not determine how to run this repository.' }}
               </p>
@@ -681,6 +681,11 @@ type ModalState =
                 </div>
               }
 
+              @if (sourcePrepare()?.candidates?.length) {
+                <ul class="env-list">
+                  @for (candidate of sourcePrepare()?.candidates; track candidate) { <li>{{ candidate }}</li> }
+                </ul>
+              }
               <button class="btn btn--secondary" (click)="closeModal()">Close</button>
             </div>
           }
@@ -1379,6 +1384,7 @@ export class TestToolModalComponent implements OnInit {
   sourcePrepare = signal<SourcePrepareResponse | null>(null);
   sourceEnvValues: Record<string, string> = {};
   sourceConnectError = signal<string>('');
+  sourceCommand = '';
 
   // ---------------------------------------------------------------------------
   // Form fields (derived from selected tool's inputSchema)
@@ -1970,6 +1976,14 @@ export class TestToolModalComponent implements OnInit {
 
         if (res.status === 'not_runnable') {
           this.state.set('source-not-runnable');
+          return;
+        }
+
+        if (res.status === 'remote') {
+          // The backend has classified this GitHub repository as a hosted
+          // MCP server. Reuse the normal remote initialize/tools-list flow.
+          this.state.set('connecting');
+          this.doConnect();
           return;
         }
 

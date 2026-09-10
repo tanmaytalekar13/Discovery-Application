@@ -28,6 +28,7 @@ server still needs to be running on the user's own machine.
 from __future__ import annotations
 
 from typing import Any
+import re
 from urllib.parse import urlparse
 
 from app.sandbox.schemas import (
@@ -229,6 +230,34 @@ def _build_github_source_hint(entry: dict[str, Any]) -> GithubSourceHint | None:
     )
 
 
+def _cached_github_readme_classification(config_files: list[dict[str, Any]]) -> ClassificationResult | None:
+    """Use cached README evidence as a fast path when no clone is needed.
+
+    This is intentionally limited to explicit MCP endpoint/launcher syntax;
+    repositories without that evidence remain ``local_source`` and receive
+    the full multi-file execution plan before anything runs.
+    """
+    entry = _find_config_entry(config_files, "github_readme")
+    text = entry.get("content") if entry else None
+    if not isinstance(text, str):
+        return None
+    endpoint = re.search(r"https?://[^\s)`]+/(?:mcp|sse)\b", text, re.I)
+    if endpoint and re.search(r"\b(mcp|streamable\s+http|sse)\b", text, re.I):
+        kind = "sse" if endpoint.group(0).rstrip("/").endswith("/sse") or re.search(r"\bsse\b", text, re.I) else "streamable-http"
+        return ClassificationResult(testable=True, mode="remote", detail=[RemoteCandidate(type=kind, url=endpoint.group(0))])
+    launcher = re.search(r"\b(npx\s+-y|uvx)\s+([^\s`]+)", text)
+    if not launcher:
+        return None
+    is_npm = launcher.group(1).startswith("npx")
+    env_names = re.findall(r"\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|API))\b", text)
+    return ClassificationResult(testable=False, mode="local_stdio", detail=[LocalPackageHint(
+        registryType="npm" if is_npm else "pypi", identifier=launcher.group(2),
+        runtimeHint="npx" if is_npm else "uvx", transportType="stdio",
+        installCommand=f"{launcher.group(1)} {launcher.group(2)}",
+        environmentVariables=[{"name": name, "isRequired": True, "isSecret": True} for name in dict.fromkeys(env_names)],
+    )], reason="Repository README declares a local stdio launcher.")
+
+
 def classify_tool(item: Any) -> ClassificationResult:
     """Classify a single discovered tool item for live testing.
 
@@ -320,7 +349,12 @@ def classify_tool(item: Any) -> ClassificationResult:
                 ),
             )
 
-    # --- 4. GitHub-sourced item, no registry package/remote info ----------
+    # --- 4. Explicit cached README evidence, otherwise full lazy planner ---
+    readme_classification = _cached_github_readme_classification(config_files)
+    if readme_classification:
+        return readme_classification
+
+    # --- 5. GitHub-sourced item, no registry package/remote info ----------
     # These items only carry repo coordinates (repository, clone_url,
     # default_branch) - there's no transport/runtime/env info to read
     # here. We mark them testable (the sandbox *can* run them) but the
@@ -335,7 +369,7 @@ def classify_tool(item: Any) -> ClassificationResult:
                 detail=hint,
             )
 
-    # --- 5. Fallback --------------------------------------------------------
+    # --- 6. Fallback --------------------------------------------------------
     return ClassificationResult(
         testable=False,
         mode="not_testable",

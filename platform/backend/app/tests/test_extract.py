@@ -173,3 +173,119 @@ async def test_heuristic_fallback_when_nothing_structured_found():
     assert result.install_command == "docker build -t mcp-test ."
     assert result.command is None
     assert result.env_vars == []
+
+
+@pytest.mark.asyncio
+async def test_package_start_script_is_a_local_stdio_command():
+    tree = [{"path": "package.json", "type": "blob"}]
+    package = '{"scripts":{"start":"node dist/server.js"}}'
+    with (
+        patch("app.sandbox.extract.get_repository_tree", new=AsyncMock(return_value=(_FakeTreeResult(tree), None))),
+        patch("app.sandbox.extract.get_source_file", new=AsyncMock(return_value=_FakeFileResult(package))),
+        patch("app.sandbox.extract.resolve_source", new=AsyncMock(return_value=(_FakePreviewResult("Set WEATHER_API_KEY first."), None))),
+    ):
+        result = await extract_local_run_config(_make_item())
+    assert result.source == "package"
+    assert result.command == "npm"
+    assert result.args == ["run", "start"]
+    assert result.install_command == "npm install"
+    assert result.env_vars == ["WEATHER_API_KEY"]
+
+
+@pytest.mark.asyncio
+async def test_readme_remote_is_not_treated_as_local():
+    tree = [{"path": "README.md", "type": "blob"}]
+    readme = '''```json
+    {"mcpServers":{"hosted":{"type":"streamable-http","url":"https://mcp.example.test/mcp","env":{"API_KEY":""}}}}
+    ```'''
+    with (
+        patch("app.sandbox.extract.get_repository_tree", new=AsyncMock(return_value=(_FakeTreeResult(tree), None))),
+        patch("app.sandbox.extract.get_source_file", new=AsyncMock(return_value=_FakeFileResult(None))),
+        patch("app.sandbox.extract.resolve_source", new=AsyncMock(return_value=(_FakePreviewResult(readme), None))),
+    ):
+        result = await extract_local_run_config(_make_item())
+    assert result.remote is not None
+    assert result.remote.type == "streamable-http"
+    assert result.env_vars == ["API_KEY"]
+
+
+@pytest.mark.asyncio
+async def test_python_console_script_is_detected():
+    tree = [{"path": "pyproject.toml", "type": "blob"}]
+    pyproject = '[project.scripts]\nweather-mcp = "weather.server:main"\n'
+    with (
+        patch("app.sandbox.extract.get_repository_tree", new=AsyncMock(return_value=(_FakeTreeResult(tree), None))),
+        patch("app.sandbox.extract.get_source_file", new=AsyncMock(return_value=_FakeFileResult(pyproject))),
+        patch("app.sandbox.extract.resolve_source", new=AsyncMock(return_value=(_FakePreviewResult(None), None))),
+    ):
+        result = await extract_local_run_config(_make_item())
+    assert result.source == "python"
+    assert result.command == "weather-mcp"
+
+
+@pytest.mark.asyncio
+async def test_quickstart_hosted_endpoint_wins_over_local_start_command():
+    """A repo may offer both modes; discovery tests use the hosted MCP first."""
+    tree = [
+        {"path": "README.md", "type": "blob"},
+        {"path": "quickstart.md", "type": "blob"},
+        {"path": "package.json", "type": "blob"},
+        {"path": "package-lock.json", "type": "blob"},
+    ]
+    files = {
+        "quickstart.md": """Use the hosted MCP endpoint https://host.example.test/mcp\nTRANSPORT=http PORT=3015 npm start\nRequires ZoomISO application/network access.\n""",
+        "package.json": '{"scripts":{"start":"node dist/server.js"}}',
+    }
+
+    async def read_file(_, path):
+        return _FakeFileResult(files.get(path))
+
+    with (
+        patch("app.sandbox.extract.get_repository_tree", new=AsyncMock(return_value=(_FakeTreeResult(tree), None))),
+        patch("app.sandbox.extract.get_source_file", new=AsyncMock(side_effect=read_file)),
+        patch("app.sandbox.extract.resolve_source", new=AsyncMock(return_value=(_FakePreviewResult("# Server"), None))),
+    ):
+        result = await extract_local_run_config(_make_item())
+
+    assert result.execution_type == "both"
+    assert result.remote and result.remote.url == "https://host.example.test/mcp"
+    assert result.remote.type == "streamable-http"
+    assert result.command == "npm"
+    assert result.args == ["run", "start"]
+    assert result.install_command == "npm ci"
+    assert {item.name for item in result.required_env} >= {"TRANSPORT", "PORT"}
+    assert result.external_dependencies
+
+
+@pytest.mark.asyncio
+async def test_documented_environment_requirements_are_described_without_values():
+    tree = [{"path": "README.md", "type": "blob"}, {"path": "package.json", "type": "blob"}]
+    readme = "Set API_KEY, SERVICE_HOST and SERVICE_PORT, then run npm start."
+
+    async def read_file(_, path):
+        return _FakeFileResult('{"scripts":{"start":"node server.js"}}' if path == "package.json" else None)
+
+    with (
+        patch("app.sandbox.extract.get_repository_tree", new=AsyncMock(return_value=(_FakeTreeResult(tree), None))),
+        patch("app.sandbox.extract.get_source_file", new=AsyncMock(side_effect=read_file)),
+        patch("app.sandbox.extract.resolve_source", new=AsyncMock(return_value=(_FakePreviewResult(readme), None))),
+    ):
+        result = await extract_local_run_config(_make_item())
+    reqs = {item.name: item for item in result.required_env}
+    assert set(reqs) >= {"API_KEY", "SERVICE_HOST", "SERVICE_PORT"}
+    assert reqs["API_KEY"].is_secret is True
+    assert all(not hasattr(item, "value") for item in result.required_env)
+
+
+@pytest.mark.asyncio
+async def test_install_script_is_never_selected_as_run_command():
+    tree = [{"path": "package.json", "type": "blob"}]
+    package = '{"scripts":{"install":"node setup.js","build":"tsc"}}'
+    with (
+        patch("app.sandbox.extract.get_repository_tree", new=AsyncMock(return_value=(_FakeTreeResult(tree), None))),
+        patch("app.sandbox.extract.get_source_file", new=AsyncMock(return_value=_FakeFileResult(package))),
+        patch("app.sandbox.extract.resolve_source", new=AsyncMock(return_value=(_FakePreviewResult(None), None))),
+    ):
+        result = await extract_local_run_config(_make_item())
+    assert result.command is None
+    assert result.execution_type == "ambiguous"

@@ -224,10 +224,10 @@ class SourcePrepareResponse(BaseModel):
     """
 
     item_id: UUID
-    status: Literal["not_runnable", "needs_auth", "ready"] = Field(
+    status: Literal["not_runnable", "needs_auth", "ready", "remote", "external_dependency"] = Field(
         description="Which state extraction landed in; determines the next UI step",
     )
-    source: Literal["manifest", "readme", "heuristic"] = Field(
+    source: Literal["manifest", "readme", "package", "python", "docker", "heuristic"] = Field(
         description="Where the run config was derived from, in priority order. "
         "Frontend can use this to show a confidence hint (e.g. 'inferred "
         "from README' vs 'declared in repo manifest')",
@@ -249,6 +249,14 @@ class SourcePrepareResponse(BaseModel):
         default=None,
         description="Human-readable explanation, populated when status='not_runnable'",
     )
+    candidates: list[str] = Field(default_factory=list)
+    execution_type: Literal["remote", "local", "both", "ambiguous"] = "ambiguous"
+    transport: str | None = None
+    endpoint: str | None = None
+    required_configuration: list[EnvironmentVariableSchema] = Field(default_factory=list)
+    external_dependencies: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
 
 
 # ---------------------------------------------------------------------------
