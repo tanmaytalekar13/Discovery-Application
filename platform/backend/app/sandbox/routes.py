@@ -25,6 +25,7 @@ from the existing discovery routes.
 """
 from __future__ import annotations
 
+import logging
 import secrets
 from typing import Annotated
 from uuid import UUID
@@ -58,11 +59,12 @@ from app.sandbox.container_schemas import (
 )
 from app.sandbox.extract import extract_local_run_config
 from app.sandbox.local_mcp_client import LocalMCPClient
-from app.sandbox.mcp_client import MCPTestClient
+from app.sandbox.mcp_client import MCPClientError, MCPTestClient, classify_connection_error
 from app.sandbox.schemas import GithubSourceHint, LocalPackageHint, LocalRunConfig, RemoteCandidate
 from app.sandbox.session import get_session_store, SessionStore
 
 router = APIRouter(prefix="/api/items", tags=["tool-test"])
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -164,13 +166,42 @@ async def connect(
     candidate, url = await _require_testable(item_id, repository)
     token = _extract_bearer_token(session_store, session_id) if session_id else None
 
-    client = MCPTestClient(
-        url=url,
-        auth_token=token,
-        preferred_transport=candidate.type,
-        auth_header=candidate.auth_header,
-    )
-    result = await client.connect()
+    # URL validation happens in the client constructor. A malformed or unsafe
+    # registry URL must be a failed test, never an opaque FastAPI 500.
+    try:
+        client = MCPTestClient(
+            url=url,
+            auth_token=token,
+            preferred_transport=candidate.type,
+            auth_header=candidate.auth_header,
+            auth_value_prefix=candidate.auth_value_prefix,
+        )
+        result = await client.connect()
+    except MCPClientError as exc:
+        logger.warning(
+            "Remote MCP connection rejected (item_id=%s, transport=%s, url=%s): %s",
+            item_id, candidate.type, url, exc, exc_info=True,
+        )
+        info = classify_connection_error(exc)
+        return ToolConnectResponse(
+            connected=False, auth_required=info.auth_reason == "unauthorized",
+            transport=candidate.type, error=info.user_message,
+            requires_auth=info.auth_reason == "unauthorized",
+            auth_reason=info.auth_reason, user_message=info.user_message,
+            show_token_input=info.show_token_input, show_oauth_button=info.show_oauth_button,
+        )
+    except Exception:
+        # Keep the full traceback in server logs. Do not expose exception text:
+        # some HTTP clients include request headers in their diagnostics.
+        logger.exception(
+            "Unexpected remote MCP connection failure (item_id=%s, transport=%s, url=%s)",
+            item_id, candidate.type, url,
+        )
+        return ToolConnectResponse(
+            connected=False, transport=candidate.type, error="Unexpected MCP connection failure",
+            auth_reason="unknown",
+            user_message="The MCP connection failed unexpectedly. Please retry or contact the server provider.",
+        )
 
     return ToolConnectResponse(
         connected=result.connected,
@@ -226,6 +257,7 @@ async def invoke(
         auth_token=token,
         preferred_transport=candidate.type,
         auth_header=candidate.auth_header,
+        auth_value_prefix=candidate.auth_value_prefix,
     )
     result = await client.invoke(body.tool_name, body.arguments)
 
@@ -563,6 +595,24 @@ async def connect_local(
     plus the list of available tools.
     """
     hint = await _require_local_testable(item_id, repository)
+
+    # Registry metadata is authoritative for package-level configuration.
+    # Do not attempt a stdio handshake until required values are present.
+    required_env = [
+        value.get("name") for value in hint.environment_variables
+        if isinstance(value, dict) and value.get("isRequired", value.get("is_required", True))
+        and isinstance(value.get("name"), str)
+    ]
+    missing = [name for name in required_env if not body.env_vars.get(name)]
+    if missing:
+        return LocalConnectResponse(
+            connected=False,
+            error="Missing required environment variables: " + ", ".join(missing),
+            user_message="This MCP server requires configuration before it can start.",
+            required_env_vars=missing,
+            show_token_input=True,
+            show_retry=False,
+        )
 
     # Build tool config
     config = LocalToolConfig(

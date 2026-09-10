@@ -316,6 +316,27 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
     )
 
 
+def _log_remote_failure(operation: str, url: str, exc: BaseException) -> None:
+    """Log actionable upstream diagnostics without logging credentials."""
+    root = exc
+    while isinstance(root, MCPClientError) and root.__cause__ is not None:
+        root = root.__cause__
+    root = _unwrap_exception(root)
+    if isinstance(root, httpx.HTTPStatusError):
+        response = root.response
+        logger.error(
+            "MCP %s upstream response (url=%s status=%s headers=%s body=%r)",
+            operation, url.split("?", 1)[0], response.status_code,
+            {key: value for key, value in response.headers.items()
+             if key.lower() in {"content-type", "www-authenticate", "retry-after", "mcp-session-id"}},
+            response.text[:512] if response.is_stream_consumed else "<streaming body not read by MCP transport>", exc_info=exc,
+        )
+    elif isinstance(root, httpx.TimeoutException):
+        logger.error("MCP %s timeout (url=%s type=%s): %s", operation, url.split("?", 1)[0], type(root).__name__, root, exc_info=exc)
+    else:
+        logger.error("MCP %s transport/protocol failure (url=%s type=%s): %s", operation, url.split("?", 1)[0], type(root).__name__, root, exc_info=exc)
+
+
 def _unwrap_exception(exc: BaseException) -> BaseException:
     """Recursively unwrap ExceptionGroup / BaseExceptionGroup to find the
     first non-ExceptionGroup exception.
@@ -560,25 +581,11 @@ async def _open_session(
     the module don't pay the import cost, and so import errors are
     isolated to where they matter.
     """
-    from urllib.parse import urlencode, urlparse, parse_qs
-
     from mcp import ClientSession
 
-    # Append auth token as a URL query param if the URL doesn't already
-    # have one. Many MCP servers (e.g. PennyOCR) accept ?key=<token> or
-    # ?api_key=<token> in addition to / instead of Authorization headers.
-    if auth_token:
-        parsed = urlparse(url)
-        existing_params = parse_qs(parsed.query)
-        common_names = ("key", "api_key", "apikey", "token", "bearer")
-        if not any(name in existing_params for name in common_names):
-            existing_params["key"] = [auth_token]
-            new_query = urlencode(
-                {k: v[0] for k, v in existing_params.items()},
-                doseq=False,
-            )
-            url = parsed._replace(query=new_query).geturl()
-
+    # Credentials are passed only in the declared HTTP header.  Adding a
+    # guessed `?key=` parameter is non-standard, leaks into proxy logs, and
+    # breaks servers that validate their endpoint query strictly.
     if transport == "streamable-http":
         from mcp.client.streamable_http import streamablehttp_client
 
@@ -653,6 +660,7 @@ class MCPTestClient:
         max_retries: int = DEFAULT_MAX_RETRIES,
         allow_local_host: bool = False,
         auth_header: str | None = None,
+        auth_value_prefix: str | None = None,
     ) -> None:
         self._url = _validate_url(url, allow_local=allow_local_host)
         self._auth_token = auth_token
@@ -660,9 +668,8 @@ class MCPTestClient:
         self._timeout = timeout
         self._max_retries = max_retries
         self._transport_name = _pick_transport(self._url, preferred_transport)
-        self._auth_header = (
-            auth_header  # e.g. "x-api-key" (None = use Authorization: Bearer)
-        )
+        self._auth_header = auth_header
+        self._auth_value_prefix = auth_value_prefix
 
     # ---- headers ---------------------------------------------------------
 
@@ -676,7 +683,7 @@ class MCPTestClient:
             # Most servers accept Authorization: Bearer <token>. Some tools
             # (e.g. Roboflow) require a custom header like x-api-key.
             if self._auth_header:
-                headers[self._auth_header] = self._auth_token
+                headers[self._auth_header] = (self._auth_value_prefix or "") + self._auth_token
             else:
                 headers["Authorization"] = f"Bearer {self._auth_token}"
         return headers
@@ -800,6 +807,7 @@ class MCPTestClient:
             httpx.HTTPStatusError,
             RuntimeError,
         ) as exc:
+            _log_remote_failure("connect", self._url, exc)
             info = classify_connection_error(exc)
             # Auth errors (401/403) that come through the outer handler
             # (wrapped in ExceptionGroup) should still surface as auth_required.

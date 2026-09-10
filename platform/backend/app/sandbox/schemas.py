@@ -59,6 +59,11 @@ class RemoteCandidate(BaseModel):
         ),
     )
 
+    auth_value_prefix: str | None = Field(
+        default=None,
+        description="Literal prefix from a registry header template, e.g. Bearer.",
+    )
+
 
 class GithubSourceHint(BaseModel):
     """Repo coordinates for a github_repository-sourced item.

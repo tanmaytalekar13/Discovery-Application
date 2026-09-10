@@ -137,6 +137,7 @@ class LocalMCPClient:
             await asyncio.sleep(0.15)
             if self._process.returncode is not None:
                 stderr_text = self._get_stderr_text()
+                logger.warning("Local MCP exited before initialize (container=%s command=%r exit_code=%s stderr=%r)", self._container_id, command, self._process.returncode, stderr_text[-4000:])
                 user_msg, auth_reason, required_env_vars = self._analyze_error(
                     stderr_text, self._process.returncode
                 )
@@ -253,6 +254,7 @@ class LocalMCPClient:
         except Exception as exc:
             logger.error("Failed to connect to local MCP server: %s", exc)
             stderr_text = self._get_stderr_text()
+            logger.warning("Local MCP connection failure (container=%s command=%r exit_code=%s stderr=%r)", self._container_id, command, self._process.returncode if self._process else None, stderr_text[-4000:])
             returncode = self._process.returncode if self._process else None
             user_msg, auth_reason, required_env_vars = self._analyze_error(stderr_text, returncode)
             await self._cleanup()
@@ -438,8 +440,15 @@ class LocalMCPClient:
                 # Read a chunk of data
                 chunk = await self._process.stdout.read(4096)
                 if not chunk:
-                    # EOF reached - process exited
-                    logger.info("Process stdout EOF reached")
+                    # EOF reached: fail outstanding RPCs immediately with the
+                    # exit code instead of waiting for the initialize timeout.
+                    code = self._process.returncode if self._process else None
+                    error = RuntimeError(f"MCP server exited with code {code}" if code is not None else "MCP server closed stdout")
+                    for future in self._pending.values():
+                        if not future.done():
+                            future.set_exception(error)
+                    self._pending.clear()
+                    logger.info("Process stdout EOF reached (exit_code=%s)", code)
                     break
 
                 # Decode and append to buffer

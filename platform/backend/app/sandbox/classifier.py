@@ -100,11 +100,13 @@ def _build_remote_candidates(
         # Registry entries with isRequired=True headers (e.g. x-api-key)
         # override the default Authorization: Bearer header.
         auth_header: str | None = None
+        auth_value_prefix: str | None = None
         headers = remote.get("headers") or []
         if isinstance(headers, list):
             for h in headers:
                 if isinstance(h, dict) and h.get("isRequired") is True:
                     auth_header = h.get("name")
+                    auth_value_prefix = _auth_value_prefix(h)
                     break
 
         candidates.append(
@@ -112,6 +114,7 @@ def _build_remote_candidates(
                 type=transport_type,
                 url=url,
                 auth_header=auth_header,
+                auth_value_prefix=auth_value_prefix,
             )
         )
     # Python's sort is stable, retaining publisher order within each
@@ -133,6 +136,31 @@ def _required_auth_header(entry: dict[str, Any]) -> str | None:
             if isinstance(name, str) and name:
                 return name
     return None
+
+
+def _auth_value_prefix(header: dict[str, Any]) -> str | None:
+    """Return the literal prefix before a registry credential placeholder."""
+    value = header.get("value")
+    if not isinstance(value, str):
+        return None
+    marker = value.find("{")
+    if marker <= 0 or "}" not in value[marker + 1:]:
+        return None
+    prefix = value[:marker]
+    return prefix if prefix.strip() else None
+
+
+def _required_auth(entry: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return a required header name plus its registry value prefix."""
+    headers = entry.get("headers") or []
+    if not isinstance(headers, list):
+        return None, None
+    for header in headers:
+        if isinstance(header, dict) and header.get("isRequired") is True:
+            name = header.get("name")
+            if isinstance(name, str) and name:
+                return name, _auth_value_prefix(header)
+    return None, None
 
 
 def _summarize_package(pkg: dict[str, Any]) -> LocalPackageHint:
@@ -318,12 +346,13 @@ def classify_tool(item: Any) -> ClassificationResult:
                 # the package or its transport. Preserve this so a supplied
                 # API key is sent using e.g. x-api-key instead of always as a
                 # Bearer token.
-                auth_header = _required_auth_header(pkg) or _required_auth_header(
-                    transport
-                )
+                auth_header, auth_value_prefix = _required_auth(pkg)
+                if auth_header is None:
+                    auth_header, auth_value_prefix = _required_auth(transport)
                 remote_package_candidates.append(
                     RemoteCandidate(
-                        type=transport_type, url=transport_url, auth_header=auth_header
+                        type=transport_type, url=transport_url, auth_header=auth_header,
+                        auth_value_prefix=auth_value_prefix,
                     )
                 )
             else:

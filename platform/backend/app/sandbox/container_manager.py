@@ -201,13 +201,24 @@ class LocalToolConfig:
             return ["sh", "-c", full_cmd]
 
         if self.registry_type == "pip":
-            # Check if pipx is installed first to avoid redundant installation on every run
-            full_cmd = (
-                f"(command -v pipx >/dev/null 2>&1 || pip install --quiet --no-warn-script-location --prefer-binary pipx) "
-                f"&& pipx run {shlex.quote(self.identifier)}"
-            )
-            if self.runtime_arguments:
-                full_cmd += " " + " ".join(shlex.quote(arg) for arg in self.runtime_arguments)
+            args = " ".join(shlex.quote(arg) for arg in self.runtime_arguments)
+            if "uvx" in (self.runtime_hint or "").lower():
+                # The official registry commonly declares uvx for Python
+                # servers.  Running it as pipx changes dependency resolution
+                # and previously failed with command-not-found in slim images.
+                full_cmd = (
+                    "(command -v uvx >/dev/null 2>&1 || python -m pip install "
+                    "--quiet --no-warn-script-location --prefer-binary uv) && "
+                    f"uvx {shlex.quote(self.identifier)}"
+                )
+            else:
+                full_cmd = (
+                    "(command -v pipx >/dev/null 2>&1 || python -m pip install "
+                    "--quiet --no-warn-script-location --prefer-binary pipx) && "
+                    f"pipx run {shlex.quote(self.identifier)}"
+                )
+            if args:
+                full_cmd += " " + args
             return ["sh", "-c", full_cmd]
 
         # Fallback for other tools: run via node runner
