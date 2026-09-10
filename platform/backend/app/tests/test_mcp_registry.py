@@ -145,8 +145,36 @@ async def test_search_handles_cursor_pagination():
     assert results[1].server_name == "io.github.example/search"
     assert len(calls) == 2
     assert calls[1].params["cursor"] == "next-page"
-    assert "search" not in calls[0].params
+    assert calls[0].params.get("search") == "weather"
     assert "version" not in calls[0].params
+
+
+@pytest.mark.asyncio
+async def test_search_cleans_protocol_noise_terms():
+    calls = []
+
+    class MockTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            calls.append(request.url)
+            return httpx.Response(
+                200,
+                json={
+                    "servers": [_server_entry(name="com.roboflow/roboflow-mcp")],
+                    "metadata": {"count": 1, "nextCursor": None},
+                },
+            )
+
+    client = httpx.AsyncClient(
+        transport=MockTransport(),
+        base_url="https://registry.test",
+    )
+
+    async with MCPRegistryClient(httpx_client=client) as registry:
+        results = await registry.search(query="roboflow mcp server", max_results=5)
+
+    assert len(results) == 1
+    assert results[0].server_name == "com.roboflow/roboflow-mcp"
+    assert calls[0].params.get("search") == "roboflow"
 
 
 @pytest.mark.asyncio

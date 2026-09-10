@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
 
+from app.discovery.mcp_registry.client import strip_registry_namespace
 from app.models import Item
 from app.query.embeddings import LocalEmbeddingModel, cosine_similarity
 
@@ -153,10 +154,10 @@ def _lexical_relevance(query_terms: tuple[str, ...], item: Item) -> float:
     """
     if not query_terms:
         return 0.0
-    fields = [item.name, item.description, item.source.id]
+    fields = [item.name, item.description, strip_registry_namespace(item.source.id)]
     if item.tool is not None:
         fields.extend((item.tool.server_id, item.tool.tool_name))
-    fields.extend(source.id for source in item.provenance)
+    fields.extend(strip_registry_namespace(source.id) for source in item.provenance)
     text = " ".join(field for field in fields if field).lower()
     matched = sum(1 for term in query_terms if term in text)
     if not matched:
@@ -170,7 +171,7 @@ def _lexical_relevance(query_terms: tuple[str, ...], item: Item) -> float:
         part
         for part in (
             item.name,
-            item.source.id,
+            strip_registry_namespace(item.source.id),
             item.tool.server_id if item.tool else "",
         )
         if part

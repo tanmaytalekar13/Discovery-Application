@@ -42,6 +42,7 @@ services:
       DISCOVERY_MAX_RESULTS_PER_SOURCE: ${DISCOVERY_MAX_RESULTS_PER_SOURCE:-20}
       SOURCE_CACHE_DIR: ${SOURCE_CACHE_DIR:-/data/discovery_cache}
     volumes:
+      - ./platform/backend/app:/app/app
       - ./platform/arcadedb/init:/app/arcadedb/init:ro
       # Persistent cache for downloaded repo trees/files/READMEs so a
       # container restart or rebuild doesn't wipe out already-downloaded

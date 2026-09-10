@@ -48,7 +48,7 @@ export class DiscoveryService {
   search(
     query: string,
     type: PreferredType = 'all',
-    limit: number = 25,
+    limit: number = 100,
   ): Observable<DiscoveryResult> {
     const params = new HttpParams()
       .set('q', query)

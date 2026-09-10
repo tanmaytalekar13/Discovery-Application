@@ -17,6 +17,7 @@ locally after reading valid list pages.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 import re
 from typing import Any
@@ -28,10 +29,59 @@ from app.models import DiscoverySource, ItemType, SourceType
 DEFAULT_MCP_REGISTRY_URL = (
     "https://registry.modelcontextprotocol.io"
 )
-DEFAULT_MCP_REGISTRY_TIMEOUT_SECONDS = 10.0
+DEFAULT_MCP_REGISTRY_TIMEOUT_SECONDS = 35.0
 DEFAULT_MCP_REGISTRY_PAGE_SIZE = 50
 DEFAULT_MCP_REGISTRY_MAX_RESULTS = 100
 DEFAULT_MCP_REGISTRY_MAX_PAGES = 10
+
+_PROTOCOL_NOISE_TERMS = {
+    "mcp",
+    "server",
+    "servers",
+    "tool",
+    "tools",
+    "protocol",
+    "client",
+    "service",
+    "services",
+    "api",
+}
+
+
+def extract_search_terms(query: str | None) -> tuple[str | None, list[str]]:
+    """Clean a user search query for the official MCP Registry API.
+
+    Returns (primary_search_term, significant_tokens).
+    Removes generic protocol words (like 'mcp', 'server', 'tool') which otherwise
+    break exact-substring matching on the registry endpoint.
+    """
+    if query is None:
+        return None, []
+    raw_tokens = [t for t in re.findall(r"[a-zA-Z0-9_-]+", query.lower()) if len(t) > 1]
+    filtered_tokens = [t for t in raw_tokens if t not in _PROTOCOL_NOISE_TERMS]
+
+    tokens = filtered_tokens if filtered_tokens else raw_tokens
+    primary = " ".join(tokens).strip() if tokens else query.strip()
+    return primary or None, tokens
+
+
+# Registry server names are ``<publisher-namespace>.<owner>/<slug>``, e.g.
+# ``io.github.fieldcure/filesystem`` or ``ai.smithery/some-tool``. The
+# namespace segment identifies *who published the entry* (almost always a
+# GitHub-based reverse-DNS namespace) - it says nothing about what the
+# server actually does. Left in, a query term like "github" would match
+# nearly every entry in the registry regardless of relevance, since almost
+# every unscoped publisher namespace is "io.github.*". Stripping it keeps
+# only the meaningful owner/slug text for matching, so "github" only
+# matches entries that are genuinely about GitHub (e.g. a slug like
+# "github-mcp-server" or "github-repos"), not everything hosted under the
+# io.github.* namespace.
+_NAMESPACE_PREFIX_PATTERN = re.compile(r"^[a-z]{2,4}\.[a-z0-9][a-z0-9_-]*[./]")
+
+
+def strip_registry_namespace(server_name: str) -> str:
+    """Strip the reverse-DNS publisher namespace from a registry server name."""
+    return _NAMESPACE_PREFIX_PATTERN.sub("", server_name.lower(), count=1)
 
 
 class MCPRegistryError(RuntimeError):
@@ -115,60 +165,98 @@ class MCPRegistryClient:
         if max_results < 1:
             raise ValueError("max_results must be at least 1")
 
+        primary_term, tokens = extract_search_terms(query)
         candidates_by_name: dict[str, MCPRegistryCandidate] = {}
-        cursor: str | None = None
 
-        for _ in range(self._max_pages):
-            params: dict[str, Any] = {
-                "limit": self._page_size,
-            }
-            if cursor:
-                params["cursor"] = cursor
+        # When searching with a query, the official registry returns focused
+        # matches; we only need a few pages (max 3) instead of 10.
+        max_pages = min(self._max_pages, 3) if primary_term else self._max_pages
 
-            payload = await self._request(params=params)
-            entries = payload.get("servers")
+        async def _fetch_pages(search_param: str | None) -> dict[str, MCPRegistryCandidate]:
+            found: dict[str, MCPRegistryCandidate] = {}
+            cursor: str | None = None
+            for _ in range(max_pages):
+                params: dict[str, Any] = {
+                    "limit": self._page_size,
+                }
+                if search_param:
+                    params["search"] = search_param
+                if cursor:
+                    params["cursor"] = cursor
 
-            if not isinstance(entries, list):
-                raise MCPRegistryAPIError(
-                    "MCP Registry response has an invalid 'servers' field"
-                )
+                payload = await self._request(params=params)
+                entries = payload.get("servers")
 
-            for entry in entries:
-                candidate = self._parse_candidate(entry)
-                if candidate is not None and self._matches_query(candidate, query):
-                    existing = candidates_by_name.get(candidate.server_name)
-                    if existing is None or self._is_newer(candidate, existing):
-                        candidates_by_name[candidate.server_name] = candidate
+                if not isinstance(entries, list):
+                    raise MCPRegistryAPIError(
+                        "MCP Registry response has an invalid 'servers' field"
+                    )
 
-            metadata = payload.get("metadata")
-            if not isinstance(metadata, dict):
-                break
+                for entry in entries:
+                    candidate = self._parse_candidate(entry)
+                    if candidate is not None and self._matches_query(candidate, query):
+                        existing = found.get(candidate.server_name)
+                        if existing is None or self._is_newer(candidate, existing):
+                            found[candidate.server_name] = candidate
 
-            next_cursor = metadata.get("nextCursor")
-            if not next_cursor:
-                break
-            if not isinstance(next_cursor, str):
-                raise MCPRegistryAPIError(
-                    "MCP Registry metadata.nextCursor must be a string"
-                )
+                metadata = payload.get("metadata")
+                if not isinstance(metadata, dict):
+                    break
 
-            cursor = next_cursor
+                next_cursor = metadata.get("nextCursor")
+                if not next_cursor:
+                    break
+                if not isinstance(next_cursor, str):
+                    raise MCPRegistryAPIError(
+                        "MCP Registry metadata.nextCursor must be a string"
+                    )
+
+                cursor = next_cursor
+            return found
+
+        # 1. Primary search with cleaned search term
+        candidates_by_name = await _fetch_pages(primary_term)
+
+        # 2. Fallback: if multi-token query returned nothing, search tokens concurrently
+        if not candidates_by_name and len(tokens) > 1:
+            token_tasks = [
+                _fetch_pages(token)
+                for token in tokens[:3]
+                if token not in _PROTOCOL_NOISE_TERMS
+            ]
+            if token_tasks:
+                sub_results = await asyncio.gather(*token_tasks, return_exceptions=True)
+                for res in sub_results:
+                    if isinstance(res, dict):
+                        for name, cand in res.items():
+                            existing = candidates_by_name.get(name)
+                            if existing is None or self._is_newer(cand, existing):
+                                candidates_by_name[name] = cand
 
         return list(candidates_by_name.values())[:max_results]
 
     @staticmethod
     def _matches_query(candidate: MCPRegistryCandidate, query: str | None) -> bool:
-        """Match a user query without relying on unsupported API filters."""
+        """Match a user query without eliminating valid candidates due to filler words."""
         if query is None:
             return True
-        terms = [term for term in re.findall(r"[a-z0-9]+", query.lower()) if len(term) > 1]
-        if not terms:
+        raw_terms = [term for term in re.findall(r"[a-z0-9]+", query.lower()) if len(term) > 1]
+        if not raw_terms:
             return True
-        haystack = " ".join(
-            value.lower()
-            for value in (candidate.server_name, candidate.title or "", candidate.description)
-        )
-        return all(term in haystack for term in terms)
+        meaningful_terms = [t for t in raw_terms if t not in _PROTOCOL_NOISE_TERMS]
+        terms = meaningful_terms if meaningful_terms else raw_terms
+
+        haystack_pieces = [
+            candidate.server_name.lower(),
+            strip_registry_namespace(candidate.server_name),
+            (candidate.title or "").lower(),
+            candidate.description.lower(),
+        ]
+        if candidate.repository_url:
+            haystack_pieces.append(candidate.repository_url.lower())
+
+        haystack = " ".join(haystack_pieces)
+        return any(term in haystack for term in terms)
 
     @staticmethod
     def _is_newer(

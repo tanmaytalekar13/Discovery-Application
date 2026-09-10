@@ -252,6 +252,7 @@ export class MetadataStripComponent {
   }
 
   private displayName(name: string): string {
+    const cleanName = name.replace(/^(mcp|a2a):/, '');
     const map: Record<string, string> = {
       arcadedb: 'ArcadeDB',
       github: 'GitHub',
@@ -261,6 +262,6 @@ export class MetadataStripComponent {
       web_extraction: 'Web Extraction',
       well_known: 'Well-Known',
     };
-    return map[name] ?? name;
+    return map[cleanName] ?? map[name] ?? name;
   }
 }
