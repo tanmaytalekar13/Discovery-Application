@@ -7,7 +7,7 @@ import {
   PreferredType,
   SearchResultItem,
 } from './models';
-import { SearchFormComponent, SearchFormSubmit } from './search-form.component';
+import { SearchFormComponent, SearchFormSubmit, UiFilterType } from './search-form.component';
 import { ResultListComponent } from './result-list.component';
 import { MetadataStripComponent } from './metadata-strip.component';
 import { ViewCodeModalComponent } from './view-code-modal.component';
@@ -106,7 +106,7 @@ import { TestToolModalComponent } from './test-tool-modal.component';
 })
 export class DiscoveryPageComponent {
   readonly query = signal('');
-  readonly type = signal<PreferredType>('all');
+  readonly type = signal<UiFilterType>('mcp_server');
   readonly loading = signal(false);
   readonly hasSearched = signal(false);
   readonly response = signal<SearchResponse | null>(null);
@@ -118,7 +118,6 @@ export class DiscoveryPageComponent {
 
   onSearch(submit: SearchFormSubmit): void {
     this.query.set(submit.q);
-    this.type.set(submit.type);
     this.runSearch(submit.q, submit.type);
   }
 

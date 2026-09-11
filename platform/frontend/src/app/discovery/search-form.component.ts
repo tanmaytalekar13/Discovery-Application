@@ -14,6 +14,18 @@ export interface SearchFormSubmit {
   type: PreferredType;
 }
 
+/** UI-only filter: the two visible tabs the user can pick. */
+export type UiFilterType = 'mcp_server' | 'skill';
+
+/** Maps each UI tab to its backend PreferredType and the keyword suffix to inject into the query. */
+const UI_TYPE_CONFIG: Record<
+  UiFilterType,
+  { backendType: PreferredType; suffix: string }
+> = {
+  mcp_server: { backendType: 'tool', suffix: 'mcp server' },
+  skill:      { backendType: 'agent', suffix: 'skill' },
+};
+
 @Component({
   selector: 'app-search-form',
   standalone: true,
@@ -58,7 +70,7 @@ export interface SearchFormSubmit {
             <button
               class="type-btn"
               type="button"
-              [class.active]="type() === opt.value"
+              [class.active]="uiType() === opt.value"
               [disabled]="disabled"
               (click)="onType(opt.value)"
             >
@@ -181,36 +193,55 @@ export interface SearchFormSubmit {
 export class SearchFormComponent implements OnInit {
   @Input() disabled = false;
   @Input() initialValue = '';
-  @Input() initialType: PreferredType = 'all';
+  @Input() initialType: UiFilterType = 'mcp_server';
 
   @Output() submitted = new EventEmitter<SearchFormSubmit>();
 
   readonly q = signal('');
-  readonly type = signal<PreferredType>('all');
+  readonly uiType = signal<UiFilterType>('mcp_server');
 
-  readonly typeOptions: Array<{ value: PreferredType; label: string }> = [
-    { value: 'all', label: 'All' },
-    { value: 'tool', label: 'Tools' },
-    { value: 'agent', label: 'Agents' },
+  readonly typeOptions: Array<{ value: UiFilterType; label: string }> = [
+    { value: 'mcp_server', label: 'MCP Server' },
+    { value: 'skill',      label: 'Skills' },
   ];
 
   ngOnInit(): void {
     this.q.set(this.initialValue);
-    this.type.set(this.initialType);
+    this.uiType.set(this.initialType);
   }
 
   onInput(event: Event): void {
     this.q.set((event.target as HTMLInputElement).value);
   }
 
-  onType(value: PreferredType): void {
-    this.type.set(value);
+  onType(value: UiFilterType): void {
+    this.uiType.set(value);
   }
 
   onSubmit(event: Event): void {
     event.preventDefault();
     const trimmed = this.q().trim();
     if (!trimmed || this.disabled) return;
-    this.submitted.emit({ q: trimmed, type: this.type() });
+
+    const config = UI_TYPE_CONFIG[this.uiType()];
+    const enrichedQuery = injectSuffix(trimmed, config.suffix);
+
+    this.submitted.emit({ q: enrichedQuery, type: config.backendType });
   }
+}
+
+/**
+ * Appends `suffix` to `query` only if it isn't already present in the query
+ * (case-insensitive, normalised whitespace). Handles cases like:
+ *   "zoom"              -> "zoom mcp server"
+ *   "zoom mcp server"   -> "zoom mcp server"   (no duplicate)
+ *   "zoom MCP Server"   -> "zoom MCP Server"   (no duplicate, case-insensitive)
+ *   "zoom  mcp  server" -> "zoom  mcp  server" (normalises before checking)
+ */
+function injectSuffix(query: string, suffix: string): string {
+  const normalise = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (normalise(query).includes(normalise(suffix))) {
+    return query;
+  }
+  return `${query} ${suffix}`;
 }
