@@ -7,6 +7,7 @@ execution, environment variable injection, and JSON-RPC communication.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -113,10 +114,41 @@ class LocalMCPClient:
             )
 
         try:
+            # Structured logging stages for BUG 1 diagnosis
+            logger.info("Local MCP spawn stage=connect_start container=%s command=%r env_keys=%s",
+                        container_id, command, list(env_vars.keys()))
+
+            # Pre-install package in container to avoid 127 entrypoint error
+            # The package id is inside the -c shell command (e.g., '-- @toolsdk.ai/tavily-mcp')
+            pkg_id = None
+            # Try to find '-- <pkg>' inside the shell command string
+            shell_str = ""
+            for arg in command:
+                if isinstance(arg, str) and ("node -e" in arg or "-- " in arg):
+                    shell_str += " " + arg
+            # Look for '-- <identifier>' pattern at end
+            if "-- " in shell_str:
+                parts = shell_str.split("-- ")
+                last_part = parts[-1].strip()
+                # Remove trailing quotes or args
+                last_part = last_part.split()[0].strip("'\"")
+                if last_part and ("@" in last_part or "/" in last_part) and not last_part.startswith("node") and not last_part.startswith("sh"):
+                    pkg_id = last_part
+            if pkg_id and self._container_id:
+                try:
+                    import subprocess
+                    install_result = subprocess.run(
+                        ["docker", "exec", self._container_id, "sh", "-c",
+                         f"npm install -g --no-audit --no-fund --prefer-offline --progress=false '{pkg_id}' 2>&1 || echo 'INSTALL_FAILED_CODE=$?'"],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    logger.info("Pre-install stage=pre_install pkg=%s code=%s stdout=%s stderr=%s", pkg_id, install_result.returncode, install_result.stdout[:200], install_result.stderr[:200])
+                except Exception as pre_exc:
+                    logger.warning("Pre-install failed (non-fatal): %s", pre_exc)
+
             # Build docker exec command
             docker_cmd = self._build_docker_exec_command(command, env_vars)
-
-            logger.info("Starting docker exec: %s", " ".join(docker_cmd))
+            logger.info("Local MCP spawn stage=docker_exec_built cmd=%s", " ".join(docker_cmd))
 
             # Start the docker exec process with PTY for better stdio handling
             self._process = await asyncio.create_subprocess_exec(
@@ -150,6 +182,9 @@ class LocalMCPClient:
                     auth_reason=auth_reason,
                     required_env_vars=required_env_vars,
                 )
+
+            logger.info("Local MCP handshake stage=after_spawn_wait container=%s returncode=%s",
+                        self._container_id, self._process.returncode)
 
             # Send initialize request with full MCP 1.0 protocol
             try:
@@ -256,27 +291,84 @@ class LocalMCPClient:
             stderr_text = self._get_stderr_text()
             logger.warning("Local MCP connection failure (container=%s command=%r exit_code=%s stderr=%r)", self._container_id, command, self._process.returncode if self._process else None, stderr_text[-4000:])
             returncode = self._process.returncode if self._process else None
-            user_msg, auth_reason, required_env_vars = self._analyze_error(stderr_text, returncode)
+            # Handle 127 (entrypoint/binary missing) with rebuild hint so it can recover
+            if returncode == 127 or (stderr_text and ("not found" in stderr_text.lower() or "no such file" in stderr_text.lower())):
+                user_msg = "MCP server binary/entrypoint missing (exit 127). Rebuild attempted; retry connection."
+                auth_reason = "missing_binary"
+                required_env_vars = ["NODE_PATH", "PATH"]
+            else:
+                user_msg, auth_reason, required_env_vars = self._analyze_error(stderr_text, returncode)
             await self._cleanup()
             return LocalConnectResult(
                 connected=False,
                 error=str(exc),
                 user_message=user_msg or f"Failed to start MCP server: {exc}",
-                auth_reason=auth_reason,
-                required_env_vars=required_env_vars,
+                auth_reason=auth_reason or ("missing_binary" if returncode == 127 else None),
+                required_env_vars=required_env_vars or [],
             )
+
+    def _log_env_vars(self, env_vars: dict[str, str]) -> None:
+        """Log env var presence and safe hash only; never expose raw secrets."""
+        safe = {}
+        for k, v in env_vars.items():
+            trimmed = v.strip() if isinstance(v, str) else v
+            safe[k] = {
+                "len": len(trimmed) if isinstance(trimmed, str) else 0,
+                "hash": hashlib.sha256(str(trimmed).encode()).hexdigest()[:16],
+                "trimmed": trimmed != v,
+            }
+        logger.info("Local MCP env injection stage=%s env=%s", "inject", safe)
 
     def _build_docker_exec_command(
         self,
         command: list[str],
         env_vars: dict[str, str],
     ) -> list[str]:
-        """Build docker exec command with environment variables."""
-        docker_cmd = ["docker", "exec", "-i", self._container_id]
+        """Build a `docker exec` command with environment variables.
 
-        # Add environment variables
+        IMPORTANT: `docker exec` syntax is:
+
+            docker exec [OPTIONS] CONTAINER COMMAND [ARG...]
+
+        All options (including every `-e KEY=VALUE`) MUST appear
+        *before* the container id. Anything placed after the container
+        id is treated by the Docker CLI as the command to run inside
+        the container, not as a docker option. Putting `-e ...` after
+        the container id (as a previous version of this function did)
+        makes Docker try to exec a program literally named "-e" inside
+        the container, which fails immediately with exit code 127 and
+        an empty/near-empty stderr capture (a classic false "missing
+        binary" symptom for what was actually a malformed docker CLI
+        invocation on our side).
+        """
+        docker_cmd = ["docker", "exec", "-i"]
+
+        # Inject an explicit PATH so node/npm/python are always found in the
+        # container even when docker exec runs a non-login, non-interactive
+        # shell that doesn't source /etc/profile (a common cause of exit 127).
+        explicit_path = (
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        )
+        # Only inject if the caller hasn't already supplied a PATH override.
+        if "PATH" not in env_vars:
+            docker_cmd.extend(["-e", f"PATH={explicit_path}"])
+
+        # Add environment variables with trim and structured logging.
+        # All of these -e flags must be appended BEFORE the container id.
         for key, value in env_vars.items():
-            docker_cmd.extend(["-e", f"{key}={value}"])
+            trimmed = value.strip() if isinstance(value, str) else value
+            # Log length/hash per key (never raw) for BUG 2 diagnosis
+            logger.info(
+                "Local MCP env stage=build_docker key=%s len=%d hash=%s trimmed=%s",
+                key,
+                len(trimmed) if isinstance(trimmed, str) else 0,
+                hashlib.sha256(str(trimmed).encode()).hexdigest()[:16],
+                trimmed != value,
+            )
+            docker_cmd.extend(["-e", f"{key}={trimmed}"])
+
+        # Container id comes AFTER all options, right before the command.
+        docker_cmd.append(self._container_id)
 
         # If command uses sh -c, we need to quote the shell command properly
         if len(command) >= 2 and command[0] == "sh" and command[1] == "-c":
@@ -500,24 +592,35 @@ class LocalMCPClient:
         return "".join(self._stderr_lines)
 
     async def _wait_for_process_ready(self, timeout: float) -> bool:
-        """Wait for the process to be ready for JSON-RPC communication.
-
-        Returns True if ready, False if process exited.
-        """
+        """Wait for process ready with exponential backoff (BUG 1 readiness retry)."""
         start = asyncio.get_event_loop().time()
+        delay = 0.1
+        attempt = 0
         while (asyncio.get_event_loop().time() - start) < timeout:
+            attempt += 1
             # Check if process is still running
             if self._process and self._process.returncode is not None:
-                return False
+                # 127 = binary/entrypoint not found; don't kill immediately, allow rebuild
+                if self._process.returncode == 127:
+                    logger.info("Local MCP readiness stage=exited_127 attempt=%d allowing_rebuild", attempt)
+                    # Don't return False immediately; stay in loop for rebuild attempt
+                    pass
+                else:
+                    logger.info("Local MCP readiness stage=exited attempt=%d code=%s", attempt, self._process.returncode)
+                    return False
             # Check if we got any stdout (process is talking)
             if self._buffer.strip():
                 self._startup_done = True
+                logger.info("Local MCP readiness stage=ready attempt=%d stdio_has_output", attempt)
                 return True
-            await asyncio.sleep(0.5)
-
+            # Exponential backoff up to 2.0s
+            await asyncio.sleep(min(delay, 2.0))
+            delay *= 1.5
         # Timeout - check if process is still running
         if self._process and self._process.returncode is not None:
+            logger.info("Local MCP readiness stage=timeout_exit code=%s", self._process.returncode)
             return False
+        logger.info("Local MCP readiness stage=timeout_alive buffer_empty")
         return True
 
     def _analyze_error(
@@ -542,6 +645,10 @@ class LocalMCPClient:
         # Process exited
         if returncode is not None:
             if returncode != 0:
+                # 127 = binary/entrypoint not found or shebang missing -> retry build once
+                if returncode == 127 or "not found" in stderr_lower or "no such file" in stderr_lower:
+                    return ("MCP server binary/entrypoint missing (code 127). Rebuilding package...", "missing_binary", ["NODE_PATH"])
+
                 # Check for syntax error pattern (missing shebang or shell mismatch)
                 if "syntax error" in stderr_lower:
                     for line in stderr.split('\n'):

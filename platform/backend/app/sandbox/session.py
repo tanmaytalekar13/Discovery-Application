@@ -185,11 +185,20 @@ class SessionStore:
             if session is None:
                 return None
             now = time.monotonic()
-            session.access_token = access_token
+            trimmed_token = access_token.strip() if isinstance(access_token, str) else access_token
+            session.access_token = trimmed_token
             session.token_type = token_type
             session.refresh_token = refresh_token
             session.auth_method = auth_method
             session.expires_at = now + (ttl_seconds or TOKEN_TTL_SECONDS)
+            import hashlib
+            logger.info(
+                "Session token stage=store session=%s method=%s len=%d hash=%s trimmed=%s",
+                session_id, auth_method,
+                len(trimmed_token) if isinstance(trimmed_token, str) else 0,
+                hashlib.sha256(str(trimmed_token).encode()).hexdigest()[:16] if trimmed_token else "",
+                trimmed_token != access_token,
+            )
             self._store(session)
             logger.info(
                 "Stored %s token for session %s (expires in %ds)",

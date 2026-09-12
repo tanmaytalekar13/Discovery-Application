@@ -71,6 +71,10 @@ DEFAULT_ALLOWED_DOMAINS = {
     "npm": [
         "registry.npmjs.org",
         "registry.npmmirror.com",
+        # Scoped-package registries used by vendors (e.g. @toolsdk.ai/*)
+        "toolsdk.ai",
+        "npm.pkg.github.com",
+        "registry.yarnpkg.com",
     ],
     "pip": [
         "pypi.org",
@@ -135,13 +139,19 @@ class ContainerSession:
 # This runner installs the package, fixes missing shebangs/CRLF, and invokes node directly.
 NPM_RUNNER_SCRIPT = (
     'const {execSync,spawn}=require("child_process"),fs=require("fs"),path=require("path");'
+    # getPkgName: strips a trailing @version from any package id, including scoped packages.
+    # For @scope/pkg@1.2.3 -> lastIndexOf("@") hits the version @, at>0 so strips it -> @scope/pkg.
+    # For @scope/pkg (no version) -> lastIndexOf("@") == 0, not >0, returns full string. Correct.
     'function getPkgName(id){const at=id.lastIndexOf("@");return at>0?id.slice(0,at):id;}'
+    'function getGlobalRoot(){try{return execSync("npm root -g").toString().trim();}catch(e){return "/usr/lib/node_modules";}}'
     'const id=process.argv[1],extraArgs=process.argv.slice(2);'
-    'let globalRoot="/usr/local/lib/node_modules";'
-    'try{globalRoot=execSync("npm root -g").toString().trim();}catch(e){}'
-    'const pkgDir=path.join(globalRoot,getPkgName(id));'
+    'let globalRoot=getGlobalRoot();'
+    'let pkgDir=path.join(globalRoot,getPkgName(id));'
+    # If package dir doesn\'t exist, install it globally (network access required)
     'if(!fs.existsSync(pkgDir)){'
-    'try{execSync("npm install -g --no-audit --no-fund --prefer-offline --progress=false "+JSON.stringify(id),{stdio:["ignore","ignore","inherit"]});}catch(e){process.exit(1);}'
+    'try{execSync("npm install -g --no-audit --no-fund --prefer-offline --progress=false "+JSON.stringify(id),{stdio:["ignore","pipe","inherit"]});}catch(e){console.error("npm install failed:",e);process.exit(1);}'
+    # Re-resolve globalRoot and pkgDir after install (npm may use a different root)
+    'globalRoot=getGlobalRoot();pkgDir=path.join(globalRoot,getPkgName(id));'
     '}'
     'let binPath=null;'
     'const pkgJsonPath=path.join(pkgDir,"package.json");'
@@ -153,9 +163,10 @@ NPM_RUNNER_SCRIPT = (
     'else if(pkg.main){binPath=path.resolve(pkgDir,pkg.main);}'
     '}catch(e){}'
     '}'
+    # Fallback: look up binary on PATH (covers packages that install a bin to /usr/local/bin)
     'if(!binPath||!fs.existsSync(binPath)){'
     'try{const binName=getPkgName(id).split("/").pop();'
-    'const candidate=execSync("which "+binName+" 2>/dev/null").toString().trim();'
+    'const candidate=execSync("which "+JSON.stringify(binName)+" 2>/dev/null").toString().trim();'
     'if(candidate&&fs.existsSync(candidate))binPath=fs.realpathSync(candidate);'
     '}catch(e){}'
     '}'
@@ -785,8 +796,17 @@ class ContainerManager:
             except Exception as exc:
                 logger.warning("Failed to pull image %s (may already exist): %s", image, exc)
 
-        # Build environment list
-        env_list = [f"{k}={v}" for k, v in env_vars.items()]
+        # Build environment list (trim whitespace, never expose secrets in logs)
+        import hashlib
+        env_list = []
+        for k, v in env_vars.items():
+            trimmed = v.strip() if isinstance(v, str) else v
+            env_list.append(f"{k}={trimmed}")
+            logger.info(
+                "Container env stage=inject key=%s len=%d hash=%s trimmed=%s container=%s",
+                k, len(trimmed) if isinstance(trimmed, str) else 0,
+                hashlib.sha256(str(trimmed).encode()).hexdigest()[:16], trimmed != v, session_id,
+            )
 
         # Mount cache volumes to avoid re-downloading packages on every test run
         volumes: dict[str, dict[str, str]] = {}

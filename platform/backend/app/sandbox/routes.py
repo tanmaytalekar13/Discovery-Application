@@ -467,9 +467,11 @@ async def submit_manual_token(
         else:
             session = existing
 
+    # BUG 2: trim whitespace from user input before storage
+    trimmed_token = token.strip() if isinstance(token, str) else token
     session_store.store_token(
         session.session_id,
-        access_token=token,
+        access_token=trimmed_token,
         token_type="Bearer",
         auth_method="bearer",
     )
@@ -614,6 +616,8 @@ async def connect_local(
             show_retry=False,
         )
 
+    # Trim env vars before injection (BUG 2 whitespace corruption)
+    trimmed_env = {k: (v.strip() if isinstance(v, str) else v) for k, v in body.env_vars.items()}
     # Build tool config
     config = LocalToolConfig(
         registry_type="pip" if hint.registry_type == "pypi" else hint.registry_type,
@@ -629,7 +633,7 @@ async def connect_local(
         session = await container_manager.create_container(
             item_id=item_id,
             config=config,
-            env_vars=body.env_vars,
+            env_vars=trimmed_env,
             allowed_domains=hint.allowed_domains,
         )
 
@@ -640,7 +644,7 @@ async def connect_local(
         # Run connect (this runs the command inside the Docker container)
         connect_result = await mcp_client.connect(
             command=command,
-            env_vars=body.env_vars,
+            env_vars=trimmed_env,
             timeout=60.0,
             container_id=session.container_id,
         )
@@ -990,7 +994,9 @@ async def connect_source(
                    "/test/source/prepare first to see why.",
         )
 
-    missing = [v for v in run_config.env_vars if v not in body.env_vars]
+    # Trim env vars before injection (BUG 2 whitespace corruption)
+    trimmed_env = {k: (v.strip() if isinstance(v, str) else v) for k, v in body.env_vars.items()}
+    missing = [v for v in run_config.env_vars if v not in trimmed_env]
     if missing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1004,13 +1010,13 @@ async def connect_source(
             item=item,
             github_hint=hint,
             run_config=run_config,
-            env_vars=body.env_vars,
+            env_vars=trimmed_env,
         )
 
         mcp_client = LocalMCPClient()
         connect_result = await mcp_client.connect(
             command=[run_config.command, *run_config.args],
-            env_vars=body.env_vars,
+            env_vars=trimmed_env,
             timeout=60.0,
             container_id=session.container_id,
         )

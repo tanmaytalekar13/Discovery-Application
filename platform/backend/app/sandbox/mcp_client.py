@@ -23,6 +23,7 @@ handshake-era protocol revisions used by official Registry remotes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -680,12 +681,21 @@ class MCPTestClient:
             "User-Agent": "DiscoveryApplicationBot/1.0 (+tool-test)",
         }
         if self._auth_token:
+            trimmed_token = self._auth_token.strip() if isinstance(self._auth_token, str) else self._auth_token
+            # Log hash/length only (BUG 2 diagnosis) — never log raw token
+            logger.info(
+                "Remote MCP auth stage=header_build token_len=%d token_hash=%s",
+                len(trimmed_token) if isinstance(trimmed_token, str) else 0,
+                hashlib.sha256(str(trimmed_token).encode()).hexdigest()[:16] if trimmed_token else "",
+            )
             # Most servers accept Authorization: Bearer <token>. Some tools
             # (e.g. Roboflow) require a custom header like x-api-key.
             if self._auth_header:
-                headers[self._auth_header] = (self._auth_value_prefix or "") + self._auth_token
+                # Ensure no double Bearer prefix; match server documentation
+                prefix = (self._auth_value_prefix or "")
+                headers[self._auth_header] = prefix + trimmed_token
             else:
-                headers["Authorization"] = f"Bearer {self._auth_token}"
+                headers["Authorization"] = f"Bearer {trimmed_token}"
         return headers
 
     # ---- retry helper ---------------------------------------------------
