@@ -166,8 +166,17 @@ async def connect(
     candidate, url = await _require_testable(item_id, repository)
     token = _extract_bearer_token(session_store, session_id) if session_id else None
 
-    # URL validation happens in the client constructor. A malformed or unsafe
-    # registry URL must be a failed test, never an opaque FastAPI 500.
+    # A single generic Exception handler is used here on purpose (rather than
+    # a narrower `except MCPClientError` plus a hand-rolled fallback for
+    # everything else). MCPTestClient.connect() already turns most failures
+    # into a graceful ConnectResult internally, but URL validation
+    # (UnsafeURLError) happens synchronously in the constructor, and some
+    # exception types (e.g. mcp.shared.exceptions.McpError, or any future
+    # exception type we haven't special-cased) can still escape uncaught.
+    # Always routing every exception through classify_connection_error()
+    # means the frontend consistently gets show_token_input/show_oauth_button
+    # set from the same fallback logic used everywhere else, instead of a
+    # dead-end error with no way for the user to retry with credentials.
     try:
         client = MCPTestClient(
             url=url,
@@ -177,10 +186,10 @@ async def connect(
             auth_value_prefix=candidate.auth_value_prefix,
         )
         result = await client.connect()
-    except MCPClientError as exc:
-        logger.warning(
-            "Remote MCP connection rejected (item_id=%s, transport=%s, url=%s): %s",
-            item_id, candidate.type, url, exc, exc_info=True,
+    except Exception as exc:
+        logger.exception(
+            "Remote MCP connection failed (item_id=%s, transport=%s, url=%s)",
+            item_id, candidate.type, url,
         )
         info = classify_connection_error(exc)
         return ToolConnectResponse(
@@ -189,18 +198,6 @@ async def connect(
             requires_auth=info.auth_reason == "unauthorized",
             auth_reason=info.auth_reason, user_message=info.user_message,
             show_token_input=info.show_token_input, show_oauth_button=info.show_oauth_button,
-        )
-    except Exception:
-        # Keep the full traceback in server logs. Do not expose exception text:
-        # some HTTP clients include request headers in their diagnostics.
-        logger.exception(
-            "Unexpected remote MCP connection failure (item_id=%s, transport=%s, url=%s)",
-            item_id, candidate.type, url,
-        )
-        return ToolConnectResponse(
-            connected=False, transport=candidate.type, error="Unexpected MCP connection failure",
-            auth_reason="unknown",
-            user_message="The MCP connection failed unexpectedly. Please retry or contact the server provider.",
         )
 
     return ToolConnectResponse(
@@ -259,7 +256,31 @@ async def invoke(
         auth_header=candidate.auth_header,
         auth_value_prefix=candidate.auth_value_prefix,
     )
-    result = await client.invoke(body.tool_name, body.arguments)
+
+    # MCPTestClient.invoke() already catches its own known error types and
+    # returns a graceful InvokeResult, but - just like connect() above - an
+    # exception type it doesn't recognize (e.g. McpError, or anything new)
+    # can still escape uncaught. Without this guard the endpoint would
+    # surface a raw 500 to the frontend instead of a structured
+    # ToolInvokeResponse the UI knows how to render (including an
+    # auth-retry affordance when relevant).
+    try:
+        result = await client.invoke(body.tool_name, body.arguments)
+    except Exception as exc:
+        logger.exception(
+            "Remote MCP invoke failed (item_id=%s, tool=%s, url=%s)",
+            item_id, body.tool_name, url,
+        )
+        info = classify_connection_error(exc)
+        return ToolInvokeResponse(
+            status="error",
+            error=info.user_message,
+            requires_auth=info.auth_reason == "unauthorized",
+            auth_reason=info.auth_reason,
+            user_message=info.user_message,
+            show_token_input=info.show_token_input,
+            show_oauth_button=info.show_oauth_button,
+        )
 
     return ToolInvokeResponse(
         status=result.status,

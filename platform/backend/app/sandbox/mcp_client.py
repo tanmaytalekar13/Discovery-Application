@@ -33,6 +33,15 @@ from urllib.parse import urlparse
 
 import httpx
 
+# McpError is the JSON-RPC-level error raised by the official `mcp` SDK
+# (e.g. when a server terminates a session, sends back a JSON-RPC error
+# object during initialize/call_tool, etc). It is NOT an httpx error and
+# is NOT a subclass of our own MCPClientError hierarchy, so it must be
+# handled explicitly wherever we classify connection/invoke failures -
+# otherwise it escapes uncaught straight past classify_connection_error
+# and up into the API layer as an unhandled 500.
+from mcp.shared.exceptions import McpError
+
 # BaseExceptionGroup is built-in in Python 3.11+; fall back to the
 # exceptiongroup backport package on earlier versions.
 try:
@@ -56,6 +65,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_RETRIES = 1  # 1 = one retry after the first attempt
 DEFAULT_SSE_READ_TIMEOUT = 60.0
+
+# Hosted-remote domains whose MCP endpoint behavior is known to break the
+# standard client flow in ways no amount of correct auth can fix. Smithery
+# removed the standard MCP initialize handshake/session semantics for its
+# hosted remotes (2026-07-28 release, part of its Arcade.dev-runtime
+# migration) and appears to now require a Smithery-issued connection
+# (their `@smithery/api` `connections.set()` / `createConnection()` flow)
+# rather than accepting a raw provider bearer token directly. Until that
+# flow is integrated, surface a specific "known incompatible" message
+# instead of a misleading "invalid token" one.
+_KNOWN_INCOMPATIBLE_HOSTS = frozenset({"server.smithery.ai"})
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +124,50 @@ AUTH_REASON_INCOMPATIBLE = "incompatible"
 AUTH_REASON_UNKNOWN = "unknown"
 
 
-def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
+def _mcp_error_message(exc: McpError) -> str:
+    """Best-effort extraction of the human-readable message from an McpError.
+
+    The `mcp` SDK raises McpError wrapping a JSON-RPC ErrorData object
+    (exc.error.message / exc.error.code). Some versions/transports may
+    not populate that structured object, so fall back to str(exc).
+    """
+    err = getattr(exc, "error", None)
+    msg = getattr(err, "message", None) if err is not None else None
+    return msg or str(exc) or "Session terminated"
+
+
+def _known_incompatible_host(url: str | None) -> bool:
+    """Return True if `url` points at a host with a known-broken MCP flow.
+
+    Pure hostname check — no network calls. Matches on exact hostname
+    (case-insensitive) rather than substring, so a URL like
+    `https://not-server.smithery.ai.evil.example` would NOT match, and
+    subdomains would need to be added explicitly.
+    """
+    if not url:
+        return False
+    try:
+        host = urlparse(url).hostname
+    except (ValueError, TypeError):
+        return False
+    return bool(host) and host.lower() in _KNOWN_INCOMPATIBLE_HOSTS
+
+
+def classify_connection_error(
+    exc: BaseException, url: str | None = None
+) -> ConnectionErrorInfo:
     """Classify a connection/invoke failure for user-facing display.
 
     Handles:
+      - Hosts with a known-incompatible hosted-remote MCP flow (checked
+        first, before any status/error-text based classification, since
+        those hosts return misleading signals — e.g. a 401 "invalid_token"
+        even when the token is correct — that would otherwise be
+        classified as an ordinary auth problem)
       - Direct HTTP errors (401, 402, 403, 404, 429, 5xx)
       - ExceptionGroup-wrapped errors from the MCP library's internal task groups
+      - MCP JSON-RPC protocol-level errors (McpError), e.g. a server that
+        terminates the session instead of returning a plain HTTP 401
       - Network-level errors (DNS, TLS, connect refused, genuine timeouts)
       - Any other unexpected exception
 
@@ -117,11 +175,32 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
 
     Args:
         exc: Any exception from the MCP call stack.
+        url: The URL that was being dialed when `exc` was raised, if known.
+            Used only for the known-incompatible-host check above; every
+            other branch classifies purely from `exc`.
 
     Returns:
         ConnectionErrorInfo with auth_reason, user_message, show_token_input,
         and show_oauth_button fields populated.
     """
+    # A known-incompatible host is checked first and unconditionally: no
+    # amount of correct auth fixes it, so it should never be mislabeled as
+    # an ordinary "unauthorized" or "unknown" case further down.
+    if _known_incompatible_host(url):
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_INCOMPATIBLE,
+            user_message=(
+                "This tool is hosted on Smithery, which changed how it "
+                "handles authentication for its remote MCP servers. "
+                "Smithery no longer accepts a provider API key/token "
+                "directly — it requires a connection created through "
+                "Smithery's own Connect API, which this app doesn't yet "
+                "support. Providing a token here will not fix this."
+            ),
+            show_token_input=False,
+            show_oauth_button=False,
+        )
+
     # Recursively unwrap ExceptionGroup / BaseExceptionGroup to find the
     # first meaningful exception. MCP library wraps errors in TaskGroups.
     # Follow __cause__ chain to handle nested conversions:
@@ -204,6 +283,36 @@ def classify_connection_error(exc: BaseException) -> ConnectionErrorInfo:
             auth_reason=AUTH_REASON_UNKNOWN,
             user_message=f"Server rejected the request (HTTP {status}). "
             "If credentials are needed, try providing them below.",
+            show_token_input=True,
+            show_oauth_button=True,
+        )
+
+    # --- MCP protocol-level errors (JSON-RPC error responses) ---
+    # Some hosted MCP transports don't surface auth failures as a plain
+    # HTTP 401/403 - instead they let the transport-level handshake
+    # succeed and then terminate the session (or return a JSON-RPC error)
+    # during initialize/call_tool. We can't always tell "session
+    # terminated because of bad/missing auth" apart from a genuine
+    # protocol failure, so - like the generic fallback below - we offer
+    # credentials as a next step rather than dead-ending the user. If the
+    # error text itself names an auth problem, classify it more
+    # specifically as unauthorized so the copy is more accurate.
+    if isinstance(root_cause, McpError):
+        msg = _mcp_error_message(root_cause)
+        if _is_auth_error_text(msg):
+            return ConnectionErrorInfo(
+                auth_reason=AUTH_REASON_UNAUTHORIZED,
+                user_message="This MCP server requires credentials. "
+                "Provide your API key or bearer token to continue.",
+                show_token_input=True,
+                show_oauth_button=True,
+            )
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_UNKNOWN,
+            user_message=(
+                f"The MCP server ended the connection ({msg}). If this tool "
+                "requires credentials, provide your API key or bearer token below."
+            ),
             show_token_input=True,
             show_oauth_button=True,
         )
@@ -334,6 +443,11 @@ def _log_remote_failure(operation: str, url: str, exc: BaseException) -> None:
         )
     elif isinstance(root, httpx.TimeoutException):
         logger.error("MCP %s timeout (url=%s type=%s): %s", operation, url.split("?", 1)[0], type(root).__name__, root, exc_info=exc)
+    elif isinstance(root, McpError):
+        logger.error(
+            "MCP %s protocol-level error (url=%s message=%s): %s",
+            operation, url.split("?", 1)[0], _mcp_error_message(root), root, exc_info=exc,
+        )
     else:
         logger.error("MCP %s transport/protocol failure (url=%s type=%s): %s", operation, url.split("?", 1)[0], type(root).__name__, root, exc_info=exc)
 
@@ -751,8 +865,11 @@ class MCPTestClient:
                 # MCP library wraps many errors in ExceptionGroup — unwrap the
                 # first real cause. If it's an HTTPStatusError, let it propagate
                 # to the existing HTTP handler so auth_required can be detected.
+                # If it's an McpError (JSON-RPC level failure), let it propagate
+                # too so the outer handler classifies it via classify_connection_error
+                # instead of getting relabelled as a generic MCPClientError below.
                 root = _unwrap_exception(exc)
-                if isinstance(root, httpx.HTTPStatusError):
+                if isinstance(root, (httpx.HTTPStatusError, McpError)):
                     raise root from exc
                 raise MCPClientError(
                     f"Unhandled exception during connect: {root}"
@@ -785,6 +902,15 @@ class MCPTestClient:
                     auth_required=True,
                     transport=transport,
                 )
+            # NOTE: McpError (mcp.shared.exceptions.McpError) is deliberately
+            # NOT caught here. Some hosted MCP servers terminate the session
+            # or return a JSON-RPC error during initialize/list_tools instead
+            # of a plain HTTP 401/403 (e.g. "Session terminated"). Catching it
+            # here would force a decision this layer can't make reliably; it
+            # is left to propagate to connect()'s outer except block below,
+            # which calls classify_connection_error() to turn it into a
+            # proper ConnectResult (offering a token/OAuth retry) instead of
+            # crashing the request.
 
             tools = [
                 RemoteToolInfo(
@@ -816,9 +942,10 @@ class MCPTestClient:
             MCPClientError,
             httpx.HTTPStatusError,
             RuntimeError,
+            McpError,  # JSON-RPC-level failure (e.g. "Session terminated")
         ) as exc:
             _log_remote_failure("connect", self._url, exc)
-            info = classify_connection_error(exc)
+            info = classify_connection_error(exc, url=self._url)
             # Auth errors (401/403) that come through the outer handler
             # (wrapped in ExceptionGroup) should still surface as auth_required.
             # A failed network connection, timeout, or malformed endpoint is
@@ -861,7 +988,7 @@ class MCPTestClient:
                 ) from None
             except (ExceptionGroup, BaseExceptionGroup) as exc:
                 root = _unwrap_exception(exc)
-                if isinstance(root, httpx.HTTPStatusError):
+                if isinstance(root, (httpx.HTTPStatusError, McpError)):
                     raise root from exc
                 raise MCPClientError(
                     f"Unhandled exception during invoke: {root}"
@@ -899,6 +1026,10 @@ class MCPTestClient:
                     requires_auth=True,
                     duration_ms=_elapsed_ms(started),
                 )
+            # NOTE: McpError is deliberately not caught here — see the
+            # matching note in _do_connect above. It propagates to invoke()'s
+            # outer except block, which classifies it via
+            # classify_connection_error() instead of crashing the request.
 
             duration = _elapsed_ms(started)
 
@@ -985,12 +1116,15 @@ class MCPTestClient:
             MCPTransportError,
             MCPProtocolError,
             MCPClientError,
+            McpError,  # JSON-RPC-level failure (e.g. "Session terminated")
         ) as exc:
-            info = classify_connection_error(exc)
+            _log_remote_failure("invoke", self._url, exc)
+            info = classify_connection_error(exc, url=self._url)
             return InvokeResult(
                 status="error",
                 error=info.user_message,
                 duration_ms=_elapsed_ms(started),
+                requires_auth=info.auth_reason == AUTH_REASON_UNAUTHORIZED,
                 auth_reason=info.auth_reason,
                 user_message=info.user_message,
                 show_token_input=info.show_token_input,
