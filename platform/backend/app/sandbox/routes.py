@@ -26,16 +26,15 @@ from the existing discovery routes.
 from __future__ import annotations
 
 import logging
-import secrets
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse, Response as FastAPIResponse
 
 from app.api.dependencies import get_item_repository
 from app.api.schemas import (
-    OAuthCallbackResponse,
+    ManualTokenRequest,
     OAuthStartResponse,
     ToolConnectResponse,
     ToolInvokeRequest,
@@ -60,6 +59,16 @@ from app.sandbox.container_schemas import (
 from app.sandbox.extract import extract_local_run_config
 from app.sandbox.local_mcp_client import LocalMCPClient
 from app.sandbox.mcp_client import MCPClientError, MCPTestClient, classify_connection_error
+from app.sandbox.oauth import (
+    OAuthFlowError,
+    build_authorization_url,
+    exchange_code_for_token,
+    frontend_base_url,
+    get_flow_store,
+    redirect_uri_for_item,
+    register_dynamic_client,
+    resolve_authorization_server,
+)
 from app.sandbox.schemas import GithubSourceHint, LocalPackageHint, LocalRunConfig, RemoteCandidate
 from app.sandbox.session import get_session_store, SessionStore
 
@@ -191,7 +200,7 @@ async def connect(
             "Remote MCP connection failed (item_id=%s, transport=%s, url=%s)",
             item_id, candidate.type, url,
         )
-        info = classify_connection_error(exc)
+        info = classify_connection_error(exc, url=url)
         return ToolConnectResponse(
             connected=False, auth_required=info.auth_reason == "unauthorized",
             transport=candidate.type, error=info.user_message,
@@ -271,7 +280,7 @@ async def invoke(
             "Remote MCP invoke failed (item_id=%s, tool=%s, url=%s)",
             item_id, body.tool_name, url,
         )
-        info = classify_connection_error(exc)
+        info = classify_connection_error(exc, url=url)
         return ToolInvokeResponse(
             status="error",
             error=info.user_message,
@@ -310,119 +319,183 @@ async def authorize_start(
     repository: ItemRepository = Depends(get_item_repository),
     session_store: SessionStore = Depends(get_session_store),
 ):
-    """Generate an OAuth authorization URL and return it for redirect.
+    """Discover the server's OAuth metadata and build an authorize URL.
 
-    If the connect endpoint returned `auth_required=True` and
-    `WWW-Authenticate` metadata, this endpoint uses that metadata to
-    build the appropriate authorization URL.
-
-    If the item has no OAuth metadata, a 400 is returned with a
-    message suggesting the user provide a manual API key instead.
-
-    The returned `authorization_url` should be opened in a new tab
-    for the user to complete the OAuth flow. After authorization,
-    the OAuth provider redirects to our `/callback` endpoint with
-    the `state` and `code` parameters.
-
-    The `session_id` is used to associate the OAuth callback with
-    the correct in-memory session (and to verify the CSRF `state`).
+    Implements the client side of the MCP authorization spec:
+      1. RFC 9728 protected-resource metadata (fallback: MCP origin)
+      2. RFC 8414 authorization-server metadata
+      3. RFC 7591 dynamic client registration (when offered)
+      4. Authorization-code + PKCE (S256) authorize URL with RFC 8707
+         `resource` binding
+    The user completes the flow in a new tab; the provider redirects to
+    /test/authorize/callback, which stores the token on the session.
     """
-    # First ensure we have a session to attach this flow to
+    candidate, url = await _require_testable(item_id, repository)
+
+    # Ensure we have a session to attach the eventual token to.
     if session_id:
-        store = get_session_store()
-        existing = store.get_session(session_id)
+        existing = session_store.get_session(session_id)
         if existing is None:
             session_id = None  # treat as missing; create new
-
     if session_id is None:
-        store = get_session_store()
-        session = store.create_session(item_id)
+        session = session_store.create_session(item_id)
         session_id = session.session_id
 
-    # Build the authorization URL.
-    # For now we accept a pre-configured URL from the tool's classification
-    # detail (WWW-Authenticate header). If no pre-configured URL exists,
-    # we can't auto-discover the OAuth endpoint from the MCP spec, so we
-    # return a 400 with a hint.
-    #
-    # TODO: When MCP spec adds OAuth discovery metadata, wire it here.
-    item = await _require_item(item_id, repository)
-    classification = classify_tool(item)
+    try:
+        as_metadata = await resolve_authorization_server(url)
+    except OAuthFlowError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    # Look for an authorization URL in the candidate data.
-    # The MCP spec uses WWW-Authenticate: Bearer authorization_url="..."
-    # but that typically appears on a 401, not in the registry entry.
-    # For now we return a 400 asking the user to provide an API key.
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=(
-            "OAuth authorization URL discovery from WWW-Authenticate metadata "
-            "will be implemented when the MCP spec adds this to the registry "
-            "schema. For now, use the /test/manual-token endpoint to "
-            "provide a bearer token directly."
-        ),
+    client_id: str | None = None
+    client_secret: str | None = None
+    registration_endpoint = as_metadata.get("registration_endpoint")
+    redirect_uri = redirect_uri_for_item(str(item_id))
+    if registration_endpoint:
+        try:
+            client_id, client_secret = await register_dynamic_client(
+                str(registration_endpoint), redirect_uri
+            )
+        except OAuthFlowError as exc:
+            logger.warning("Dynamic client registration failed for %s: %s", url, exc)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"{exc} If you control this server, pre-register an OAuth "
+                    "client or enable dynamic registration."
+                ),
+            ) from exc
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This MCP server's authorization server does not advertise "
+                "dynamic client registration (registration_endpoint missing), "
+                "so this app cannot start an OAuth flow for it. Provide an "
+                "API token instead if the server accepts one."
+            ),
+        )
+
+    authorization_url, oauth_state, flow = build_authorization_url(
+        authorization_endpoint=str(as_metadata["authorization_endpoint"]),
+        token_endpoint=str(as_metadata["token_endpoint"]),
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        resource=url,
+        item_id=str(item_id),
+        session_id=session_id,
+        scope=(as_metadata.get("scopes_supported") or [None])[0],
     )
+    get_flow_store().put(flow)
+    # Keep the legacy session-state binding in sync for compatibility.
+    session_store.set_oauth_state(session_id, oauth_state)
 
-    # This line is unreachable but satisfies the type checker
-    state = secrets.token_urlsafe(32)
-    return OAuthStartResponse(authorization_url="", state=state)  # pragma: no cover
+    logger.info(
+        "OAuth start (item=%s url=%s issuer=%s dcr=ok state=%s)",
+        item_id, url.split("?", 1)[0],
+        str(as_metadata.get("issuer") or "")[:100], oauth_state[:8],
+    )
+    return OAuthStartResponse(
+        authorization_url=authorization_url,
+        state=oauth_state,
+        session_id=session_id,
+    )
 
 
 # ---------------------------------------------------------------------------
 # GET /items/{item_id}/test/authorize/callback
 # ---------------------------------------------------------------------------
 
+_CALLBACK_SUCCESS_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="3;url={frontend_url}/">
+<title>Authorization complete</title></head>
+<body style="font-family: system-ui; text-align:center; padding-top:4rem">
+<h2>&#10003; Authorization complete</h2>
+<p>The MCP server token was stored. You can close this tab and
+retry the connection in the app.</p>
+</body></html>"""
+
+_CALLBACK_FAILURE_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Authorization failed</title></head>
+<body style="font-family: system-ui; text-align:center; padding-top:4rem">
+<h2>&#10007; Authorization failed</h2>
+<p>{message}</p>
+<p>Close this tab and try connecting again.</p>
+</body></html>"""
+
+
 @router.get(
     "/{item_id}/test/authorize/callback",
-    response_model=OAuthCallbackResponse,
     summary="OAuth callback",
+    response_class=FastAPIResponse,
 )
 async def authorize_callback(
     item_id: UUID,
-    code: Annotated[str, Query(description="Authorization code from OAuth provider")],
-    state: Annotated[str, Query(description="CSRF state from authorize/start")],
-    session_id: Annotated[str | None, Query(description="Test-session ID")] = None,
-    repository: ItemRepository = Depends(get_item_repository),
-    session_store: SessionStore = Depends(get_session_store),
+    request: Request,
+    code: Annotated[str | None, Query(description="Authorization code from OAuth provider")] = None,
+    state: Annotated[str, Query(description="CSRF state from authorize/start")] = "",
+    error: Annotated[str | None, Query(description="OAuth error code, if the user denied access")] = None,
 ):
-    """Handle the OAuth callback from the authorization server.
+    """Receive the provider redirect, exchange the code, store the token.
 
-    The OAuth provider redirects here with `code` and `state` parameters.
-    We verify the `state` against our stored CSRF token, exchange the
-    `code` for tokens, store the access token in the session, and
-    redirect the user back to the app.
-
-    In practice this endpoint is rarely called directly by the frontend —
-    the user completes OAuth in a new tab and the redirect URL brings
-    them back to the app. The app then re-calls /connect with the
-    `session_id` to pick up the stored token.
+    The flow context (PKCE verifier, client, token endpoint) was stored at
+    /authorize/start under the CSRF `state`; it is consumed exactly once
+    here. On success the access token lands on the test session and the
+    browser gets a small confirmation page (close the tab and retry
+    connect in the app).
     """
-    if session_id is None:
-        raise HTTPException(status_code=400, detail="session_id is required")
-
-    # Verify CSRF state
-    stored_state = session_store.get_oauth_state(session_id)
-    if stored_state is None or stored_state != state:
-        return OAuthCallbackResponse(
-            success=False,
-            message="Invalid or expired OAuth state (possible CSRF attack). Please try again.",
+    frontend_url = frontend_base_url()
+    if error:
+        detail = request.query_params.get("error_description") or error
+        return HTMLResponse(
+            _CALLBACK_FAILURE_HTML.format(message=f"Provider said: {detail}"),
+            status_code=400,
+        )
+    if not code or not state:
+        return HTMLResponse(
+            _CALLBACK_FAILURE_HTML.format(message="Missing code or state parameter."),
+            status_code=400,
         )
 
-    # Exchange code for token.
-    # The token exchange endpoint depends on the OAuth provider's metadata.
-    # For now this is a stub; the full implementation is gated on MCP spec
-    # adding authorization_url to the registry schema.
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=(
-            "Token exchange requires the authorization server's token endpoint "
-            "URL, which will be available when the MCP spec adds OAuth "
-            "discovery metadata. Use /test/manual-token to provide a "
-            "bearer token directly."
-        ),
-    )
+    flow = get_flow_store().take(state)
+    if flow is None or flow.item_id != str(item_id):
+        return HTMLResponse(
+            _CALLBACK_FAILURE_HTML.format(
+                message="Unknown or expired OAuth state (possible CSRF attack). Please start the flow again."
+            ),
+            status_code=400,
+        )
 
-    return OAuthCallbackResponse(success=True, message="Authorized successfully")  # pragma: no cover
+    try:
+        token_doc = await exchange_code_for_token(flow, code)
+    except OAuthFlowError as exc:
+        logger.warning("OAuth token exchange failed (item=%s): %s", item_id, exc)
+        return HTMLResponse(
+            _CALLBACK_FAILURE_HTML.format(message=str(exc)),
+            status_code=400,
+        )
+
+    # Store the token on the session created at /authorize/start.
+    store = get_session_store()
+    session = store.get_session(flow.session_id)
+    if session is None:
+        session = store.create_session(UUID(flow.item_id))
+    store.store_token(
+        session.session_id,
+        access_token=str(token_doc["access_token"]),
+        token_type=str(token_doc.get("token_type") or "Bearer"),
+        refresh_token=(str(token_doc["refresh_token"]) if token_doc.get("refresh_token") else None),
+        auth_method="oauth2",
+    )
+    logger.info(
+        "OAuth callback success (item=%s session=%s token_len=%d)",
+        item_id, session.session_id[:8], len(str(token_doc["access_token"])),
+    )
+    return HTMLResponse(
+        _CALLBACK_SUCCESS_HTML.format(frontend_url=frontend_url),
+        status_code=200,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +535,8 @@ async def disconnect(
 )
 async def submit_manual_token(
     item_id: UUID,
-    token: Annotated[str, Query(description="Bearer token or API key")],
+    body: ManualTokenRequest | None = None,
+    token: Annotated[str | None, Query(description="Bearer token or API key (deprecated; send in body)")] = None,
     session_id: Annotated[str | None, Query(description="Test-session ID")] = None,
     repository: ItemRepository = Depends(get_item_repository),
     session_store: SessionStore = Depends(get_session_store),
@@ -479,17 +553,28 @@ async def submit_manual_token(
     """
     candidate, url = await _require_testable(item_id, repository)
 
-    if session_id is None:
+    # Preferred: token in JSON body. Kept as a deprecated query-param
+    # fallback for older clients — query params end up in access logs.
+    raw_token = (body.token if body is not None else None) or token or ""
+    body_session_id = body.session_id if body is not None else None
+    effective_session_id = session_id or body_session_id
+    if not raw_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A non-empty 'token' is required.",
+        )
+
+    if effective_session_id is None:
         session = session_store.create_session(item_id)
     else:
-        existing = session_store.get_session(session_id)
+        existing = session_store.get_session(effective_session_id)
         if existing is None:
             session = session_store.create_session(item_id)
         else:
             session = existing
 
-    # BUG 2: trim whitespace from user input before storage
-    trimmed_token = token.strip() if isinstance(token, str) else token
+    # Trim whitespace from user input before storage
+    trimmed_token = raw_token.strip() if isinstance(raw_token, str) else raw_token
     session_store.store_token(
         session.session_id,
         access_token=trimmed_token,

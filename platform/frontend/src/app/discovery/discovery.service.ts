@@ -137,7 +137,9 @@ export class DiscoveryService {
 
   /**
    * POST /api/items/{item_id}/test/authorize/start
-   * Begin an OAuth flow. Backend returns a 501 for now (spec gating).
+   * Begin the MCP OAuth flow: backend discovers OAuth metadata, registers
+   * a dynamic client, and returns the provider's authorization URL plus
+   * the test session the eventual token will be stored on.
    */
   testAuthorizeStart(
     itemId: string,
@@ -198,12 +200,11 @@ export class DiscoveryService {
     token: string,
     sessionId?: string,
   ): Observable<{ status: string; session_id: string; message: string }> {
-    let params = new HttpParams().set('token', token);
-    if (sessionId) params = params.set('session_id', sessionId);
+    // The token travels in the request body (never as a query param —
+    // URLs are logged by proxies and access logs and would leak secrets).
     return this.http.post<{ status: string; session_id: string; message: string }>(
       `${this.apiBase}/items/${itemId}/test/manual-token`,
-      null,
-      { params },
+      { token, session_id: sessionId ?? null },
     );
   }
 

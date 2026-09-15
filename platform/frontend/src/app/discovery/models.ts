@@ -308,6 +308,7 @@ export interface ToolInvokeResponse {
 export interface OAuthStartResponse {
   authorization_url: string;
   state: string;
+  session_id?: string;
 }
 
 export interface OAuthCallbackResponse {

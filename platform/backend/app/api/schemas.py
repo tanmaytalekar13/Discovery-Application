@@ -109,9 +109,23 @@ class ToolInvokeResponse(BaseModel):
     show_oauth_button: bool = False
 
 
+class ManualTokenRequest(BaseModel):
+    """Body for POST /items/{id}/test/manual-token.
+
+    The token travels in the body rather than the query string so it
+    doesn't leak into access logs and proxy URLs.
+    """
+
+    token: str
+    session_id: str | None = None
+
+
 class OAuthStartResponse(BaseModel):
     authorization_url: str
     state: str
+    # Test session the eventual OAuth token will be attached to. The
+    # frontend should pass this back to /test/connect after the flow.
+    session_id: str | None = None
 
 
 class OAuthCallbackResponse(BaseModel):

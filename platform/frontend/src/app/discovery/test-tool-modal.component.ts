@@ -35,6 +35,7 @@ type ModalState =
   | 'idle'              // Initial loading
   | 'connecting'        // POST /connect in-flight
   | 'auth-required'     // 401/403 received — offer OAuth or manual token
+  | 'oauth-waiting'     // OAuth tab opened — waiting for the user to authorize
   | 'tools-ready'       // Connected, showing tool list
   | 'tool-form'         // Tool selected — show dynamic input form
   | 'invoking'          // POST /invoke in-flight
@@ -182,7 +183,7 @@ type ModalState =
                   </button>
                 }
                 @if (showOAuthButton()) {
-                  <button class="btn btn--primary" (click)="state.set('auth-required')">
+                  <button class="btn btn--primary" (click)="startOAuthFlow()">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                       <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
                       <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
@@ -255,7 +256,39 @@ type ModalState =
                 </button>
               </div>
 
-              <button class="btn btn--ghost" (click)="retryConnect()">Use without token</button>
+              @if (showOAuthButton()) {
+                <div class="oauth-divider"><span>or</span></div>
+                <button
+                  class="btn btn--primary"
+                  (click)="startOAuthFlow()"
+                  [disabled]="oauthStarting()"
+                >
+                  @if (oauthStarting()) {
+                    <span class="btn-spinner"></span> Preparing…
+                  } @else {
+                    Connect Account (OAuth)
+                  }
+                </button>
+              }
+            </div>
+          }
+
+          <!-- oauth-waiting -->
+          @if (state() === 'oauth-waiting') {
+            <div class="state-container">
+              <div class="auth-icon">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path>
+                  <polyline points="10 17 15 12 10 7"></polyline>
+                  <line x1="15" y1="12" x2="3" y2="12"></line>
+                </svg>
+              </div>
+              <p class="auth-title">Complete authorization in the opened tab</p>
+              <p class="auth-desc">
+                The provider will redirect back automatically. This dialog
+                continues on its own once the token is stored.
+              </p>
+              <button class="btn btn--ghost" (click)="retryConnect()">Cancel and retry connection</button>
             </div>
           }
 
@@ -1312,6 +1345,15 @@ type ModalState =
         background: var(--color-ground);
         flex-shrink: 0;
       }
+      .oauth-divider {
+        display: flex; align-items: center; gap: 0.5rem;
+        margin: 0.25rem 0 0.75rem;
+        color: var(--color-text-muted); font-size: 0.75rem;
+      }
+      .oauth-divider::before,
+      .oauth-divider::after {
+        content: ''; flex: 1; height: 1px; background: var(--color-border);
+      }
       .session-info {
         display: flex;
         align-items: center;
@@ -1355,6 +1397,7 @@ export class TestToolModalComponent implements OnInit {
   showToken = signal(false);
   tokenSubmitting = signal(false);
   tokenSubmitError = signal<string>('');
+  oauthStarting = signal(false);
   // Error classification from the backend
   authReason = signal<AuthReason | null>(null);
   userMessage = signal<string>('');
@@ -1439,7 +1482,70 @@ export class TestToolModalComponent implements OnInit {
   constructor(private readonly service: DiscoveryService) {}
 
   ngOnInit(): void {
+    // Resume an in-progress OAuth flow after the provider redirected the
+    // callback tab back to the app (stored before the popup opened).
+    try {
+      const pending = sessionStorage.getItem(this.oauthResumeKey());
+      sessionStorage.removeItem(this.oauthResumeKey());
+      if (pending) {
+        const { sessionId } = JSON.parse(pending) as { sessionId?: string };
+        if (sessionId) {
+          this.sessionId.set(sessionId);
+          this.state.set('connecting');
+          this.doConnect();
+          return;
+        }
+      }
+    } catch {
+      // sessionStorage unavailable (e.g. privacy mode) — fall through.
+    }
     this.startConnection();
+  }
+
+  /**
+   * Kick off the MCP OAuth flow: the backend discovers the provider's
+   * OAuth metadata, registers a dynamic client, and returns the
+   * authorization URL. We remember the session so that, when the OAuth
+   * tab redirects back into the app and the user re-opens this tool's
+   * Test dialog, the connection resumes with the fresh token.
+   */
+  startOAuthFlow(): void {
+    const itemId = this.result.item.item_id;
+    this.oauthStarting.set(true);
+    this.tokenSubmitError.set('');
+    this.service.testAuthorizeStart(itemId, this.sessionId() ?? undefined).subscribe({
+      next: (res) => {
+        this.oauthStarting.set(false);
+        if (res.session_id) {
+          this.sessionId.set(res.session_id);
+          try {
+            sessionStorage.setItem(
+              this.oauthResumeKey(),
+              JSON.stringify({ sessionId: res.session_id }),
+            );
+          } catch {
+            // ignore storage failures
+          }
+        }
+        // Open the provider's consent screen in a new tab.
+        window.open(res.authorization_url, '_blank', 'noopener');
+        this.state.set('oauth-waiting');
+        // Poll-free resume: when the user returns to this tab and the
+        // backend has stored the token, a plain reconnect succeeds. Give
+        // them a manual path too — the waiting screen has "Cancel and retry".
+      },
+      error: (err) => {
+        this.oauthStarting.set(false);
+        this.state.set('auth-required');
+        this.tokenSubmitError.set(
+          this.extractErrorMessage(err) || 'Could not start the OAuth flow.',
+        );
+      },
+    });
+  }
+
+  private oauthResumeKey(): string {
+    return `mcp-oauth-resume:${this.result.item.item_id}`;
   }
 
   // ---------------------------------------------------------------------------
@@ -1515,10 +1621,15 @@ export class TestToolModalComponent implements OnInit {
     }
 
     if (res.auth_required || res.requires_auth) {
-      // If token was already provided but still auth-required, show error
+      // If token was already provided but still auth-required, show the
+      // server's actual rejection reason (recovered by the backend's
+      // auth-rejection probe) instead of a generic hard-coded message.
       if (token) {
         this.state.set('auth-required');
-        this.tokenSubmitError.set('The provided token is invalid or expired.');
+        this.tokenSubmitError.set(
+          this.userMessage() ||
+          'The server rejected the provided token. Check the token and try again.'
+        );
         return;
       }
       this.state.set('auth-required');

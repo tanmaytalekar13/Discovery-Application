@@ -153,6 +153,191 @@ def _known_incompatible_host(url: str | None) -> bool:
     return bool(host) and host.lower() in _KNOWN_INCOMPATIBLE_HOSTS
 
 
+def _classify_auth_rejection_body(
+    status_code: int, body_text: str, headers: dict[str, str]
+) -> ConnectionErrorInfo:
+    """Map a non-JSON (or JSON without a recognizable `code`) auth-rejection
+    body to a ConnectionErrorInfo.
+
+    Best-effort: an unrecognized body keeps the generic 401/403 message.
+    """
+    lower_body = body_text.lower()
+    if status_code == 402 or "payment" in lower_body or "subscription" in lower_body:
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_PAYMENT_REQUIRED,
+            user_message="This tool requires a paid subscription. "
+            "Set up an account or subscription on the provider's website first.",
+            show_token_input=False,
+            show_oauth_button=False,
+        )
+    if "expired" in lower_body or "revoked" in lower_body:
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_UNAUTHORIZED,
+            user_message="The server rejected the provided credentials "
+            f"(HTTP {status_code}): the token appears to be expired or "
+            "revoked. Generate a new token and try again.",
+            show_token_input=True,
+            show_oauth_button=True,
+        )
+    if "invalid" in lower_body or "malformed" in lower_body:
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_UNAUTHORIZED,
+            user_message="The server rejected the provided credentials "
+            f"(HTTP {status_code}): the token is invalid. Check the token "
+            "and try again.",
+            show_token_input=True,
+            show_oauth_button=True,
+        )
+    if "oauth" in lower_body:
+        return ConnectionErrorInfo(
+            auth_reason=AUTH_REASON_UNAUTHORIZED,
+            user_message="This MCP server rejected the provided credentials "
+            f"(HTTP {status_code}). It appears to require an OAuth "
+            "authorization flow rather than a static API token.",
+            show_token_input=False,
+            show_oauth_button=True,
+        )
+    return ConnectionErrorInfo(
+        auth_reason=AUTH_REASON_UNAUTHORIZED,
+        user_message="This MCP server requires credentials. "
+        "Provide your API key or bearer token to continue.",
+        show_token_input=True,
+        show_oauth_button=True,  # OAuth discovery done by caller if needed
+    )
+
+
+async def _probe_auth_rejection(
+    url: str, headers: dict[str, str], timeout: float
+) -> ConnectionErrorInfo | None:
+    """Re-send one plain initialize POST to a server that just rejected us
+    with 401/403, and read the error body directly.
+
+    The `mcp` SDK streams upstream responses inside a task and closes the
+    body the moment `raise_for_status()` fires, so the HTTPStatusError that
+    propagates to us carries only the status line — never the server's
+    error payload (e.g. Notion's `{"code":"restricted_resource",
+    "message":"Endpoint unavailable."}`, which means the token is VALID
+    but the endpoint forbids static API keys). This probe recovers that
+    body so the UI can show the real reason instead of a generic
+    "credentials required" message.
+
+    Never raises: any failure returns None and the caller falls back to
+    the generic classification. Header/auth failures here are logged at
+    debug level only — they must never mask the original error.
+    """
+    # Upstream rejected us with 401/403 — the stored token (if any) is
+    # deliberately NOT echoed in probe logs. Only status + short body are
+    # logged, and only at debug level.
+    probe_url = url.split("?", 1)[0]
+    try:
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp-tool-test", "version": "1.0.0"},
+            },
+        }
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.post(
+                probe_url,
+                json=body,
+                headers=headers,
+            )
+        if resp.status_code not in _AUTH_STATUS_CODES:
+            return None
+        logger.debug(
+            "MCP auth-rejection probe (url=%s status=%s body=%r)",
+            probe_url, resp.status_code, resp.text[:300],
+        )
+        content_type = resp.headers.get("content-type", "").lower()
+        if content_type.startswith("application/json"):
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                code = str(payload.get("code") or payload.get("error") or "")
+                message = str(payload.get("message") or payload.get("error_description") or "")
+                hint = ": ".join(part for part in (code, message) if part)
+                if hint:
+                    return ConnectionErrorInfo(
+                        auth_reason=AUTH_REASON_UNAUTHORIZED,
+                        user_message=(
+                            f"The MCP server rejected the credentials "
+                            f"(HTTP {resp.status_code}): {hint}"
+                        ),
+                        # A 403 from a JSON-RPC body (e.g. Notion's
+                        # restricted_resource) usually means the token was
+                        # accepted but the endpoint/flow is forbidden — a
+                        # different token rarely helps. Keep OAuth visible.
+                        show_token_input=resp.status_code == 401,
+                        show_oauth_button=True,
+                    )
+        return _classify_auth_rejection_body(
+            resp.status_code, resp.text[:500], dict(resp.headers)
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the original error
+        logger.debug("MCP auth-rejection probe failed", exc_info=True)
+        return None
+
+
+def _extract_auth_request_headers(exc: BaseException) -> dict[str, str]:
+    """Pull the auth-related request headers from the root HTTPStatusError.
+
+    Used to replay the failed request's credentials in the body-recovery
+    probe. Returns {} when no auth headers were present (e.g. the failure
+    happened on an unauthenticated request).
+    """
+    root = exc
+    while isinstance(root, MCPClientError) and root.__cause__ is not None:
+        root = root.__cause__
+    root = _unwrap_exception(root)
+    request = getattr(root, "request", None)
+    headers = getattr(request, "headers", None)
+    if not headers:
+        return {}
+    return {
+        key: value
+        for key, value in dict(headers).items()
+        if key.lower() in {"authorization", "x-api-key", "x-auth-token", "api-key"}
+    }
+
+
+async def _maybe_probe_auth_rejection(
+    info: ConnectionErrorInfo,
+    exc: BaseException,
+    url: str,
+) -> ConnectionErrorInfo:
+    """Enrich a 401/403 classification with the server's real error body.
+
+    The `mcp` SDK closes the streamed upstream response before raising, so
+    the HTTPStatusError carries only the status line. When the failure is
+    an auth rejection AND the failed request carried credentials, re-send
+    one plain initialize POST to recover the server's JSON error body
+    (e.g. Notion returns {"code":"restricted_resource"} for a VALID token
+    used without OAuth — a fundamentally different problem from an invalid
+    token). Never raises; falls back to the original `info` on any problem.
+    """
+    if info.auth_reason != AUTH_REASON_UNAUTHORIZED:
+        return info
+    auth_headers = _extract_auth_request_headers(exc)
+    if not auth_headers:
+        # No credentials were attached — the generic "requires credentials"
+        # message is already accurate.
+        return info
+    probed = await _probe_auth_rejection(url, auth_headers, timeout=10.0)
+    if probed is None:
+        return info
+    logger.info(
+        "MCP auth rejection enriched via probe (url=%s message=%r)",
+        url.split("?", 1)[0], probed.user_message,
+    )
+    return probed
+
+
 def classify_connection_error(
     exc: BaseException, url: str | None = None
 ) -> ConnectionErrorInfo:
@@ -434,13 +619,22 @@ def _log_remote_failure(operation: str, url: str, exc: BaseException) -> None:
     root = _unwrap_exception(root)
     if isinstance(root, httpx.HTTPStatusError):
         response = root.response
-        logger.error(
-            "MCP %s upstream response (url=%s status=%s headers=%s body=%r)",
-            operation, url.split("?", 1)[0], response.status_code,
-            {key: value for key, value in response.headers.items()
-             if key.lower() in {"content-type", "www-authenticate", "retry-after", "mcp-session-id"}},
-            response.text[:512] if response.is_stream_consumed else "<streaming body not read by MCP transport>", exc_info=exc,
-        )
+        if response.status_code in _AUTH_STATUS_CODES:
+            # Auth rejections are an expected part of the connect flow (the
+            # user often connects before entering credentials). Log one
+            # concise line — no exception traceback noise.
+            logger.warning(
+                "MCP %s auth rejection (url=%s status=%s) — not an app error",
+                operation, url.split("?", 1)[0], response.status_code,
+            )
+        else:
+            logger.error(
+                "MCP %s upstream response (url=%s status=%s headers=%s body=%r)",
+                operation, url.split("?", 1)[0], response.status_code,
+                {key: value for key, value in response.headers.items()
+                 if key.lower() in {"content-type", "www-authenticate", "retry-after", "mcp-session-id"}},
+                response.text[:512] if response.is_stream_consumed else "<streaming body not read by MCP transport>", exc_info=exc,
+            )
     elif isinstance(root, httpx.TimeoutException):
         logger.error("MCP %s timeout (url=%s type=%s): %s", operation, url.split("?", 1)[0], type(root).__name__, root, exc_info=exc)
     elif isinstance(root, McpError):
@@ -946,6 +1140,7 @@ class MCPTestClient:
         ) as exc:
             _log_remote_failure("connect", self._url, exc)
             info = classify_connection_error(exc, url=self._url)
+            info = await _maybe_probe_auth_rejection(info, exc, self._url)
             # Auth errors (401/403) that come through the outer handler
             # (wrapped in ExceptionGroup) should still surface as auth_required.
             # A failed network connection, timeout, or malformed endpoint is
@@ -1120,6 +1315,7 @@ class MCPTestClient:
         ) as exc:
             _log_remote_failure("invoke", self._url, exc)
             info = classify_connection_error(exc, url=self._url)
+            info = await _maybe_probe_auth_rejection(info, exc, self._url)
             return InvokeResult(
                 status="error",
                 error=info.user_message,
