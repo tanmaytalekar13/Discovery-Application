@@ -316,6 +316,14 @@ export interface OAuthCallbackResponse {
   message: string;
 }
 
+/** Heartbeat for the Claude-style OAuth auto-resume polling loop. */
+export interface OAuthPollResponse {
+  connected: boolean;
+  tools: ToolInfo[];
+  token_received?: boolean;
+  error?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Local STDIO MCP Tool Testing (Phase 15 - Backend Sandbox)
 // ---------------------------------------------------------------------------

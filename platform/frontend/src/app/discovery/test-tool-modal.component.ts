@@ -1530,9 +1530,10 @@ export class TestToolModalComponent implements OnInit {
         // Open the provider's consent screen in a new tab.
         window.open(res.authorization_url, '_blank', 'noopener');
         this.state.set('oauth-waiting');
-        // Poll-free resume: when the user returns to this tab and the
-        // backend has stored the token, a plain reconnect succeeds. Give
-        // them a manual path too — the waiting screen has "Cancel and retry".
+        // Claude-style auto-resume: poll the backend every 2s. When the
+        // callback lands the token and initialize+tools/list succeeds, the
+        // tools list appears here without any user click.
+        this.beginOAuthPolling();
       },
       error: (err) => {
         this.oauthStarting.set(false);
@@ -1546,6 +1547,47 @@ export class TestToolModalComponent implements OnInit {
 
   private oauthResumeKey(): string {
     return `mcp-oauth-resume:${this.result.item.item_id}`;
+  }
+
+  private oauthPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Poll /authorize/poll every 2s while the user completes consent. */
+  private beginOAuthPolling(): void {
+    this.stopOAuthPolling();
+    const sid = this.sessionId();
+    if (!sid) return;
+    const itemId = this.result.item.item_id;
+    this.oauthPollTimer = setInterval(() => {
+      if (this.state() !== 'oauth-waiting') {
+        this.stopOAuthPolling();
+        return;
+      }
+      this.service.testAuthorizePoll(itemId, sid).subscribe({
+        next: (res) => {
+          if (this.state() !== 'oauth-waiting') {
+            this.stopOAuthPolling();
+            return;
+          }
+          if (res.connected) {
+            this.stopOAuthPolling();
+            this.tools.set(res.tools ?? []);
+            this.state.set('tools-ready');
+          }
+          // token_received without connected: keep polling — the provider
+          // accepted consent but the MCP handshake still needs a retry.
+        },
+        error: () => {
+          // Transient network/DB errors: keep the heartbeat going.
+        },
+      });
+    }, 2000);
+  }
+
+  private stopOAuthPolling(): void {
+    if (this.oauthPollTimer !== null) {
+      clearInterval(this.oauthPollTimer);
+      this.oauthPollTimer = null;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1575,6 +1617,7 @@ export class TestToolModalComponent implements OnInit {
   }
 
   retryConnect(): void {
+    this.stopOAuthPolling();
     this.state.set('connecting');
     this.tokenInput = '';
     this.tokenSubmitting.set(false);
@@ -2165,6 +2208,7 @@ export class TestToolModalComponent implements OnInit {
 
   /** Close without leaving a live sandbox container behind. */
   closeModal(): void {
+    this.stopOAuthPolling();
     if (this.localSessionId()) {
       this.disconnectLocal();
     } else if (this.sessionId()) {
@@ -2198,10 +2242,19 @@ export class TestToolModalComponent implements OnInit {
     if (!err) return 'Unknown error';
     if (typeof err === 'string') return err;
     if (err instanceof Error) return err.message;
-    // Try to parse HTTP error response
     const anyErr = err as Record<string, unknown>;
+    // FastAPI error bodies: { detail: string } or { detail: { msg, ... } }.
+    // The backend's detail is written for the user (which env var to set,
+    // what to register) — prefer it over Angular's generic HttpErrorResponse
+    // message, which reads like `Http failure response ...: 400 Bad Request`.
+    const body = anyErr['error'] as Record<string, unknown> | null | undefined;
+    const detail = body?.['detail'] ?? anyErr['detail'];
+    if (typeof detail === 'string' && detail) return detail;
+    if (detail && typeof detail === 'object') {
+      const msg = (detail as Record<string, unknown>)['msg'];
+      if (typeof msg === 'string' && msg) return msg;
+    }
     if (anyErr['message']) return String(anyErr['message']);
-    if (anyErr['detail']) return String(anyErr['detail']);
     return 'An unexpected error occurred.';
   }
 

@@ -215,12 +215,15 @@ async def test_live_mode_runs_discovery_catalog_then_ranks_approved_items():
 
 
 @pytest.mark.asyncio
-async def test_mixed_mode_db_hit_returns_capped_shortlist_and_skips_live_discovery():
-    """Spec v2 Section 9.1: a catalog hit stops the cascade - no live source runs."""
+async def test_mixed_mode_warm_hit_still_runs_live_discovery_and_merges():
+    """Spec v2 Section 4.2 (Warm Search): a catalog hit answers instantly from
+    ArcadeDB but live discovery still runs and merges with the cached shortlist.
+    """
     cached_items = [item(f"cached_weather_{i}") for i in range(5)]
+    live_item = item("live_weather")
     phase11 = FakePhase11(cached_items)
     orchestrator = FakeOrchestrator()
-    phase10 = FakePhase10([item("live_weather")])
+    phase10 = FakePhase10([live_item])
     service = ApplicationSearchService(
         settings=settings("mixed"),
         phase11=phase11,
@@ -230,13 +233,44 @@ async def test_mixed_mode_db_hit_returns_capped_shortlist_and_skips_live_discove
 
     result = await service.search("weather", item_type="tool", limit=10)
 
-    # Catalog hit: live discovery never ran.
-    assert orchestrator.calls == []
-    assert result.metadata.mode == "cached"
-    assert result.metadata.sources_attempted == ("arcadedb",)
-    # Shortlist capped at 3 regardless of the requested limit of 10.
-    assert len(result.ranked.results) == 3
-    assert result.metadata.cached_results == 3
+    # Live discovery ran even though the catalog had verified hits.
+    assert orchestrator.calls != []
+    assert result.metadata.mode == "merged"
+    assert result.metadata.sources_attempted == ("arcadedb", "mcp:mcp_registry")
+    assert result.metadata.sources_succeeded == ("arcadedb", "mcp:mcp_registry")
+    assert result.metadata.live_candidates == 1
+    assert result.metadata.approved_count == 1
+    # Merged shortlist: the live item plus the cached entries, capped.
+    names = [ranked.item.name for ranked in result.ranked.results]
+    assert "live_weather" in names
+    assert any(name.startswith("cached_weather_") for name in names)
+    assert len(result.ranked.results) == 6
+    assert result.metadata.cached_results == 5
+
+
+@pytest.mark.asyncio
+async def test_mixed_mode_catalog_hit_with_no_live_approval_serves_catalog_shortlist():
+    """When live discovery approves nothing, the verified catalog entries serve."""
+    cached_items = [item(f"cached_weather_{i}") for i in range(5)]
+    phase11 = FakePhase11(cached_items)
+    orchestrator = FakeOrchestrator()
+    phase10 = FakePhase10([])
+    service = ApplicationSearchService(
+        settings=settings("mixed"),
+        phase11=phase11,
+        orchestrator=orchestrator,
+        phase10_pipeline=phase10,
+    )
+
+    result = await service.search("weather", item_type="tool", limit=10)
+
+    assert orchestrator.calls != []
+    assert result.metadata.mode == "merged"
+    assert result.metadata.cached_results == 5
+    assert result.metadata.approved_count == 0
+    assert [ranked.item.name for ranked in result.ranked.results][:5] == [
+        f"cached_weather_{i}" for i in range(5)
+    ]
 
 
 @pytest.mark.asyncio

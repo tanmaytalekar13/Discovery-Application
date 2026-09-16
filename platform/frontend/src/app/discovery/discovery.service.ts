@@ -16,6 +16,7 @@ import {
   ToolInvokeResponse,
   OAuthStartResponse,
   OAuthCallbackResponse,
+  OAuthPollResponse,
   LocalPrepareResponse,
   LocalConnectRequest,
   LocalConnectResponse,
@@ -150,6 +151,23 @@ export class DiscoveryService {
     return this.http.post<OAuthStartResponse>(
       `${this.apiBase}/items/${itemId}/test/authorize/start`,
       null,
+      { params },
+    );
+  }
+
+  /**
+   * GET /api/items/{item_id}/test/authorize/poll
+   * Claude-style auto-resume heartbeat: returns { connected: true, tools }
+   * once the OAuth token has landed on the session and a real MCP
+   * initialize+tools/list succeeds. Safe to poll every ~2s.
+   */
+  testAuthorizePoll(
+    itemId: string,
+    sessionId: string,
+  ): Observable<OAuthPollResponse> {
+    const params = new HttpParams().set('session_id', sessionId);
+    return this.http.get<OAuthPollResponse>(
+      `${this.apiBase}/items/${itemId}/test/authorize/poll`,
       { params },
     );
   }

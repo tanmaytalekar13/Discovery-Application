@@ -55,6 +55,9 @@ import { SearchResultItem, ClassificationMode } from './models';
       <!-- Source badges -->
       @if (dedupedSources.length > 0) {
         <div class="source-badges" aria-label="Discovery sources">
+          @if (isOfficial) {
+            <span class="source-badge source-badge--official" title="Vendor-published official MCP endpoint">Official</span>
+          }
           @for (src of dedupedSources; track src.id) {
             <span class="source-badge" [title]="src.provider || src.id">
               {{ sourceLabel(src.type) }}
@@ -279,6 +282,18 @@ import { SearchResultItem, ClassificationMode } from './models';
         text-transform: uppercase;
         letter-spacing: 0.04em;
       }
+      .source-badge--official {
+        background: #dcfce7;
+        border-color: #86efac;
+        color: #166534;
+      }
+      @media (prefers-color-scheme: dark) {
+        .source-badge--official {
+          background: #14532d;
+          border-color: #166534;
+          color: #86efac;
+        }
+      }
       .meta-detail {
         display: flex;
         align-items: center;
@@ -438,6 +453,13 @@ export class ResultCardComponent {
       `Reliability: ${(this.result.reliability * 100).toFixed(1)} | ` +
       `Freshness: ${(this.result.freshness * 100).toFixed(1)} | ` +
       `Evidence: ${(this.result.evidence * 100).toFixed(1)}`
+    );
+  }
+
+  /** Vendor-published official connector (seeded from the curated directory). */
+  get isOfficial(): boolean {
+    return this.result.item.provenance.some(
+      (s) => s.provider === 'official_connectors',
     );
   }
 

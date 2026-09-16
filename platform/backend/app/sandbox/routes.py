@@ -32,7 +32,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, Response as FastAPIResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response as FastAPIResponse
 
 from app.api.dependencies import get_item_repository
 from app.artifacts.source_resolver import resolve_source
@@ -64,10 +64,17 @@ from app.sandbox.local_mcp_client import LocalMCPClient
 from app.sandbox.mcp_client import MCPTestClient, classify_connection_error
 from app.sandbox.oauth import (
     OAuthFlowError,
+    OAuthRedirectItem,
     build_authorization_url,
+    default_scopes_for,
     exchange_code_for_token,
     frontend_base_url,
     get_flow_store,
+    prereg_redirect_uri,
+    preregistered_client_for,
+    preregistered_env_hint,
+    preregistered_redirect_supported,
+    redirect_base_hint,
     redirect_uri_for_item,
     register_dynamic_client,
     resolve_authorization_server,
@@ -352,7 +359,37 @@ async def authorize_start(
     client_id: str | None = None
     client_secret: str | None = None
     registration_endpoint = as_metadata.get("registration_endpoint")
-    redirect_uri = redirect_uri_for_item(str(item_id))
+    prereg = (
+        preregistered_client_for(url, as_metadata)
+        if not registration_endpoint
+        else None
+    )
+    if prereg and not preregistered_redirect_supported():
+        # A pre-registered client without a stable redirect can only produce
+        # a per-item callback the provider has never seen registered — fail
+        # fast with the fix instead of bouncing the user to a provider error
+        # page halfway through consent.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "A pre-registered OAuth client is configured for this provider "
+                f"({preregistered_env_hint(url, as_metadata)}), but the app has "
+                "no stable OAuth redirect URI: set MCP_OAUTH_REDIRECT_BASE_URL "
+                "to the externally reachable base URL whose "
+                f"/api/items/{OAuthRedirectItem}/test/authorize/callback you "
+                "registered with the provider (e.g. your tunnel host), then "
+                "retry. Alternatively provide an API token if the server "
+                "accepts one."
+            ),
+        )
+    if prereg and preregistered_redirect_supported():
+        # Providers without dynamic registration have their redirect URIs
+        # registered once per provider, so the callback must be the stable,
+        # item-independent one (the real item context rides in the CSRF
+        # `state`). Redirecting back into the app from there resumes the flow.
+        redirect_uri = prereg_redirect_uri(url, as_metadata) or redirect_uri_for_item(str(item_id))
+    else:
+        redirect_uri = redirect_uri_for_item(str(item_id))
     if registration_endpoint:
         try:
             client_id, client_secret = await register_dynamic_client(
@@ -367,14 +404,27 @@ async def authorize_start(
                     "client or enable dynamic registration."
                 ),
             ) from exc
+    elif prereg:
+        client_id, client_secret = prereg
+        logger.info(
+            "Using pre-registered OAuth client for %s (no DCR, redirect=%s)",
+            url,
+            redirect_uri,
+        )
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "This MCP server's authorization server does not advertise "
-                "dynamic client registration (registration_endpoint missing), "
-                "so this app cannot start an OAuth flow for it. Provide an "
-                "API token instead if the server accepts one."
+                "This MCP server's authorization server does not offer "
+                "dynamic client registration, so the app needs a "
+                "pre-registered OAuth client for it: set "
+                f"{preregistered_env_hint(url, as_metadata)} (and optionally "
+                "MCP_OAUTH_CLIENT_SECRET_<PROVIDER>) plus "
+                "MCP_OAUTH_REDIRECT_BASE_URL — register the callback "
+                f"{redirect_base_hint(url, as_metadata)} as the OAuth redirect "
+                "URI in the provider's developer console — in the backend "
+                "environment, then retry. Alternatively provide an API token "
+                "if the server accepts one."
             ),
         )
 
@@ -387,7 +437,13 @@ async def authorize_start(
         resource=url,
         item_id=str(item_id),
         session_id=session_id,
-        scope=(as_metadata.get("scopes_supported") or [None])[0],
+        # Prefer the server's advertised scopes; fall back to provider
+        # defaults (Google / Entra consent screens need explicit resource
+        # scopes or they grant only an identity token).
+        scope=default_scopes_for(url, as_metadata),
+        # When the redirect is the stable oauth-redirect callback, the token
+        # must land on this item's session, not on the sentinel item.
+        session_item_id=str(item_id),
     )
     get_flow_store().put(flow)
     # Keep the legacy session-state binding in sync for compatibility.
@@ -462,13 +518,17 @@ async def authorize_callback(
         )
 
     flow = get_flow_store().take(state)
-    if flow is None or flow.item_id != str(item_id):
+    if flow is None or flow.item_id not in {str(item_id), OAuthRedirectItem}:
         return HTMLResponse(
             _CALLBACK_FAILURE_HTML.format(
                 message="Unknown or expired OAuth state (possible CSRF attack). Please start the flow again."
             ),
             status_code=400,
         )
+    # The catalog item the token belongs to. With the stable oauth-redirect
+    # callback the provider redirects to the sentinel item id; the real item
+    # context was stored in the flow at /authorize/start.
+    target_item_id = flow.session_item_id or flow.item_id
 
     try:
         token_doc = await exchange_code_for_token(flow, code)
@@ -483,7 +543,7 @@ async def authorize_callback(
     store = get_session_store()
     session = store.get_session(flow.session_id)
     if session is None:
-        session = store.create_session(UUID(flow.item_id))
+        session = store.create_session(UUID(target_item_id))
     store.store_token(
         session.session_id,
         access_token=str(token_doc["access_token"]),
@@ -493,12 +553,85 @@ async def authorize_callback(
     )
     logger.info(
         "OAuth callback success (item=%s session=%s token_len=%d)",
-        item_id, session.session_id[:8], len(str(token_doc["access_token"])),
+        target_item_id, session.session_id[:8], len(str(token_doc["access_token"])),
     )
+    # With the stable oauth-redirect callback, the provider lands on the
+    # sentinel item id; bounce the browser into the app so the test dialog
+    # (already polling /authorize/poll for its session) resumes by itself.
+    if str(item_id) != target_item_id:
+        return RedirectResponse(url=f"{frontend_url}/", status_code=302)
     return HTMLResponse(
         _CALLBACK_SUCCESS_HTML.format(frontend_url=frontend_url),
         status_code=200,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /items/{item_id}/test/authorize/poll  (Claude-style auto-resume)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{item_id}/test/authorize/poll",
+    summary="Poll whether an OAuth flow finished and auto-connect",
+)
+async def authorize_poll(
+    item_id: UUID,
+    session_id: Annotated[str, Query(description="Test-session ID from authorize/start")],
+    repository: ItemRepository = Depends(get_item_repository),
+    session_store: SessionStore = Depends(get_session_store),
+):
+    """Check whether the OAuth token for this session has landed.
+
+    The user completes consent in a separate tab; the provider redirects
+    to /test/authorize/callback which stores the token on this session.
+    The test dialog polls this endpoint every ~2s (like Claude's connector
+    flow) so the tools list appears the moment authorization completes —
+    no manual 'I'm done, retry' click needed.
+
+    Returns `{connected: true, tools: [...]}` once the token exists and a
+    real initialize+tools/list succeeds against the MCP server; a plain
+    `{connected: false}` heartbeat otherwise. Never raises for 'not yet'.
+    """
+    session = session_store.get_session(session_id)
+    if session is None or session.access_token is None:
+        return {"connected": False, "tools": []}
+
+    # Token landed: immediately attempt a real connect with it.
+    try:
+        candidate, url = await _require_testable(item_id, repository)
+        client = MCPTestClient(
+            url=url,
+            auth_token=session.access_token,
+            preferred_transport=candidate.type,
+            auth_header=candidate.auth_header,
+            auth_value_prefix=candidate.auth_value_prefix,
+        )
+        result = await client.connect()
+    except Exception as exc:  # noqa: BLE001 - poll must stay a heartbeat
+        logger.info(
+            "OAuth poll connect attempt failed (item=%s): %s", item_id, exc
+        )
+        return {"connected": False, "tools": [], "token_received": True}
+
+    if not result.connected:
+        return {
+            "connected": False,
+            "tools": [],
+            "token_received": True,
+            "error": result.user_message or result.error,
+        }
+
+    return {
+        "connected": True,
+        "tools": [
+            {
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.input_schema,
+            }
+            for t in result.tools
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

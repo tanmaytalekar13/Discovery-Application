@@ -1,14 +1,19 @@
 
+import logging
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app.api.routes import router as api_router
 from app.config import get_settings
 from app.db.client import ArcadeDBClient
+from app.db.seed_official_servers import seed as seed_official_connectors
 from app.sandbox.routes import router as sandbox_router
 from app.verification.api import router as verification_router
 from app.verification.queue import build_worker_handles, start_background_loops, stop_background_loops
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 settings = get_settings()
 arcadedb = ArcadeDBClient(settings)
 app = FastAPI(title="Agentic Discovery Platform", version="0.1.0")
@@ -21,6 +26,28 @@ app.include_router(verification_router)
 # endpoints only read from the DB. Started on startup, cancelled on
 # shutdown; a DB outage delays verification but never breaks the API.
 _verification_tasks: list = []
+
+
+@app.on_event("startup")
+async def seed_official_connectors_on_startup() -> None:
+    """Upsert the curated official MCP connector directory into the catalog.
+
+    Idempotent (canonical_id = 'official:<id>'), so every restart re-syncs
+    without duplicating. A failure must never block the API from starting:
+    search then simply falls back to live discovery.
+    """
+    try:
+        summary = await seed_official_connectors()
+    except Exception:  # noqa: BLE001 - a bad seed run must not block startup
+        logger.exception("Official connector seeding failed; continuing without it")
+        return
+    logger.info(
+        "Official connector seeding: created=%s updated=%s excluded=%s no_url=%s",
+        summary["seeded"],
+        summary["updated"],
+        summary["skipped_excluded"],
+        summary["skipped_no_url"],
+    )
 
 
 @app.on_event("startup")

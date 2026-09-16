@@ -11,7 +11,11 @@ from app.query.embeddings import LocalEmbeddingModel, cosine_similarity
 
 # The official Registry receives a preference only after it has earned a good
 # relevance and quality score. GitHub remains the sole fallback source.
+# Vendor-published official connectors (seeded from the curated directory)
+# outrank everything: they are the vendor's own endpoint for that exact
+# service, so a "Slack" query must list 'Official: Slack' first.
 SOURCE_PRIORITY_MULTIPLIER: dict[str, float] = {
+    "official_connectors": 1.5,
     "MCP Registry": 1.25,
     "GitHub": 1.0,
     # Default for unknown providers
@@ -114,12 +118,15 @@ def rank_items(
         # match the query and have a solid quality score. This avoids a source
         # label pushing a weak or unrelated registry entry above a strong
         # GitHub result, while reliably breaking close, good-result ties in
-        # favour of the official record.
-        official_registry_bonus = (
-            0.15
-            if priority > 1.0 and lexical_relevance >= 0.5 and quality_score >= 0.6
-            else 0.0
-        )
+        # favour of the official record. Vendor-published official connectors
+        # (priority 1.5) get a decisively larger bonus so the vendor's own
+        # endpoint outranks registry mirrors of the same service.
+        if priority >= 1.5 and lexical_relevance >= 0.5 and quality_score >= 0.6:
+            official_registry_bonus = 0.35
+        elif priority > 1.0 and lexical_relevance >= 0.5 and quality_score >= 0.6:
+            official_registry_bonus = 0.15
+        else:
+            official_registry_bonus = 0.0
         final_score = lexical_relevance * 10.0 + quality_score + official_registry_bonus
         ranked.append(
             RankedItem(

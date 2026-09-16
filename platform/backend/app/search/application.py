@@ -86,67 +86,72 @@ class ApplicationSearchService:
         item_type: PreferredType | None,
         limit: int | None,
     ) -> ApplicationSearchResult:
-        """Cascade search: catalog first, live discovery only on a cold miss.
+        """Warm-start search: catalog shortlist + live discovery, merged.
 
-        Spec v2 Section 9.1: step 1 (the local registry read) is the only
-        synchronous step that can satisfy a query, and a hit there stops the
-        cascade - no live source is contacted at all. The catalog shortlist is
-        capped (`search_verified_result_cap`, default 3) because the product
-        promises a small set of already-verified servers, not a firehose.
+        Spec v2 Section 4.2 (Warm Search): a query already represented in the
+        catalog is answered from ArcadeDB immediately, but live discovery
+        still runs and its approved results are merged with the cached ones -
+        one query should surface every server for that service across the
+        catalog (vendor-published official connectors), the official MCP
+        Registry, and GitHub (the plan's multi-source merge), not just the
+        first catalog hit.
 
-        On a miss, live discovery runs as the registry -> GitHub cascade
-        (source order enforced inside `MCPDiscoveryAdapter`). Whatever it
-        finds goes through the normal Phase 10 persistence pipeline and is
-        ranked, then capped more generously
-        (`search_cold_miss_result_cap`, default 7) - still a shortlist, and
-        the freshly persisted items make the next search for the same query
-        a catalog hit. If live discovery is unavailable or approves nothing,
-        the best catalog matches are served stale-but-available rather than
-        leaving the user with a blank page.
+        Inside live discovery the registry -> GitHub trust cascade still
+        holds (enforced in `MCPDiscoveryAdapter`): GitHub is only queried
+        when the registry yields nothing. Ranking then orders the merge:
+        `official_connectors` provenance outranks registry mirrors, which
+        outrank GitHub repos, so the vendor's own endpoint lists first while
+        community mirrors remain visible below it.
+
+        The merged shortlist is capped (`search_cold_miss_result_cap`,
+        default 7) to stay a shortlist, not a firehose. If neither the
+        catalog nor live discovery produces a verifiable item, the best
+        catalog matches are served stale-but-available rather than leaving
+        the user with a blank page.
         """
         cached = await self._phase11.search(
             query, item_type=item_type, limit=self._settings.ranking_candidate_limit
         )
         verified = [entry for entry in cached.results if _is_verified(entry.item)]
 
-        if verified:
-            capped_limit = min(
-                limit or self._settings.search_verified_result_cap,
-                self._settings.search_verified_result_cap,
-            )
-            return ApplicationSearchResult(
-                ranked=Phase11SearchResult(
-                    plan=cached.plan, results=tuple(verified[:capped_limit])
-                ),
-                metadata=ApplicationSearchMetadata(
-                    mode="cached",
-                    sources_attempted=("arcadedb",),
-                    sources_succeeded=("arcadedb",),
-                    cached_results=min(len(verified), capped_limit),
-                ),
-            )
-
         discovery, catalog = await self._run_live_discovery(query, item_type, limit)
         live_metadata = self._live_metadata(discovery, catalog, mode="merged")
         live_items = list(catalog.approved) if catalog is not None else []
-        cold_miss_limit = self._settings.search_cold_miss_result_cap
+        merged_cap = self._settings.search_cold_miss_result_cap
 
-        if live_items:
+        # Merge verified catalog entries with freshly approved live items.
+        # `_merge_items` deduplicates on canonical identity and prefers the
+        # live copy when both sources found the same server.
+        merged = _merge_items([entry.item for entry in verified], live_items)
+        if merged:
             ranked = await self._rank_items(
                 query,
-                live_items,
+                merged,
                 item_type=item_type,
-                limit=min(limit or cold_miss_limit, cold_miss_limit),
+                limit=min(limit or merged_cap, merged_cap),
                 plan=cached.plan,
+            )
+            live_ids = {
+                entry.canonical_id or str(entry.item_id) for entry in live_items
+            }
+            cached_in_results = sum(
+                1
+                for entry in ranked.results
+                if (entry.item.canonical_id or str(entry.item.item_id))
+                not in live_ids
             )
             return ApplicationSearchResult(
                 ranked=ranked,
                 metadata=ApplicationSearchMetadata(
                     mode="merged",
                     sources_attempted=("arcadedb", *live_metadata.sources_attempted),
-                    sources_succeeded=live_metadata.sources_succeeded,
+                    sources_succeeded=(
+                        ("arcadedb", *live_metadata.sources_succeeded)
+                        if cached.results
+                        else live_metadata.sources_succeeded
+                    ),
                     sources_failed=live_metadata.sources_failed,
-                    cached_results=0,
+                    cached_results=cached_in_results,
                     live_candidates=live_metadata.live_candidates,
                     approved_count=live_metadata.approved_count,
                     rejected_count=live_metadata.rejected_count,
@@ -159,7 +164,7 @@ class ApplicationSearchService:
             query,
             [entry.item for entry in cached.results],
             item_type=item_type,
-            limit=min(limit or cold_miss_limit, cold_miss_limit),
+            limit=min(limit or merged_cap, merged_cap),
             plan=cached.plan,
         )
         return ApplicationSearchResult(
@@ -232,8 +237,22 @@ def _is_verified(item: Item) -> bool:
     Phase 10 only attaches `protocol_validation` evidence to items whose MCP
     resolution (or best-effort source-backed acceptance) succeeded; candidates
     rejected during normalization never enter the catalog with it.
+
+    Vendor-published official connectors (seeded from the curated directory,
+    provider='official_connectors') count as verified provenance too: the
+    vendor's own directory is first-party evidence that the endpoint exists
+    and is the official one for that service. The live protocol check still
+    happens on every Test Tool connect — this gate only controls whether the
+    item may appear in the search shortlist, where official servers must
+    surface above registry/GitHub mirrors (and before any live cascade).
     """
-    return any(entry.kind == "protocol_validation" for entry in item.evidence)
+    if any(entry.kind == "protocol_validation" for entry in item.evidence):
+        return True
+    return any(
+        entry.kind == "official_directory"
+        and entry.source.provider == "official_connectors"
+        for entry in item.evidence
+    )
 
 
 def _merge_items(cached: list[Item], live: list[Item]) -> list[Item]:

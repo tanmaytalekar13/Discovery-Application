@@ -70,6 +70,195 @@ def redirect_uri_for_item(item_id: str) -> str:
     return f"{_public_base_url()}/api/items/{item_id}/test/authorize/callback"
 
 
+# Well-known OAuth scope grants for the major identity providers behind
+# official MCP servers. The MCP spec's `scopes_supported` from server
+# metadata is preferred when advertised; these defaults fill the gap for
+# providers (notably Google and Microsoft Entra) whose MCP endpoints
+# either omit scopes_supported or need their broad account scopes spelled
+# out for the consent screen to show the resource the user expects.
+# Keys are matched as exact host or domain suffix, because the MCP URL's
+# host (e.g. calendarmcp.googleapis.com) differs from the authorization
+# server's host (accounts.google.com).
+DEFAULT_OAUTH_SCOPES: dict[str, str] = {
+    "google.com": (
+        "openid email profile "
+        "https://www.googleapis.com/auth/drive "
+        "https://www.googleapis.com/auth/calendar "
+        "https://www.googleapis.com/auth/gmail.modify "
+        "https://www.googleapis.com/auth/documents "
+        "https://www.googleapis.com/auth/spreadsheets "
+        "https://www.googleapis.com/auth/presentations "
+        "https://www.googleapis.com/auth/chat.spaces "
+        "https://www.googleapis.com/auth/tasks"
+    ),
+    "googleapis.com": (
+        "openid email profile "
+        "https://www.googleapis.com/auth/drive "
+        "https://www.googleapis.com/auth/calendar "
+        "https://www.googleapis.com/auth/gmail.modify "
+        "https://www.googleapis.com/auth/documents "
+        "https://www.googleapis.com/auth/spreadsheets "
+        "https://www.googleapis.com/auth/presentations "
+        "https://www.googleapis.com/auth/chat.spaces "
+        "https://www.googleapis.com/auth/tasks"
+    ),
+    "microsoftonline.com": (
+        "openid email profile offline_access "
+        "https://graph.microsoft.com/.default"
+    ),
+    "microsoft.com": (
+        "openid email profile offline_access "
+        "https://graph.microsoft.com/.default"
+    ),
+    "cloud.microsoft": (
+        "openid email profile offline_access "
+        "https://graph.microsoft.com/.default"
+    ),
+    "azure.com": (
+        "openid email profile offline_access "
+        "https://graph.microsoft.com/.default"
+    ),
+    "github.com": "repo read:org read:user",
+    "gitlab.com": "api read_user",
+    "slack.com": "identity.basic identity.email",
+}
+
+
+def default_scopes_for(mcp_url: str, as_metadata: dict | None = None) -> str | None:
+    """Pick a sensible scope grant for the provider behind `mcp_url`.
+
+    Order: the authorization server's advertised scopes_supported (the
+    server knows best), then the host-suffix defaults above, then None
+    (send no scope parameter and let the provider apply its default).
+    """
+    if as_metadata:
+        supported = as_metadata.get("scopes_supported")
+        if isinstance(supported, list) and supported:
+            return " ".join(str(s) for s in supported)
+    host = (urlparse(mcp_url).hostname or "").lower()
+    if not host:
+        return None
+    for suffix, scopes in DEFAULT_OAUTH_SCOPES.items():
+        if host == suffix or host.endswith("." + suffix):
+            return scopes
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pre-registered OAuth clients (for providers without dynamic registration)
+# ---------------------------------------------------------------------------
+
+# Sentinel item id used in the redirect URI for pre-registered (no-DCR)
+# providers. Their redirect URIs are registered once per provider in the
+# provider's developer console, so the callback URL must be stable and can
+# never contain a per-item UUID (the callback route parses item_id as a
+# UUID, hence the nil UUID rather than a word). The real item context
+# travels in the CSRF `state` (the OAuthFlowContext), so one redirect
+# serves every item.
+OAuthRedirectItem = "00000000-0000-0000-0000-000000000000"
+
+# Several major providers (Slack, Google, GitHub Apps, Entra) do NOT offer
+# RFC 7591 dynamic client registration — their MCP servers still speak the
+# rest of the MCP auth spec, but the app must present a client_id from the
+# provider's developer console. Those are configured once per provider via
+# env vars and reused for every server behind that issuer.
+_PRE_REGISTERED_CLIENT_ENV: dict[str, str] = {
+    "slack.com": "SLACK",
+    "google.com": "GOOGLE",
+    "googleapis.com": "GOOGLE",
+    "github.com": "GITHUB",
+    "gitlab.com": "GITLAB",
+    "microsoftonline.com": "ENTRA",
+    "microsoft.com": "ENTRA",
+    "cloud.microsoft": "ENTRA",
+    "azure.com": "ENTRA",
+    "linear.app": "LINEAR",
+    "notion.com": "NOTION",
+    "atlassian.com": "ATLASSIAN",
+    "sentry.dev": "SENTRY",
+    "vercel.com": "VERCEL",
+    "supabase.com": "SUPABASE",
+    "stripe.com": "STRIPE",
+    "huggingface.co": "HUGGINGFACE",
+}
+
+
+def _issuer_host(mcp_url: str, as_metadata: dict | None = None) -> str:
+    """The authorization server's host (falls back to the MCP origin)."""
+    issuer = (as_metadata or {}).get("issuer") or mcp_url
+    return (urlparse(str(issuer)).hostname or "").lower()
+
+
+def preregistered_client_for(
+    mcp_url: str, as_metadata: dict | None = None
+) -> tuple[str, str | None] | None:
+    """Look up a pre-registered OAuth client for the issuer behind `mcp_url`.
+
+    Reads MCP_OAUTH_CLIENT_ID_<SLUG> (required) and
+    MCP_OAUTH_CLIENT_SECRET_<SLUG> (optional; PKCE public clients omit it).
+    Returns (client_id, client_secret) or None when unset.
+    """
+    host = _issuer_host(mcp_url, as_metadata)
+    for suffix, slug in _PRE_REGISTERED_CLIENT_ENV.items():
+        if host == suffix or host.endswith("." + suffix):
+            client_id = os.environ.get(f"MCP_OAUTH_CLIENT_ID_{slug}", "").strip()
+            if client_id:
+                secret = os.environ.get(f"MCP_OAUTH_CLIENT_SECRET_{slug}", "").strip()
+                return client_id, (secret or None)
+    return None
+
+
+def preregistered_env_hint(mcp_url: str, as_metadata: dict | None = None) -> str:
+    """The env var name a user would set for this issuer (for error copy)."""
+    host = _issuer_host(mcp_url, as_metadata)
+    for suffix, slug in _PRE_REGISTERED_CLIENT_ENV.items():
+        if host == suffix or host.endswith("." + suffix):
+            return f"MCP_OAUTH_CLIENT_ID_{slug}"
+    return "MCP_OAUTH_CLIENT_ID_<PROVIDER>"
+
+
+def prereg_redirect_uri(mcp_url: str, as_metadata: dict | None = None) -> str | None:
+    """Stable callback URL for pre-registered providers, or None.
+
+    Providers without dynamic registration have their redirect URIs
+    registered once per provider, so the callback must not vary per item.
+    MCP_OAUTH_REDIRECT_BASE_URL (e.g. https://tunnel.example.com when the
+    app runs behind a tunnel) builds that stable callback. Without it the
+    caller falls back to the per-item redirect URI, which only works when
+    the developer happened to register exactly that URI.
+    """
+    host = _issuer_host(mcp_url, as_metadata)
+    for suffix, slug in _PRE_REGISTERED_CLIENT_ENV.items():
+        if host == suffix or host.endswith("." + suffix):
+            base = os.environ.get("MCP_OAUTH_REDIRECT_BASE_URL", "").strip().rstrip("/")
+            if base:
+                return f"{base}/api/items/{OAuthRedirectItem}/test/authorize/callback"
+            return None
+    return None
+
+
+def redirect_base_hint(mcp_url: str, as_metadata: dict | None = None) -> str:
+    """Human-readable callback path for error copy (base URL unknown here)."""
+    host = _issuer_host(mcp_url, as_metadata)
+    for suffix, slug in _PRE_REGISTERED_CLIENT_ENV.items():
+        if host == suffix or host.endswith("." + suffix):
+            return f"$MCP_OAUTH_REDIRECT_BASE_URL/api/items/{OAuthRedirectItem}/test/authorize/callback"
+    return "$MCP_OAUTH_REDIRECT_BASE_URL/api/items/<item_id>/test/authorize/callback"
+
+
+def preregistered_redirect_supported() -> bool:
+    """Whether a stable, item-independent OAuth callback is configured.
+
+    MCP_OAUTH_REDIRECT_BASE_URL names the externally reachable base URL
+    the developer registered with the provider (the same host for every
+    item), e.g. a tunnel hostname during local development. When set,
+    pre-registered (no-DCR) providers redirect to
+    {base}/api/items/<nil-uuid>/test/authorize/callback instead of a
+    per-item callback the provider would reject as unregistered.
+    """
+    return bool(os.environ.get("MCP_OAUTH_REDIRECT_BASE_URL", "").strip())
+
+
 # ---------------------------------------------------------------------------
 # In-memory flow store
 # ---------------------------------------------------------------------------
@@ -89,6 +278,9 @@ class OAuthFlowContext:
     resource: str  # MCP server URL, sent as RFC 8707 `resource` when supported
     created_at: float
     expires_at: float
+    # Catalog item the eventual token lands on. Differs from item_id when the
+    # redirect URI is the stable OAuthRedirectItem callback.
+    session_item_id: str = ""
 
     @property
     def is_expired(self) -> bool:
@@ -230,6 +422,18 @@ async def resolve_authorization_server(mcp_url: str) -> dict:
 
     metadata = await discover_authorization_server_metadata(str(issuer))
     if not metadata:
+        # RFC 8414 fallback: if the issuer URL carries a path component, the
+        # metadata may also live path-aware at the origin root. Slack is the
+        # real-world case: its MCP server (https://mcp.slack.com) is its own
+        # authorization server and serves its metadata at
+        # /well-known/oauth-authorization-server (no leading dot), while
+        # /slack.com returns the unrelated OpenID document (no PKCE, no MCP
+        # scopes). Trying the MCP origin's path-aware candidate finds it.
+        parsed = urlparse(str(issuer))
+        if parsed.path:
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            metadata = await discover_authorization_server_metadata(origin)
+    if not metadata:
         raise OAuthFlowError(
             "This server's OAuth authorization metadata could not be "
             f"discovered from {issuer}. The provider may not support "
@@ -240,6 +444,16 @@ async def resolve_authorization_server(mcp_url: str) -> dict:
             "The authorization server metadata is missing required "
             "endpoints (authorization_endpoint / token_endpoint)."
         )
+
+    # The MCP server's protected-resource metadata often advertises the
+    # resource scopes the MCP tools actually need (Slack advertises 30 MCP
+    # scopes there; its AS metadata and OpenID document advertise only
+    # openid/profile/email). Merge those scopes into the metadata so scope
+    # selection prefers the resource's own list before provider defaults.
+    if prm:
+        prm_scopes = prm.get("scopes_supported")
+        if isinstance(prm_scopes, list) and prm_scopes:
+            metadata = {**metadata, "scopes_supported": prm_scopes}
     return metadata
 
 
@@ -293,6 +507,7 @@ def build_authorization_url(
     item_id: str,
     session_id: str,
     scope: str | None = None,
+    session_item_id: str | None = None,
 ) -> tuple[str, str, OAuthFlowContext]:
     """Build the authorize URL (PKCE S256) and return (url, state, context)."""
     state = secrets.token_urlsafe(32)
@@ -322,6 +537,7 @@ def build_authorization_url(
         resource=resource,
         created_at=time.monotonic(),
         expires_at=time.monotonic() + FLOW_TTL_SECONDS,
+        session_item_id=session_item_id or item_id,
     )
     return url, state, flow
 
