@@ -40,8 +40,35 @@ from app.discovery.github.client import GitHubDiscoveryAdapter
 from app.discovery.mcp_registry.client import MCPRegistryClient
 from app.discovery.mcp_registry.service_adapter import discover_services
 from app.search.concurrency import gather_source_outcomes
+from app.verification.prefilter import KNOWN_INCOMPATIBLE_HOSTS, known_incompatible_reason
 
 DEFAULT_MAX_RESULTS = 20
+
+
+def _candidate_is_excluded(candidate: CandidateReference) -> bool:
+    """True when a candidate is a third-party hosted/aggregator server.
+
+    Spec v2 Section 7.4: Smithery-style platforms are confirmed
+    incompatible (or sit behind platform-level gateway auth) and are
+    never surfaced to users. Checked on the flattened candidate URLs,
+    the raw registry candidate's remote endpoints, and explicit host
+    mentions in the title/description (e.g. "hosted on smithery.ai").
+    Upstream GitHub repositories are deliberately NOT filtered here -
+    they are exactly what the registry-miss fallback should return.
+    """
+    for url in (str(getattr(candidate, "url", None) or ""), str(getattr(candidate, "repository_url", None) or "")):
+        if url and known_incompatible_reason(url):
+            return True
+
+    raw = candidate.raw_metadata.get("source_candidate")
+    if raw is not None:
+        for remote in getattr(raw, "remotes", ()) or ():
+            remote_url = remote.get("url") if isinstance(remote, dict) else None
+            if remote_url and known_incompatible_reason(str(remote_url)):
+                return True
+
+    text = f"{getattr(candidate, 'title', '') or ''} {getattr(candidate, 'description', '') or ''}".lower()
+    return any(host in text for host in KNOWN_INCOMPATIBLE_HOSTS)
 
 
 class MCPDiscoveryAdapter:
@@ -63,30 +90,45 @@ class MCPDiscoveryAdapter:
         query: str,
         max_results: int = DEFAULT_MAX_RESULTS,
     ) -> list[SourceOutcome]:
-        """Run every enabled MCP source concurrently for `query`.
+        """Run MCP discovery sources as a sequential trust cascade.
+
+        Spec v2 Section 9.1: the official MCP Registry is the
+        higher-trust, cheaper-to-query source (structured, already has
+        manifests), so it is consulted first — together with the
+        registry-backed service search, which targets the same official
+        source. GitHub is only queried when the official sources yield
+        *nothing* for the query. A registry hit stops the cascade and
+        GitHub is never contacted for that query.
 
         Returns one `SourceOutcome` per *attempted* source (a disabled
         source, i.e. constructor arg left `None`, is simply absent -
         not attempted, not failed).
-
-        When service discovery is enabled, performs an additional search
-        for official MCP servers matching the query against the MCP Registry's
-        search endpoint. This finds servers for specific services like
-        "Slack", "Figma", "Zoom", etc.
-
         """
-        tier1_tasks: dict[str, object] = {}
+        outcomes: list[SourceOutcome] = []
+
+        official_tasks: dict[str, object] = {}
+        if self._mcp_registry is not None:
+            official_tasks["mcp_registry"] = self._discover_registry(query, max_results)
+        if self._enable_service_discovery:
+            official_tasks["service"] = self._discover_service(query, max_results)
+
+        if official_tasks:
+            official_outcomes = await gather_source_outcomes(official_tasks)
+            outcomes.extend(official_outcomes)
+            if any(
+                outcome.succeeded and outcome.candidates
+                for outcome in official_outcomes
+            ):
+                return outcomes
 
         if self._github is not None:
-            tier1_tasks["github"] = self._discover_github(query, max_results)
+            outcomes.extend(
+                await gather_source_outcomes(
+                    {"github": self._discover_github(query, max_results)}
+                )
+            )
 
-        if self._mcp_registry is not None:
-            tier1_tasks["mcp_registry"] = self._discover_registry(query, max_results)
-
-        if self._enable_service_discovery:
-            tier1_tasks["service"] = self._discover_service(query, max_results)
-
-        return await gather_source_outcomes(tier1_tasks)
+        return outcomes
 
     async def _discover_github(
         self,
@@ -104,7 +146,11 @@ class MCPDiscoveryAdapter:
     ) -> list[CandidateReference]:
         assert self._mcp_registry is not None
         candidates = await self._mcp_registry.search(query, max_results)
-        return [_from_mcp_registry(candidate) for candidate in candidates]
+        return [
+            converted
+            for candidate in candidates
+            if not _candidate_is_excluded(converted := _from_mcp_registry(candidate))
+        ]
 
     async def _discover_service(
         self,
@@ -113,4 +159,4 @@ class MCPDiscoveryAdapter:
     ) -> list[CandidateReference]:
         """Search the official MCP Registry for servers matching a service name."""
         candidates = await discover_services(query, max_results=max_results)
-        return list(candidates)
+        return [c for c in candidates if not _candidate_is_excluded(c)]

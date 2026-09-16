@@ -10,7 +10,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -425,9 +424,30 @@ class LocalMCPClient:
                     auth_reason="unauthorized" if requires_auth else None,
                 )
 
+            payload = result.get("result")
+
+            # MCP lets a server return a protocol-successful (isError=false)
+            # result whose payload is an application-level auth failure —
+            # e.g. {"ok": false, "error": "not_authed"}, optionally wrapped
+            # in a text content block. Classify that as an auth failure so
+            # the UI offers the credential form instead of rendering the
+            # error as "Success".
+            auth_error = self._extract_auth_error(payload)
+            if auth_error:
+                return LocalInvokeResult(
+                    status="error",
+                    error=auth_error,
+                    duration_ms=duration_ms,
+                    user_message=(
+                        "This tool needs credentials. Add the required token or API key and try again."
+                    ),
+                    requires_auth=True,
+                    auth_reason="unauthorized",
+                )
+
             return LocalInvokeResult(
                 status="success",
-                result=result.get("result"),
+                result=payload,
                 duration_ms=duration_ms,
             )
 
@@ -459,6 +479,86 @@ class LocalMCPClient:
             "api key", "access token", "bearer token", "invalid token",
             "missing token", "credentials required", "permission denied",
         ))
+
+    # -----------------------------------------------------------------------
+    # In-band auth failure detection
+    #
+    # `_looks_like_auth_error` classifies exception / JSON-RPC error text.
+    # The helpers below classify *successful* (isError=false) tool payloads:
+    # many stdio servers read credentials from the environment at startup
+    # (so the handshake and tools/list succeed) and then return an
+    # application-level auth code — e.g. Slack's {"ok": false, "error":
+    # "not_authed"} — inside an otherwise protocol-valid result.
+    # -----------------------------------------------------------------------
+
+    # Exact application-level auth error codes servers return inside a
+    # result payload's `error` field.
+    _AUTH_ERROR_CODES = frozenset((
+        "not_authed", "not_authenticated", "unauthenticated", "unauthorized",
+        "authentication_required", "auth_required", "invalid_auth",
+        "invalid_token", "token_expired", "account_inactive",
+        "missing_credentials", "no_credentials", "missing_api_key",
+        "missing_token",
+    ))
+
+    # Strong textual prefixes for free-text auth failures. Deliberately
+    # prefix-based (not substring) so a legitimate result that merely
+    # mentions "api keys" mid-sentence is never misclassified.
+    _AUTH_TEXT_PREFIXES = (
+        "unauthorized", "authentication", "not authenticated",
+        "invalid token", "invalid api key", "missing token",
+        "missing api key", "api key required", "token required",
+        "credentials required", "auth required", "not_authed", "401", "403",
+    )
+
+    @classmethod
+    def _auth_error_string(cls, value: str) -> bool:
+        """True when `value` reads as an auth failure, not ordinary content."""
+        lowered = value.strip().lower()
+        if not lowered or len(lowered) > 300:
+            return False
+        return lowered in cls._AUTH_ERROR_CODES or any(
+            lowered.startswith(prefix) for prefix in cls._AUTH_TEXT_PREFIXES
+        )
+
+    @classmethod
+    def _extract_auth_error(cls, payload: Any, _depth: int = 0) -> str | None:
+        """Find an application-level auth failure inside a tool result payload.
+
+        Recurses (bounded) through dicts/lists and JSON-in-text blocks —
+        many stdio servers wrap their JSON result in a text content block
+        (content[0].text = '{"ok":false,"error":"not_authed"}'). Returns
+        the auth error text, or None when the payload looks like a genuine
+        successful result.
+        """
+        if _depth > 6 or payload is None:
+            return None
+        if isinstance(payload, str):
+            text = payload.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    return cls._extract_auth_error(json.loads(text), _depth + 1)
+                except (ValueError, TypeError):
+                    pass
+            if cls._auth_error_string(text):
+                return text[:300]
+            return None
+        if isinstance(payload, dict):
+            for key in ("error", "message", "detail"):
+                value = payload.get(key)
+                if isinstance(value, str) and cls._auth_error_string(value):
+                    return value[:300]
+            for value in payload.values():
+                found = cls._extract_auth_error(value, _depth + 1)
+                if found:
+                    return found
+            return None
+        if isinstance(payload, (list, tuple)):
+            for item in payload:
+                found = cls._extract_auth_error(item, _depth + 1)
+                if found:
+                    return found
+        return None
 
     async def disconnect(self) -> None:
         """Disconnect from the MCP server and clean up."""

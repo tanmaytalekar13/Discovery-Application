@@ -33,6 +33,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from app.sandbox.auth_signals import extract_inband_auth_error
+
 # McpError is the JSON-RPC-level error raised by the official `mcp` SDK
 # (e.g. when a server terminates a session, sends back a JSON-RPC error
 # object during initialize/call_tool, etc). It is NOT an httpx error and
@@ -1235,32 +1237,29 @@ class MCPTestClient:
 
             # Check for auth-required patterns in the result content.
             # Some servers (e.g. pipeworx) return {"error":"connection_required"}
-            # in structuredContent rather than via HTTP 401/403 or isError flag.
+            # in structuredContent rather than via HTTP 401/403 or isError flag,
+            # and stdio-style servers return application-level codes such as
+            # Slack's {"ok": false, "error": "not_authed"}. The shared
+            # in-band detector covers both shapes plus JSON-in-text blocks.
             auth_required = False
             auth_message: str | None = None
             structured = getattr(call_result, "structuredContent", None)
-            if structured is not None:
+            inband = extract_inband_auth_error(structured)
+            if inband:
+                auth_required = True
+                auth_message = inband
                 if isinstance(structured, dict):
-                    err_val = structured.get("error", "")
-                    if (
-                        isinstance(err_val, str)
-                        and "connection_required" in err_val.lower()
-                    ):
-                        auth_required = True
-                        auth_message = structured.get("message") or err_val
-                elif (
-                    isinstance(structured, str)
-                    and "connection_required" in structured.lower()
-                ):
-                    auth_required = True
-                    auth_message = structured
+                    auth_message = structured.get("message") or inband
 
-            # Also check content blocks for connection_required text (fallback)
+            # Also check content blocks for connection_required / auth text (fallback)
             if not auth_required:
                 extracted = _extract_error_message(call_result)
-                if extracted and "connection_required" in extracted.lower():
+                if extracted and (
+                    "connection_required" in extracted.lower()
+                    or extract_inband_auth_error(extracted)
+                ):
                     auth_required = True
-                    auth_message = auth_message or extracted
+                    auth_message = auth_message or extract_inband_auth_error(extracted) or extracted
 
             # Detect auth-related errors from text content.
             # Some servers (e.g. PennyOCR) return the error as a plain text

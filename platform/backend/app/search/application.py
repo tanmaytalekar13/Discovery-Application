@@ -77,38 +77,89 @@ class ApplicationSearchService:
                 metadata=self._live_metadata(discovery, catalog, mode="live"),
             )
 
-        # Always use the full ranking pool (ranking_candidate_limit) for cached
-        # items so that lower-priority sources (npm, awesome-list) are ranked
-        # before the result slice. The user's limit applies only to the final
-        # ranked output.
+        return await self._search_mixed(query, item_type=item_type, limit=limit)
+
+    async def _search_mixed(
+        self,
+        query: str,
+        *,
+        item_type: PreferredType | None,
+        limit: int | None,
+    ) -> ApplicationSearchResult:
+        """Cascade search: catalog first, live discovery only on a cold miss.
+
+        Spec v2 Section 9.1: step 1 (the local registry read) is the only
+        synchronous step that can satisfy a query, and a hit there stops the
+        cascade - no live source is contacted at all. The catalog shortlist is
+        capped (`search_verified_result_cap`, default 3) because the product
+        promises a small set of already-verified servers, not a firehose.
+
+        On a miss, live discovery runs as the registry -> GitHub cascade
+        (source order enforced inside `MCPDiscoveryAdapter`). Whatever it
+        finds goes through the normal Phase 10 persistence pipeline and is
+        ranked, then capped more generously
+        (`search_cold_miss_result_cap`, default 7) - still a shortlist, and
+        the freshly persisted items make the next search for the same query
+        a catalog hit. If live discovery is unavailable or approves nothing,
+        the best catalog matches are served stale-but-available rather than
+        leaving the user with a blank page.
+        """
         cached = await self._phase11.search(
             query, item_type=item_type, limit=self._settings.ranking_candidate_limit
         )
+        verified = [entry for entry in cached.results if _is_verified(entry.item)]
+
+        if verified:
+            capped_limit = min(
+                limit or self._settings.search_verified_result_cap,
+                self._settings.search_verified_result_cap,
+            )
+            return ApplicationSearchResult(
+                ranked=Phase11SearchResult(
+                    plan=cached.plan, results=tuple(verified[:capped_limit])
+                ),
+                metadata=ApplicationSearchMetadata(
+                    mode="cached",
+                    sources_attempted=("arcadedb",),
+                    sources_succeeded=("arcadedb",),
+                    cached_results=min(len(verified), capped_limit),
+                ),
+            )
+
         discovery, catalog = await self._run_live_discovery(query, item_type, limit)
         live_metadata = self._live_metadata(discovery, catalog, mode="merged")
+        live_items = list(catalog.approved) if catalog is not None else []
+        cold_miss_limit = self._settings.search_cold_miss_result_cap
 
-        # A successful live discovery pass should not be masked by stale seed/demo
-        # catalog rows. When live sources ran and produced no approved catalog
-        # entries, the cached seed fallback is treated as stale for this query and
-        # explicitly excluded from the merged response.
-        cached_items = [ranked.item for ranked in cached.results]
-        if discovery is not None and discovery.sources_succeeded and (
-            catalog is None or not catalog.approved
-        ):
-            merged_items: list[Item] = []
-            cached_result_count = 0
-        else:
-            merged_items = _merge_items(
-                cached_items,
-                list(catalog.approved if catalog is not None else ()),
+        if live_items:
+            ranked = await self._rank_items(
+                query,
+                live_items,
+                item_type=item_type,
+                limit=min(limit or cold_miss_limit, cold_miss_limit),
+                plan=cached.plan,
             )
-            cached_result_count = len(cached.results)
+            return ApplicationSearchResult(
+                ranked=ranked,
+                metadata=ApplicationSearchMetadata(
+                    mode="merged",
+                    sources_attempted=("arcadedb", *live_metadata.sources_attempted),
+                    sources_succeeded=live_metadata.sources_succeeded,
+                    sources_failed=live_metadata.sources_failed,
+                    cached_results=0,
+                    live_candidates=live_metadata.live_candidates,
+                    approved_count=live_metadata.approved_count,
+                    rejected_count=live_metadata.rejected_count,
+                ),
+            )
 
+        # Cold miss with no live approval: serve the best catalog matches
+        # (stale-but-available) instead of an empty response.
         ranked = await self._rank_items(
             query,
-            merged_items,
+            [entry.item for entry in cached.results],
             item_type=item_type,
-            limit=limit,
+            limit=min(limit or cold_miss_limit, cold_miss_limit),
             plan=cached.plan,
         )
         return ApplicationSearchResult(
@@ -118,7 +169,7 @@ class ApplicationSearchService:
                 sources_attempted=("arcadedb", *live_metadata.sources_attempted),
                 sources_succeeded=("arcadedb", *live_metadata.sources_succeeded),
                 sources_failed=live_metadata.sources_failed,
-                cached_results=cached_result_count,
+                cached_results=len(ranked.results),
                 live_candidates=live_metadata.live_candidates,
                 approved_count=live_metadata.approved_count,
                 rejected_count=live_metadata.rejected_count,
@@ -173,6 +224,16 @@ class ApplicationSearchService:
             approved_count=len(catalog.approved) if catalog else 0,
             rejected_count=len(catalog.rejected) if catalog else 0,
         )
+
+
+def _is_verified(item: Item) -> bool:
+    """A catalog item is 'verified' when its protocol was actually validated.
+
+    Phase 10 only attaches `protocol_validation` evidence to items whose MCP
+    resolution (or best-effort source-backed acceptance) succeeded; candidates
+    rejected during normalization never enter the catalog with it.
+    """
+    return any(entry.kind == "protocol_validation" for entry in item.evidence)
 
 
 def _merge_items(cached: list[Item], live: list[Item]) -> list[Item]:

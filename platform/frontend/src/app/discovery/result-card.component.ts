@@ -16,7 +16,7 @@ import { SearchResultItem, ClassificationMode } from './models';
           <h2 class="card-name">{{ result.item.name }}</h2>
         </div>
         <div class="card-score" [title]="scoreBreakdown">
-          <span class="score-value">{{ (result.final_score * 100).toFixed(0) }}</span>
+          <span class="score-value">{{ displayScore }}</span>
           <span class="score-unit">/100</span>
         </div>
       </div>
@@ -402,6 +402,12 @@ export class ResultCardComponent {
     if (cls.mode === 'local_stdio') return 'run-locally';
     if (cls.mode === 'local_source') return 'test-source'; // NEW
     return 'hidden'; // not_testable
+  }
+
+  /** Displayed score clamped to 0-100 so ranking overflow never breaks the UI. */
+  get displayScore(): string {
+    const raw = this.result.final_score * 100;
+    return Math.min(100, Math.max(0, Math.round(raw))).toFixed(0);
   }
 
   get reliabilityClass(): string {

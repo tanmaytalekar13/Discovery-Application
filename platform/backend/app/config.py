@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     ranking_evidence_weight: float = Field(default=0.10, ge=0)
     ranking_candidate_limit: int = Field(default=100, ge=1, le=500)
 
+    # Result shaping (spec v2 Section 9): a small verified shortlist is the
+    # product. Catalog hits are capped tightly; cold-miss live discovery gets
+    # a slightly more generous cap since nothing is pre-verified yet.
+    search_verified_result_cap: int = Field(default=3, ge=1, le=50)
+    search_cold_miss_result_cap: int = Field(default=7, ge=1, le=50)
+
     # Phase 09: each discovery source is independently enabled/disabled
     # (Section 32/33). A source with no credentials/targets configured
     # is treated as disabled by the orchestrator factory even if its

@@ -33,7 +33,7 @@ def settings(mode: str) -> Settings:
     )
 
 
-def item(name: str) -> Item:
+def item(name: str, *, verified: bool = True) -> Item:
     now = datetime.now(timezone.utc)
     source = DiscoverySource(
         type=SourceType.MCP_REGISTRY,
@@ -52,8 +52,8 @@ def item(name: str) -> Item:
         evidence=[
             DiscoveryEvidence(
                 evidence_id=uuid4(),
-                kind="protocol_validation",
-                statement="validated",
+                kind="protocol_validation" if verified else "discovery",
+                statement="validated" if verified else "seen in discovery",
                 source=source,
                 observed_at=now,
             )
@@ -215,12 +215,12 @@ async def test_live_mode_runs_discovery_catalog_then_ranks_approved_items():
 
 
 @pytest.mark.asyncio
-async def test_mixed_mode_merges_cached_and_live_before_phase11_ranking():
-    cached_item = item("cached_weather")
-    live_item = item("live_weather")
-    phase11 = FakePhase11([cached_item])
+async def test_mixed_mode_db_hit_returns_capped_shortlist_and_skips_live_discovery():
+    """Spec v2 Section 9.1: a catalog hit stops the cascade - no live source runs."""
+    cached_items = [item(f"cached_weather_{i}") for i in range(5)]
+    phase11 = FakePhase11(cached_items)
     orchestrator = FakeOrchestrator()
-    phase10 = FakePhase10([live_item])
+    phase10 = FakePhase10([item("live_weather")])
     service = ApplicationSearchService(
         settings=settings("mixed"),
         phase11=phase11,
@@ -230,21 +230,45 @@ async def test_mixed_mode_merges_cached_and_live_before_phase11_ranking():
 
     result = await service.search("weather", item_type="tool", limit=10)
 
+    # Catalog hit: live discovery never ran.
+    assert orchestrator.calls == []
+    assert result.metadata.mode == "cached"
+    assert result.metadata.sources_attempted == ("arcadedb",)
+    # Shortlist capped at 3 regardless of the requested limit of 10.
+    assert len(result.ranked.results) == 3
+    assert result.metadata.cached_results == 3
+
+
+@pytest.mark.asyncio
+async def test_mixed_mode_cold_miss_runs_live_discovery_and_caps_results():
+    """No verified catalog hit -> live cascade runs, results stay capped."""
+    phase11 = FakePhase11([item("stale_weather", verified=False)])
+    orchestrator = FakeOrchestrator()
+    phase10 = FakePhase10([item("live_weather", verified=False)])
+    service = ApplicationSearchService(
+        settings=settings("mixed"),
+        phase11=phase11,
+        orchestrator=orchestrator,
+        phase10_pipeline=phase10,
+    )
+
+    result = await service.search("weather", item_type="tool", limit=10)
+
+    assert orchestrator.calls == [("weather", phase10, "tool", 10)]
     assert result.metadata.mode == "merged"
-    assert result.metadata.sources_attempted == ("arcadedb", "mcp:mcp_registry")
-    assert result.metadata.cached_results == 1
+    assert result.metadata.live_candidates == 1
     assert result.metadata.approved_count == 1
-    assert phase11.rank_calls[0][1] == [live_item, cached_item]
+    assert phase11.rank_calls[0][1] == [phase10.result.approved[0]]
     assert [ranked.item for ranked in result.ranked.results] == [
-        live_item,
-        cached_item,
+        phase10.result.approved[0]
     ]
 
 
 @pytest.mark.asyncio
-async def test_mixed_mode_skips_seed_results_when_live_discovery_succeeds_but_approves_nothing():
-    cached_item = item("cached_weather")
-    phase11 = FakePhase11([cached_item])
+async def test_mixed_mode_cold_miss_serves_catalog_fallback_when_live_approves_nothing():
+    """Stale-but-available: with no live approval the best catalog matches serve."""
+    cached_items = [item(f"stale_weather_{i}", verified=False) for i in range(9)]
+    phase11 = FakePhase11(cached_items)
     orchestrator = FakeOrchestrator()
     phase10 = FakePhase10([])
     service = ApplicationSearchService(
@@ -254,9 +278,11 @@ async def test_mixed_mode_skips_seed_results_when_live_discovery_succeeds_but_ap
         phase10_pipeline=phase10,
     )
 
-    result = await service.search("weather", item_type="tool", limit=10)
+    result = await service.search("weather", item_type="tool", limit=20)
 
+    assert orchestrator.calls != []
     assert result.metadata.mode == "merged"
-    assert result.metadata.cached_results == 0
     assert result.metadata.approved_count == 0
-    assert result.ranked.results == ()
+    # Fallback capped at the cold-miss cap (7), not the requested 20.
+    assert len(result.ranked.results) == 7
+    assert result.metadata.cached_results == 7

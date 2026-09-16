@@ -25,14 +25,17 @@ from the existing discovery routes.
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse, Response as FastAPIResponse
+from fastapi.responses import HTMLResponse, Response as FastAPIResponse
 
 from app.api.dependencies import get_item_repository
+from app.artifacts.source_resolver import resolve_source
 from app.api.schemas import (
     ManualTokenRequest,
     OAuthStartResponse,
@@ -58,7 +61,7 @@ from app.sandbox.container_schemas import (
 )
 from app.sandbox.extract import extract_local_run_config
 from app.sandbox.local_mcp_client import LocalMCPClient
-from app.sandbox.mcp_client import MCPClientError, MCPTestClient, classify_connection_error
+from app.sandbox.mcp_client import MCPTestClient, classify_connection_error
 from app.sandbox.oauth import (
     OAuthFlowError,
     build_authorization_url,
@@ -518,7 +521,7 @@ async def disconnect(
     are gone. The user will need to re-authorize if they want to test
     again.
     """
-    item = await _require_item(item_id, repository)
+    await _require_item(item_id, repository)
     revoked = session_store.revoke_session(session_id)
     if not revoked:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -623,6 +626,97 @@ async def _require_local_testable(
 
 
 # ---------------------------------------------------------------------------
+# Credential-name extraction from README-documented env configuration
+# ---------------------------------------------------------------------------
+
+_SECRET_NAME_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
+
+
+def _env_name_is_secret(name: str) -> bool:
+    return any(marker in name.upper() for marker in _SECRET_NAME_MARKERS)
+
+
+async def _collect_credential_env_names(item) -> list[str]:
+    """Credential env var names from the item's README/source evidence.
+
+    Uses the same resolution chain as the Source preview tab: inline
+    artifacts.source_code first, then the disk cache, then a GitHub
+    README fetch (cached on first download). Mirrors the mcpServers JSON
+    convention ("env": {"BEARER_TOKEN": ...}) used by Claude Desktop /
+    Cursor configs: registry packages that declare no
+    environment_variables metadata usually DO document credentials this
+    way.
+    """
+    source_code = None
+    if item is not None and item.artifacts is not None:
+        source_code = item.artifacts.source_code
+    if not source_code:
+        try:
+            preview, _ = await resolve_source(item)
+        except Exception:  # noqa: BLE001 - README fetch is best-effort
+            return []
+        source_code = preview.content if preview and preview.available else None
+    if not source_code:
+        return []
+    return _extract_env_names_from_text(source_code)
+
+
+def _extract_env_names_from_artifacts(item) -> list[str]:
+    """Synchronous inline-only variant kept for direct reuse/tests."""
+    try:
+        source_code = (item.artifacts.source_code if item and item.artifacts else "") or ""
+    except AttributeError:
+        return []
+    if not source_code:
+        return []
+    return _extract_env_names_from_text(source_code)
+
+
+_ENV_NAME_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})\b")
+
+
+def _extract_env_names_from_text(source_code: str) -> list[str]:
+    """Extract credential env var names from README/config text.
+
+    Two evidence tiers, mirroring sandbox/extract.py's approach:
+    1. names inside an `env` block of an mcpServers-style JSON config
+       (the strongest signal — Claude Desktop / Cursor convention);
+    2. ALL_CAPS credential-looking names anywhere in the text (READMEs
+       commonly write `SLACK_BOT_TOKEN=xoxb-...` in a shell example even
+       when no JSON config block exists).
+    """
+    names: list[str] = []
+    for block in re.findall(r"```(?:json)?\s*\n(.*?)```", source_code, re.DOTALL):
+        try:
+            config = json.loads(block)
+        except ValueError:
+            continue
+        servers = config.get("mcpServers") if isinstance(config, dict) else None
+        candidates = servers.values() if isinstance(servers, dict) else [config]
+        for entry in candidates:
+            if not isinstance(entry, dict):
+                continue
+            env = entry.get("env")
+            if isinstance(env, dict):
+                names.extend(str(key) for key in env if isinstance(key, str))
+
+    if names:
+        return list(dict.fromkeys(names))[:8]
+
+    # Prose/shell-example fallback: only names that read as credentials.
+    for name in _ENV_NAME_RE.findall(source_code):
+        if _env_name_is_secret(name) and name not in (
+            "API_KEY",
+            "API_TOKEN",
+            "ACCESS_TOKEN",
+            "AUTH_TOKEN",
+            "BEARER_TOKEN",
+        ):
+            names.append(name)
+    return list(dict.fromkeys(names))[:8]
+
+
+# ---------------------------------------------------------------------------
 # POST /items/{item_id}/test/local/prepare
 # ---------------------------------------------------------------------------
 
@@ -667,6 +761,25 @@ async def prepare_local_test(
         )
         for var in hint.environment_variables
     ]
+
+    # Many registry packages declare no environment_variables metadata at
+    # all, yet their README documents exactly how credentials must be
+    # supplied (an `env` block in the mcpServers JSON, e.g.
+    # "BEARER_TOKEN": "ghp_..."). Extract those names so the credential
+    # form matches what the server actually expects instead of a generic
+    # API_KEY placeholder.
+    if not env_vars:
+        item = await repository.get(item_id)
+        readme_env = await _collect_credential_env_names(item) if item else []
+        env_vars = [
+            EnvironmentVariableSchema(
+                name=name,
+                description="Documented in the server's setup instructions.",
+                is_secret=_env_name_is_secret(name),
+                is_required=True,
+            )
+            for name in readme_env
+        ]
 
     return LocalPrepareResponse(
         item_id=item_id,
