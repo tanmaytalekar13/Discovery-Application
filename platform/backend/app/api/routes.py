@@ -66,10 +66,13 @@ async def search(
         for ranked in result.ranked.results
     ]
     # Verification badge enrichment (pure DB read from the McpServer
-    # registry; never blocks or fails the search response itself).
-    from app.verification.bridge import attach_verification_badges
+    # registry; never blocks or fails the search response itself), then
+    # the presentation order: official > verified > everything else
+    # (stable within tiers - the ranking engine's score order holds).
+    from app.verification.bridge import attach_verification_badges, order_results_by_tier
 
     await attach_verification_badges(rows)
+    rows = order_results_by_tier(rows)
 
     tools = [
         SearchToolItem(

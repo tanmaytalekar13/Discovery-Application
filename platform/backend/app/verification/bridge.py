@@ -207,6 +207,48 @@ async def attach_verification_badges(ranked_results: list[Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Search-side: presentation ordering (official > verified > rest)
+# ---------------------------------------------------------------------------
+
+TIER_UNVERIFIED = 0
+TIER_VERIFIED = 1
+TIER_OFFICIAL = 2
+
+_OFFICIAL_PROVIDER = "official_connectors"
+
+
+def _result_tier(row: Any) -> int:
+    """Presentation tier for one search result row.
+
+    Official (vendor-published connector) outranks verified, which
+    outranks everything else. The verification badge is whatever the
+    bridge attached from the McpServer registry (pipeline, auth flow,
+    or the user's own successful test).
+    """
+    provenance = getattr(row.item, "provenance", None) or []
+    if any(
+        getattr(source, "provider", None) == _OFFICIAL_PROVIDER
+        for source in provenance
+    ):
+        return TIER_OFFICIAL
+    verification = getattr(row, "verification", None)
+    if verification and verification.get("verified_badge"):
+        return TIER_VERIFIED
+    return TIER_UNVERIFIED
+
+
+def order_results_by_tier(rows: list[Any]) -> list[Any]:
+    """Order search rows: official first, then verified, then the rest.
+
+    Stable sort (Python guarantees stability): within each tier the
+    ranking engine's final_score order is preserved, so this only
+    regroups tiers - it never re-shuffles equal-tier results.
+    """
+    rows.sort(key=_result_tier, reverse=True)
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Test-side: persist a user-verified success
 # ---------------------------------------------------------------------------
 

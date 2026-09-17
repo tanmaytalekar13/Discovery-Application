@@ -16,6 +16,7 @@ import pytest
 from app.models import DiscoverySource, Item, Reliability, DiscoveryMetadata, SourceType
 from app.verification.bridge import (
     attach_verification_badges,
+    order_results_by_tier,
     record_user_verified_success,
 )
 from app.verification.models import McpServerRecord, ServerStatus, Transport
@@ -235,6 +236,73 @@ class TestAttachBadges:
         results = [_result(_make_item())]
         await attach_verification_badges(results)  # must not raise
         assert results[0].verification is None
+
+
+# ---------------------------------------------------------------------------
+# order_results_by_tier: official > verified > unverified (stable)
+# ---------------------------------------------------------------------------
+
+
+def _official_item(name: str) -> Item:
+    return _make_item(
+        name=name,
+        provenance=[
+            DiscoverySource(
+                type=SourceType.CONFIGURED,
+                id=f"official:{name}",
+                provider="official_connectors",
+            )
+        ],
+    )
+
+
+class TestTierOrdering:
+    def test_official_before_verified_before_unverified(self):
+        plain = _result(_make_item(name="PlainMirror"))
+        verified = _result(_make_item(name="VerifiedServer"))
+        verified.verification = {
+            "verified_badge": True, "verified_via_auth": False,
+            "last_verified_via": "anonymous", "status": "verified",
+            "quality_score": 95, "invocation_verified": True,
+        }
+        official = _result(_official_item("Official: Tavily"))
+
+        ordered = order_results_by_tier([plain, verified, official])
+
+        assert [row.item.name for row in ordered] == [
+            "Official: Tavily", "VerifiedServer", "PlainMirror",
+        ]
+
+    def test_sort_is_stable_within_tiers(self):
+        """Equal-tier rows keep the ranking engine's score order."""
+        first = _result(_make_item(name="First"))
+        second = _result(_make_item(name="Second"))
+        third = _result(_make_item(name="Third"))
+        second.verification = {
+            "verified_badge": True, "verified_via_auth": True,
+            "last_verified_via": "auth", "status": "verified",
+            "quality_score": 99, "invocation_verified": True,
+        }
+
+        ordered = order_results_by_tier([first, second, third])
+
+        # Second (verified) jumps ahead; First stays above Third.
+        assert [row.item.name for row in ordered] == [
+            "Second", "First", "Third",
+        ]
+
+    def test_official_without_badge_still_leads(self):
+        """Official tier is independent of the verification badge."""
+        official_unverified = _result(_official_item("Official Only"))
+        verified = _result(_make_item(name="Verified"))
+        verified.verification = {
+            "verified_badge": True, "verified_via_auth": False,
+            "last_verified_via": "user_test", "status": "verified",
+            "quality_score": 90, "invocation_verified": True,
+        }
+
+        ordered = order_results_by_tier([verified, official_unverified])
+        assert ordered[0].item.name == "Official Only"
 
 
 # ---------------------------------------------------------------------------
