@@ -65,6 +65,9 @@ class VerificationRepository:
         "invocation_verified",
         "latency_p50_ms",
         "latency_category",
+        "verified_badge",
+        "verified_via_auth",
+        "last_verified_via",
         "last_verified_at",
         "ttl_expires_at",
         "verification_details",
@@ -124,6 +127,40 @@ class VerificationRepository:
             params,
         )
         return await self.get(server_id)
+
+    async def select_badge_rows(
+        self,
+        *,
+        source_urls: list[str],
+        registry_names: list[str],
+        repo_identities: list[str],
+    ) -> list[dict[str, Any]]:
+        """Batched badge lookup for the search bridge: one SELECT for all
+        identity candidates across many items (no N+1 per result)."""
+        or_clauses: list[str] = []
+        params: dict[str, Any] = {"limit": 500}
+        for i, url in enumerate(source_urls[:100]):
+            or_clauses.append(f"source_url = :url_{i}")
+            params[f"url_{i}"] = url
+        for i, name in enumerate(registry_names[:100]):
+            or_clauses.append(f"registry_name = :rname_{i}")
+            params[f"rname_{i}"] = name
+        for i, ident in enumerate(repo_identities[:100]):
+            or_clauses.append(f"repository_url.toLowerCase() LIKE :repo_{i}")
+            params[f"repo_{i}"] = f"%{ident.lower()}%"
+        if not or_clauses:
+            return []
+
+        response = await self._db.command(
+            "sql",
+            "SELECT server_id, source_url, registry_name, repository_url, status, "
+            "quality_score, invocation_verified, verified_badge, verified_via_auth, "
+            "last_verified_via FROM McpServer WHERE ("
+            + " OR ".join(or_clauses)
+            + ") LIMIT :limit",
+            params,
+        )
+        return list(response.get("result", []))
 
     # ---- search (the ONLY query shape the API uses) -----------------------
 
@@ -296,6 +333,9 @@ class VerificationRepository:
             invocation_verified=bool(row.get("invocation_verified", False)),
             latency_p50_ms=row.get("latency_p50_ms"),
             latency_category=row.get("latency_category"),
+            verified_badge=bool(row.get("verified_badge", False)),
+            verified_via_auth=bool(row.get("verified_via_auth", False)),
+            last_verified_via=row.get("last_verified_via"),
             last_verified_at=row.get("last_verified_at"),
             ttl_expires_at=row.get("ttl_expires_at"),
             verification_details=details if isinstance(details, dict) else {},
@@ -332,6 +372,9 @@ class VerificationRepository:
             "invocation_verified": record.invocation_verified,
             "latency_p50_ms": record.latency_p50_ms,
             "latency_category": record.latency_category.value if record.latency_category else None,
+            "verified_badge": record.verified_badge,
+            "verified_via_auth": record.verified_via_auth,
+            "last_verified_via": record.last_verified_via,
             "last_verified_at": self._prepare(record.last_verified_at),
             "ttl_expires_at": self._prepare(record.ttl_expires_at),
             "verification_details": self._prepare(record.verification_details),
@@ -355,6 +398,8 @@ class ProviderCredentialRepository:
 
     ALLOWED_UPDATE_FIELDS = {
         "client_id",
+        "client_secret",
+        "token_endpoint",
         "redirect_uri",
         "refresh_token",
         "access_token",
@@ -419,6 +464,8 @@ class ProviderCredentialRepository:
         return ProviderCredentialRecord(
             provider=str(row.get("provider") or ""),
             client_id=str(row.get("client_id") or ""),
+            client_secret=row.get("client_secret"),
+            token_endpoint=row.get("token_endpoint"),
             redirect_uri=str(row.get("redirect_uri") or ""),
             refresh_token=row.get("refresh_token"),
             access_token=row.get("access_token"),
@@ -433,6 +480,8 @@ class ProviderCredentialRepository:
         return {
             "provider": record.provider,
             "client_id": record.client_id,
+            "client_secret": record.client_secret,
+            "token_endpoint": record.token_endpoint,
             "redirect_uri": record.redirect_uri,
             "refresh_token": record.refresh_token,
             "access_token": record.access_token,

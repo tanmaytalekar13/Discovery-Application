@@ -540,6 +540,225 @@ def pipeline():
 
 class TestRemotePipeline:
     @pytest.mark.asyncio
+    async def test_auth_success_path_earns_verified_badge(self, pipeline, monkeypatch):
+        """An auth-gated remote server whose stored credential WORKS must
+        complete a full pass (connect + handshake + tools/list + real
+        tool invocation) and land in `verified` WITH the badge - the
+        exact scenario the spec's 'auth + successfully working ->
+        verified with badge' rule demands."""
+        svc, repo, decisions = pipeline
+        record = _remote_record("https://mcp.example.com")
+        record.auth_required = True
+        record.auth_type = AuthType.OAUTH2
+        record.oauth_flow = OAuthFlow.AUTHORIZATION_CODE
+        record.oauth_provider = "notion"
+        await repo.create(record)
+
+        fake_client = SimpleNamespace(
+            connect=self._async(_success_connect_result()),
+            invoke=self._async(_success_invoke_result()),
+        )
+        monkeypatch.setattr(
+            "app.verification.verifiers.MCPTestClient",
+            lambda *a, **kw: fake_client,
+        )
+        # Active stored provider credential with a future expiry.
+        monkeypatch.setattr(
+            svc, "_credential_token_for", self._async("valid-token")
+        )
+
+        result = await svc.verify(record)
+
+        assert result.status is ServerStatus.VERIFIED
+        assert result.verified_badge is True
+        assert result.verified_via_auth is True
+        assert result.last_verified_via == "auth"
+        assert result.invocation_verified is True
+        assert result.confidence is Confidence.HIGH
+        assert result.attempts_planned == 1
+        assert result.attempts_completed == 1
+        assert result.ttl_expires_at is not None
+        assert len(decisions.decisions) == 1
+
+        # The pass must record the full stage trail, including the
+        # handshake the auth path previously skipped.
+        stage_names = [
+            s["stage"] if isinstance(s, dict) else s.stage
+            for s in result.verification_details["stages"]
+        ]
+        assert "handshake" in stage_names
+        assert "tools_list" in stage_names
+
+    @pytest.mark.asyncio
+    async def test_verified_badge_awarded_on_anonymous_success(self, pipeline, monkeypatch):
+        """The anonymous success path keeps earning the badge, just via
+        the 'anonymous' route."""
+        svc, repo, decisions = pipeline
+        record = _remote_record("https://mcp.example.com")
+        record.attempts_completed = 2
+        await repo.create(record)
+
+        fake_client = SimpleNamespace(
+            connect=self._async(_success_connect_result()),
+            invoke=self._async(_success_invoke_result()),
+        )
+        monkeypatch.setattr(
+            "app.verification.verifiers.MCPTestClient",
+            lambda *a, **kw: fake_client,
+        )
+
+        result = await svc.verify(record)
+
+        assert result.status is ServerStatus.VERIFIED
+        assert result.verified_badge is True
+        assert result.verified_via_auth is False
+        assert result.last_verified_via == "anonymous"
+
+    @pytest.mark.asyncio
+    async def test_verified_badge_cleared_when_server_stops_working(self, pipeline, monkeypatch):
+        """A previously-badged server that later fails its handshake
+        loses the badge together with its verified status."""
+        svc, repo, decisions = pipeline
+        record = _remote_record("https://mcp.example.com")
+        record.verified_badge = True
+        record.verified_via_auth = True
+        record.last_verified_via = "auth"
+        record.status = ServerStatus.VERIFIED
+        record.attempts_completed = 2
+        await repo.create(record)
+
+        fake_client = SimpleNamespace(
+            connect=self._async(SimpleNamespace(
+                connected=False, auth_required=False, transport=None, tools=[],
+                error="boom", auth_reason="server_error",
+                user_message="Server error", show_token_input=False,
+                show_oauth_button=False, server_info={},
+            )),
+        )
+        monkeypatch.setattr(
+            "app.verification.verifiers.MCPTestClient",
+            lambda *a, **kw: fake_client,
+        )
+
+        result = await svc.verify(record)
+
+        assert result.verified_badge is False
+        assert result.verified_via_auth is False
+        assert result.last_verified_via is None
+
+    @pytest.mark.asyncio
+    async def test_token_refresh_on_expired_credential(self, pipeline, monkeypatch):
+        """Expired access token + stored refresh token: the pipeline
+        refreshes transparently and verification still completes with
+        the auth badge."""
+        from app.verification.models import ProviderCredentialRecord
+
+        svc, repo, decisions = pipeline
+        record = _remote_record("https://mcp.example.com")
+        record.auth_type = AuthType.OAUTH2
+        record.oauth_flow = OAuthFlow.AUTHORIZATION_CODE
+        record.oauth_provider = "notion"
+        await repo.create(record)
+
+        fake_client = SimpleNamespace(
+            connect=self._async(_success_connect_result()),
+            invoke=self._async(_success_invoke_result()),
+        )
+        monkeypatch.setattr(
+            "app.verification.verifiers.MCPTestClient",
+            lambda *a, **kw: fake_client,
+        )
+
+        refreshed_calls = []
+
+        async def fake_refresh(credential):
+            refreshed_calls.append(credential)
+            return "fresh-token"
+
+        monkeypatch.setattr(svc, "_refresh_provider_credential", fake_refresh)
+
+        provider_repo = SimpleNamespace(
+            get=self._async(ProviderCredentialRecord(
+                provider="notion",
+                client_id="cid",
+                token_endpoint="https://auth.example/token",
+                refresh_token="rt",
+                access_token="stale",
+                token_expires_at="2000-01-01T00:00:00+00:00",
+                status="active",
+            )),
+            update=self._async(None),
+        )
+        svc.set_provider_repository(provider_repo)
+
+        result = await svc.verify(record)
+
+        assert refreshed_calls, "refresh grant must have been replayed"
+        assert result.status is ServerStatus.VERIFIED
+        assert result.verified_badge is True
+        assert result.verified_via_auth is True
+
+    @pytest.mark.asyncio
+    async def test_failed_refresh_routes_to_reauth(self, pipeline, monkeypatch):
+        """Expired token + failed refresh: credential is flagged
+        reauth_required and the run is auth-blocked, never a fake pass."""
+        from app.verification.models import ProviderCredentialRecord
+
+        svc, repo, decisions = pipeline
+        record = _remote_record("https://mcp.example.com")
+        record.auth_type = AuthType.OAUTH2
+        record.oauth_flow = OAuthFlow.AUTHORIZATION_CODE
+        record.oauth_provider = "notion"
+        await repo.create(record)
+
+        captured_updates = {}
+
+        async def capture_update(provider, updates):
+            captured_updates.update(updates)
+
+        provider_repo = SimpleNamespace(
+            get=self._async(ProviderCredentialRecord(
+                provider="notion",
+                refresh_token="rt",
+                token_endpoint="https://auth.example/token",
+                access_token="stale",
+                token_expires_at="2000-01-01T00:00:00+00:00",
+                status="active",
+            )),
+            update=capture_update,
+        )
+        svc.set_provider_repository(provider_repo)
+        monkeypatch.setattr(svc, "_refresh_provider_credential", self._async(None))
+        monkeypatch.setattr(
+            svc, "_refine_auth_metadata",
+            self._async((AuthType.OAUTH2, OAuthFlow.AUTHORIZATION_CODE, "notion")),
+        )
+
+        # Anonymous connect is refused -> AUTH_REQUIRED path.
+        fake_client = SimpleNamespace(
+            connect=self._async(SimpleNamespace(
+                connected=False, auth_required=True, transport=None, tools=[],
+                error="unauthorized", auth_reason="unauthorized",
+                user_message="Requires auth", show_token_input=False,
+                show_oauth_button=True, server_info={},
+            )),
+        )
+        monkeypatch.setattr(
+            "app.verification.verifiers.MCPTestClient",
+            lambda *a, **kw: fake_client,
+        )
+
+        result = await svc.verify(record)
+
+        assert captured_updates.get("status") == "reauth_required"
+        # Auth-blocked (the refresh failed so no working credential),
+        # never a fake pass - and definitely no badge.
+        assert result.status in (
+            ServerStatus.OAUTH_PENDING_CONSENT, ServerStatus.PARTIAL_VERIFIED,
+        )
+        assert result.verified_badge is False
+
+    @pytest.mark.asyncio
     async def test_success_path_scores_and_persists_verified(self, pipeline, monkeypatch):
         svc, repo, decisions = pipeline
         record = _remote_record("https://mcp.example.com")

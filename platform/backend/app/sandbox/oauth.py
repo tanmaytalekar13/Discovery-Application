@@ -576,3 +576,49 @@ async def exchange_code_for_token(flow: OAuthFlowContext, code: str) -> dict:
     if not doc.get("access_token"):
         raise OAuthFlowError("Token exchange response contained no access_token.")
     return doc
+
+
+async def refresh_provider_token(
+    token_endpoint: str,
+    refresh_token: str,
+    client_id: str,
+    client_secret: str | None = None,
+) -> dict:
+    """Exchange a stored refresh token for fresh tokens (RFC 6749 Section 6).
+
+    Used by the verification pipeline so an auth-gated server whose
+    access token expired can be re-verified WITHOUT a new human consent
+    round-trip: the provider-scoped refresh token (stored at consent
+    time) is replayed against the same token_endpoint the original flow
+    used. Returns the raw token document (access_token, optional new
+    refresh_token, expires_in, scope).
+    """
+    form = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }
+    if client_secret:
+        form["client_secret"] = client_secret
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+        try:
+            resp = await client.post(
+                token_endpoint, data=form, headers={"User-Agent": _USER_AGENT}
+            )
+        except httpx.HTTPError as exc:
+            raise OAuthFlowError(f"Token refresh failed: {exc}") from exc
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            doc = resp.json()
+            detail = str(doc.get("error_description") or doc.get("error") or "")
+        except ValueError:
+            pass
+        raise OAuthFlowError(
+            f"Token refresh rejected (HTTP {resp.status_code})"
+            f"{' ' + detail if detail else ''}."
+        )
+    doc = resp.json()
+    if not doc.get("access_token"):
+        raise OAuthFlowError("Token refresh response contained no access_token.")
+    return doc

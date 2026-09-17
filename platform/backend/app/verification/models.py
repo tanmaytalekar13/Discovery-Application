@@ -162,6 +162,16 @@ class McpServerRecord(BaseModel):
     latency_p50_ms: int | None = None
     latency_category: LatencyCategory | None = None
 
+    # Verified badge (Section 2.1): set only by a completed pipeline run
+    # whose result is `verified` - the connect/handshake/tools-list checks
+    # passed and real tool invocations succeeded. Auth-gated servers earn
+    # it only when verification ran with working credentials
+    # (`auth_exercised`). Cleared automatically whenever a later run
+    # fails or the record leaves the verified bucket.
+    verified_badge: bool = False
+    verified_via_auth: bool = False
+    last_verified_via: str | None = None  # "anonymous" | "auth"
+
     last_verified_at: datetime | None = None
     ttl_expires_at: datetime | None = None
     verification_details: dict[str, Any] = Field(default_factory=dict)
@@ -176,6 +186,11 @@ class ProviderCredentialRecord(BaseModel):
 
     provider: str
     client_id: str = ""
+    # Secret + token endpoint are persisted so the verification pipeline
+    # can replay the RFC 6749 refresh_token grant when the access token
+    # expires - re-verification then needs no new human consent round.
+    client_secret: str | None = None
+    token_endpoint: str | None = None
     redirect_uri: str = ""
     # Stored encrypted at rest by the caller; this model never logs them.
     refresh_token: str | None = None

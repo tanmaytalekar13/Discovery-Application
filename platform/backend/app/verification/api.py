@@ -10,6 +10,7 @@ cold-miss hint) or supports the manual review queue (OAuth consent).
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -29,6 +30,7 @@ from app.verification.repository import (
     VerificationDecisionRepository,
     VerificationRepository,
 )
+from app.verification.scoring import ttl_days_for
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,9 @@ class ServerSummary(BaseModel):
     auth_required: bool = False
     auth_type: str = "none"
     oauth_provider: str | None = None
+    verified_badge: bool = False
+    verified_via_auth: bool = False
+    last_verified_via: str | None = None
     tool_count: int = 0
 
     @classmethod
@@ -106,6 +111,9 @@ class ServerSummary(BaseModel):
             auth_type=record.auth_type.value
             if hasattr(record.auth_type, "value") else str(record.auth_type),
             oauth_provider=record.oauth_provider,
+            verified_badge=record.verified_badge,
+            verified_via_auth=record.verified_via_auth,
+            last_verified_via=record.last_verified_via,
             tool_count=len(record.declared_tools or []),
         )
 
@@ -400,8 +408,18 @@ async def approve_server(
             status_code=409,
             detail="Refusing to approve: invocation was never verified (rule 8 - no faked verified status)",
         )
+    # The human smoke-test pass grants the same verified badge the
+    # automated pipeline awards: it IS a verified verdict, earned via
+    # manual review (last_verified_via marks the distinction).
     updated = await repository.update(server_uuid, {
         "status": ServerStatus.VERIFIED.value,
+        "verified_badge": True,
+        "verified_via_auth": bool(record.auth_required),
+        "last_verified_via": "manual_review",
+        "ttl_expires_at": (
+            datetime.now(timezone.utc)
+            + timedelta(days=ttl_days_for(record.transport.value))
+        ).isoformat(),
     })
     return ServerSummary.from_record(updated or record)
 
@@ -498,7 +516,9 @@ async def start_provider_authorization(
         ) from exc
 
     await providers.upsert(
-        _provider_record(provider, client_id, redirect_uri, existing)
+        _provider_record(provider, client_id, redirect_uri, existing,
+                         client_secret=client_secret,
+                         token_endpoint=as_metadata.get("token_endpoint"))
     )
 
     return {"authorization_url": authorization_url, "state": state}
@@ -522,15 +542,37 @@ _PROVIDER_AUTH_BASES: dict[str, str] = {
 }
 
 
-def _provider_record(provider: str, client_id: str, redirect_uri: str, existing):
+def _provider_record(
+    provider: str,
+    client_id: str,
+    redirect_uri: str,
+    existing,
+    *,
+    client_secret: str | None = None,
+    token_endpoint: str | None = None,
+):
     from app.verification.models import ProviderCredentialRecord
 
-    return ProviderCredentialRecord(
+    record = ProviderCredentialRecord(
         provider=provider,
         client_id=client_id,
+        client_secret=client_secret,
+        token_endpoint=token_endpoint,
         redirect_uri=redirect_uri,
         status=(existing.status if existing else "pending_consent"),
     )
+    if existing is not None:
+        # Re-authorization must never wipe a still-valid stored grant:
+        # carry the tokens/scopes forward unless the new flow replaces
+        # them at callback time.
+        record.refresh_token = existing.refresh_token
+        record.access_token = existing.access_token
+        record.granted_scopes = list(existing.granted_scopes or [])
+        record.requested_scopes = list(existing.requested_scopes or [])
+        record.token_expires_at = existing.token_expires_at
+        record.client_secret = client_secret or existing.client_secret
+        record.token_endpoint = token_endpoint or existing.token_endpoint
+    return record
 
 
 @router.get("/oauth/callback/{provider}")
@@ -565,8 +607,6 @@ async def oauth_callback(
     expires_at = None
     expires_in = token_doc.get("expires_in")
     if isinstance(expires_in, (int, float)):
-        from datetime import datetime, timedelta, timezone
-
         expires_at = (
             datetime.now(timezone.utc) + timedelta(seconds=float(expires_in))
         ).isoformat()
@@ -576,6 +616,11 @@ async def oauth_callback(
     await providers.upsert(ProviderCredentialRecord(
         provider=provider,
         client_id=flow.client_id,
+        # Persisted for the pipeline's refresh_token grant: with these two
+        # fields the verification worker can mint fresh access tokens
+        # forever without another consent round.
+        client_secret=flow.client_secret,
+        token_endpoint=flow.token_endpoint,
         redirect_uri=flow.redirect_uri,
         refresh_token=token_doc.get("refresh_token"),
         access_token=token_doc.get("access_token"),
@@ -595,7 +640,11 @@ async def oauth_callback(
             ServerStatus.REAUTH_REQUIRED.value,
             ServerStatus.OAUTH_PENDING_CONSENT.value,
         ):
-            await servers.update(record.server_id, {"status": ServerStatus.PENDING.value})
+            # Fresh consent = fresh complete verification pass.
+            await servers.update(record.server_id, {
+                "status": ServerStatus.PENDING.value,
+                "attempts_completed": 0,
+            })
             requeued += 1
 
     return {

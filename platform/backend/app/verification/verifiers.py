@@ -76,6 +76,9 @@ class AttemptOutcome:
     malformed_graceful: bool | None = None
     security_flagged: bool = False
     stage_results: list[StageResult] = field(default_factory=list)
+    # True when the run connected and exercised real tools WITH working
+    # credentials - the auth-gated equivalent of a full verification pass.
+    auth_exercised: bool = False
 
 
 class VerificationPipeline:
@@ -352,6 +355,7 @@ class VerificationPipeline:
             tool_outcomes=tool_outcomes,
             malformed_graceful=malformed_graceful,
             security_flagged=security_flagged,
+            auth_exercised=bool(token),
             stage_results=stages,
         )
 
@@ -465,10 +469,24 @@ class VerificationPipeline:
                     kind=StageOutcomeKind.SUCCESS.value,
                     detail="connected using stored provider credential",
                 ))
+                # With credentials attached this is a COMPLETE verification
+                # pass, structurally identical to the anonymous path: the
+                # handshake and tools/list stages must be recorded or the
+                # scoring engine will never award the verified bucket.
+                stages.append(StageResult(
+                    stage=VerificationStage.HANDSHAKE.value,
+                    kind=StageOutcomeKind.SUCCESS.value,
+                    detail=f"initialized with auth: {retry.server_info}",
+                ))
                 tools = [
                     {"name": t.name, "description": t.description, "inputSchema": t.input_schema}
                     for t in retry.tools
                 ]
+                stages.append(StageResult(
+                    stage=VerificationStage.TOOLS_LIST.value,
+                    kind=StageOutcomeKind.SUCCESS.value,
+                    detail=f"{len(tools)} tools declared",
+                ))
                 tool_outcomes, malformed, security = await self._exercise_remote_tools(
                     record_with_token, tools, stages, token
                 )
@@ -477,6 +495,7 @@ class VerificationPipeline:
                                       tool_outcomes=tool_outcomes,
                                       malformed_graceful=malformed,
                                       security_flagged=security,
+                                      auth_exercised=True,
                                       stage_results=stages)
             text = (retry.user_message or retry.error or "").lower()
             if "scope" in text or "restricted" in text or "insufficient" in text:
@@ -538,23 +557,83 @@ class VerificationPipeline:
         return record.auth_type, record.oauth_flow, record.oauth_provider
 
     async def _credential_token_for(self, record: McpServerRecord) -> str | None:
-        """Bearer token from the provider credential store, if active."""
+        """Bearer token from the provider credential store, if active.
+
+        When the cached access token has expired but a refresh token was
+        stored at consent time, the RFC 6749 refresh grant is replayed
+        once so re-verification never needs a new human consent round.
+        A failed refresh marks the credential `reauth_required` (Section
+        7.3.4) instead of silently dialing with a dead token.
+        """
         provider = record.oauth_provider
-        if not provider or not getattr(self, "_provider_repository", None):
+        repo = getattr(self, "_provider_repository", None)
+        if not provider or repo is None:
             return None
-        credential = await self._provider_repository.get(provider)
+        credential = await repo.get(provider)
         if credential is None or credential.status != "active":
             return None
+
+        token_expired = False
         if credential.token_expires_at:
             try:
                 expires = datetime.fromisoformat(str(credential.token_expires_at))
                 if expires.tzinfo is None:
                     expires = expires.replace(tzinfo=timezone.utc)
-                if expires <= datetime.now(timezone.utc):
-                    return None
+                token_expired = expires <= datetime.now(timezone.utc)
             except ValueError:
-                pass
-        return credential.access_token or None
+                token_expired = False
+
+        if not token_expired:
+            return credential.access_token or None
+
+        # Access token expired: try the refresh grant, then persist the
+        # rotated tokens so subsequent servers/providers reuse them.
+        refreshed = await self._refresh_provider_credential(credential)
+        if refreshed:
+            return refreshed
+        await repo.update(provider, {
+            "status": "reauth_required",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return None
+
+    async def _refresh_provider_credential(self, credential) -> str | None:
+        """Replay the refresh_token grant; persist rotated tokens on success."""
+        from app.sandbox.oauth import OAuthFlowError, refresh_provider_token
+
+        if not credential.refresh_token or not credential.token_endpoint:
+            return None
+        try:
+            token_doc = await refresh_provider_token(
+                token_endpoint=credential.token_endpoint,
+                refresh_token=credential.refresh_token,
+                client_id=credential.client_id,
+                client_secret=credential.client_secret,
+            )
+        except OAuthFlowError:
+            logger.info("Token refresh failed for provider %r", credential.provider)
+            return None
+        except Exception:  # noqa: BLE001 - network hiccups must not kill verification
+            logger.exception("Unexpected token refresh failure for %r", credential.provider)
+            return None
+
+        repo = getattr(self, "_provider_repository", None)
+        if repo is None:
+            return token_doc.get("access_token")
+        expires_in = token_doc.get("expires_in")
+        updates: dict[str, Any] = {
+            "access_token": token_doc.get("access_token"),
+            "status": "active",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if token_doc.get("refresh_token"):
+            updates["refresh_token"] = token_doc["refresh_token"]
+        if isinstance(expires_in, (int, float)):
+            updates["token_expires_at"] = (
+                datetime.now(timezone.utc) + timedelta(seconds=float(expires_in))
+            ).isoformat()
+        await repo.update(credential.provider, updates)
+        return token_doc.get("access_token")
 
     async def _flag_provider_reauth(self, record: McpServerRecord) -> None:
         repo = getattr(self, "_provider_repository", None)
@@ -573,8 +652,14 @@ class VerificationPipeline:
         self, record: McpServerRecord, outcome: AttemptOutcome
     ) -> McpServerRecord:
         soft = self._build_soft_checks(outcome)
+        # A run that exercised real tools with working credentials is a
+        # COMPLETE verification pass regardless of transport: the auth
+        # gate (the only reason remote servers plan 3 attempts) no longer
+        # applies, so one pass is enough for high confidence.
+        auth_exercised = outcome.auth_exercised
         attempts_planned = (
-            1 if record.transport is Transport.LOCAL else REMOTE_ATTEMPTS_PLANNED
+            1 if record.transport is Transport.LOCAL or auth_exercised
+            else REMOTE_ATTEMPTS_PLANNED
         )
         attempts_completed = min(record.attempts_completed + 1, attempts_planned)
 
@@ -594,8 +679,12 @@ class VerificationPipeline:
                 status = ServerStatus.RETRY_PENDING
             elif soft.auth_blocked:
                 status = ServerStatus.PARTIAL_VERIFIED
-        if outcome.kind is StageOutcomeKind.AUTH_REQUIRED and status not in (
-            ServerStatus.VERIFIED, ServerStatus.REVIEW,
+        if (
+            outcome.kind is StageOutcomeKind.AUTH_REQUIRED
+            and not auth_exercised
+            and status not in (
+                ServerStatus.VERIFIED, ServerStatus.REVIEW,
+            )
         ):
             # Auth-blocked: structural-only (rule 8). authorization_code
             # without consent routes to the manual queue bucket.
@@ -606,6 +695,15 @@ class VerificationPipeline:
                 and not await self._has_active_credential(record)
                 else ServerStatus.PARTIAL_VERIFIED
             )
+
+        # The verified badge (Section 2.1): awarded by the pipeline alone,
+        # only on a verified result from a run that actually connected,
+        # listed tools, and invoked them successfully. Auth-gated servers
+        # earn it through `auth_exercised` runs; it is cleared the moment
+        # any later run fails to reach a verified verdict.
+        badge_earned = status is ServerStatus.VERIFIED and bool(
+            outcome.tool_outcomes
+        ) and any(o.invocation_status == "success" for o in outcome.tool_outcomes)
 
         now = datetime.now(timezone.utc)
         updates: dict[str, Any] = {
@@ -637,6 +735,24 @@ class VerificationPipeline:
                     now + timedelta(days=ttl_days_for(record.transport.value))
                 ).isoformat() if status is ServerStatus.VERIFIED else None,
             })
+            if badge_earned:
+                updates["verified_badge"] = True
+                updates["verified_via_auth"] = auth_exercised
+                updates["last_verified_via"] = "auth" if auth_exercised else "anonymous"
+        elif record.verified_badge:
+            # The badge is never stale: a later failing/incomplete run
+            # drops it together with the verified status.
+            updates["verified_badge"] = False
+            updates["verified_via_auth"] = False
+            updates["last_verified_via"] = None
+
+        if auth_exercised:
+            # Observability: how this server's badge was earned.
+            outcome.stage_results.append(StageResult(
+                stage=VerificationStage.SECURITY.value,
+                kind=StageOutcomeKind.SUCCESS.value,
+                detail="verified with credentials: auth flow exercised end-to-end",
+            ))
 
         if result.hard_fail:
             updates["rejection_stage"] = VerificationStage.HANDSHAKE.value

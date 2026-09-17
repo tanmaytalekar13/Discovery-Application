@@ -125,6 +125,19 @@ export interface SearchResultItem {
   evidence: number;
   source_priority: number;
   classification?: ClassificationResult;
+  /** Verification badge from the McpServer registry (may be absent when
+   * the server has never been verified). */
+  verification?: VerificationInfo;
+}
+
+/** How the verified badge was earned (mirrors backend verification bridge). */
+export interface VerificationInfo {
+  verified_badge: boolean;
+  verified_via_auth: boolean;
+  last_verified_via?: 'anonymous' | 'auth' | 'user_test' | 'manual_review' | null;
+  status: string;
+  quality_score: number;
+  invocation_verified: boolean;
 }
 
 export interface SearchResponse {

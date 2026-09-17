@@ -53,8 +53,17 @@ import { SearchResultItem, ClassificationMode } from './models';
       </div>
 
       <!-- Source badges -->
-      @if (dedupedSources.length > 0) {
+      @if (dedupedSources.length > 0 || isVerified) {
         <div class="source-badges" aria-label="Discovery sources">
+          @if (isVerified) {
+            <span
+              class="source-badge"
+              [class]="verifiedViaAuth ? 'source-badge source-badge--verified--auth' : 'source-badge source-badge--verified'"
+              [title]="verifiedTitle"
+            >
+              ✓ Verified{{ verifiedViaAuth ? ' · Auth' : '' }}
+            </span>
+          }
           @if (isOfficial) {
             <span class="source-badge source-badge--official" title="Vendor-published official MCP endpoint">Official</span>
           }
@@ -287,11 +296,33 @@ import { SearchResultItem, ClassificationMode } from './models';
         border-color: #86efac;
         color: #166534;
       }
+      .source-badge--verified {
+        background: #166534;
+        border-color: #15803d;
+        color: #ffffff;
+        font-weight: 700;
+      }
+      .source-badge--verified--auth {
+        background: #1e40af;
+        border-color: #1d4ed8;
+        color: #ffffff;
+        font-weight: 700;
+      }
       @media (prefers-color-scheme: dark) {
         .source-badge--official {
           background: #14532d;
           border-color: #166534;
           color: #86efac;
+        }
+        .source-badge--verified {
+          background: #052e16;
+          border-color: #15803d;
+          color: #4ade80;
+        }
+        .source-badge--verified--auth {
+          background: #172554;
+          border-color: #1d4ed8;
+          color: #93c5fd;
         }
       }
       .meta-detail {
@@ -461,6 +492,27 @@ export class ResultCardComponent {
     return this.result.item.provenance.some(
       (s) => s.provider === 'official_connectors',
     );
+  }
+
+  /** The server earned the verified badge in the McpServer registry
+   *  (automated pipeline, working auth flow, or the user's own test). */
+  get isVerified(): boolean {
+    return this.result.verification?.verified_badge === true;
+  }
+
+  /** Badge was earned through a credentials-backed verification run. */
+  get verifiedViaAuth(): boolean {
+    return this.result.verification?.verified_via_auth === true;
+  }
+
+  get verifiedTitle(): string {
+    const v = this.result.verification;
+    if (!v) return 'Verified';
+    const via = v.last_verified_via;
+    if (via === 'auth') return 'Verified end-to-end with working credentials (handshake + tools + invocation)';
+    if (via === 'user_test') return 'Verified by your own successful test run';
+    if (via === 'manual_review') return 'Verified by manual review';
+    return 'Verified: handshake, tools/list and tool invocation all succeeded';
   }
 
   get dedupedSources() {

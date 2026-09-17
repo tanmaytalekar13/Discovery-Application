@@ -65,6 +65,12 @@ async def search(
         )
         for ranked in result.ranked.results
     ]
+    # Verification badge enrichment (pure DB read from the McpServer
+    # registry; never blocks or fails the search response itself).
+    from app.verification.bridge import attach_verification_badges
+
+    await attach_verification_badges(rows)
+
     tools = [
         SearchToolItem(
             item_id=ranked.item.item_id,

@@ -34,6 +34,10 @@ class SearchResultItem(BaseModel):
     evidence: float
     source_priority: float = 1.0
     classification: ClassificationResult | None = None
+    # Attached by the verification bridge from the McpServer registry:
+    # the verified badge a server earned through the automated pipeline,
+    # a working auth flow, or the user's own successful test run.
+    verification: dict[str, Any] | None = None
 
 
 class SearchToolItem(BaseModel):

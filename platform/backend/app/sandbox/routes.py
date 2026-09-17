@@ -84,9 +84,32 @@ from app.sandbox.oauth import (
 # in search results at all - the test endpoints stay dumb and trust the catalog.
 from app.sandbox.schemas import GithubSourceHint, LocalPackageHint, LocalRunConfig, RemoteCandidate
 from app.sandbox.session import get_session_store, SessionStore
+from app.verification.bridge import record_user_verified_success
 
 router = APIRouter(prefix="/api/items", tags=["tool-test"])
 logger = logging.getLogger(__name__)
+
+
+async def _persist_user_verified(
+    item_id: UUID,
+    repository: ItemRepository,
+    *,
+    via_auth: bool,
+    tools: list[dict] | None = None,
+) -> None:
+    """Persist the user's REAL successful test as a verified badge.
+
+    Best-effort by contract (`record_user_verified_success` swallows its
+    own errors) - a registry hiccup must never fail the test flow.
+    """
+    try:
+        item = await repository.get(item_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("User-verified persistence could not load item %s", item_id)
+        return
+    if item is None:
+        return
+    await record_user_verified_success(item, via_auth=via_auth, tools=tools)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +245,19 @@ async def connect(
             show_token_input=info.show_token_input, show_oauth_button=info.show_oauth_button,
         )
 
+    if result.connected and result.tools:
+        # A real user-driven handshake succeeded (with the supplied
+        # token when the server demands auth): persist the badge.
+        await _persist_user_verified(
+            item_id, repository,
+            via_auth=bool(token) or result.auth_required,
+            tools=[
+                {"name": t.name, "description": t.description,
+                 "inputSchema": t.input_schema}
+                for t in result.tools
+            ],
+        )
+
     return ToolConnectResponse(
         connected=result.connected,
         auth_required=result.auth_required,
@@ -302,6 +338,13 @@ async def invoke(
             user_message=info.user_message,
             show_token_input=info.show_token_input,
             show_oauth_button=info.show_oauth_button,
+        )
+
+    if result.status == "success":
+        # A real tool call with real arguments returned a real result:
+        # the strongest user-test signal there is.
+        await _persist_user_verified(
+            item_id, repository, via_auth=bool(token)
         )
 
     return ToolInvokeResponse(
@@ -623,6 +666,18 @@ async def authorize_poll(
             "token_received": True,
             "error": result.user_message or result.error,
         }
+
+    if result.tools:
+        # OAuth re-auth completed AND the server answered a real
+        # handshake + tools/list: that is a successful auth test.
+        await _persist_user_verified(
+            item_id, repository, via_auth=True,
+            tools=[
+                {"name": t.name, "description": t.description,
+                 "inputSchema": t.input_schema}
+                for t in result.tools
+            ],
+        )
 
     return {
         "connected": True,
@@ -1020,6 +1075,14 @@ async def connect_local(
         session.status = "running"
         session.mcp_client = mcp_client
 
+        if connect_result.tools:
+            # The sandboxed stdio server actually installed, started and
+            # completed an MCP handshake + tools/list.
+            await _persist_user_verified(
+                item_id, repository, via_auth=False,
+                tools=[tool.to_dict() for tool in connect_result.tools],
+            )
+
         return LocalConnectResponse(
             connected=True,
             session_id=session.session_id,
@@ -1387,6 +1450,12 @@ async def connect_source(
 
         session.status = "running"
         session.mcp_client = mcp_client
+
+        if connect_result.tools:
+            await _persist_user_verified(
+                item_id, repository, via_auth=False,
+                tools=[tool.to_dict() for tool in connect_result.tools],
+            )
 
         return SourceConnectResponse(
             connected=True,
