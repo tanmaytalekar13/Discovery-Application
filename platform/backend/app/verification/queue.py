@@ -30,7 +30,7 @@ from app.verification.models import (
     ColdMissQueryRecord,
     ServerStatus,
 )
-from app.verification.prefilter import prefilter_server
+from app.verification.prefilter import prefilter_server, prefilter_server_with_size
 from app.verification.repository import (
     ColdMissQueryRepository,
     VerificationDecisionRepository,
@@ -142,8 +142,10 @@ async def _ingest_candidate(
         return 0
 
     # Prefilter synchronously at ingestion (Section 4): malformed /
-    # known-incompatible entries never enter the verification queue.
-    prefilter = prefilter_server(result.record)
+    # known-incompatible / oversized entries never enter the verification
+    # queue. The size check consults npm/PyPI registry metadata for local
+    # packages (the exit-137 prefilter) and fails open when unknown.
+    prefilter = await prefilter_server_with_size(result.record)
     if not prefilter.passed:
         status = (
             ServerStatus.REJECTED if prefilter.status == "rejected"

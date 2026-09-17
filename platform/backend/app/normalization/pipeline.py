@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
@@ -25,6 +26,14 @@ from app.models import (
 )
 from app.query.embeddings import LocalEmbeddingModel
 from app.reliability.engine import apply_evaluation, evaluate
+from app.sandbox.package_size import (
+    NPM_UNPACKED_SIZE_LIMIT_BYTES,
+    PYPI_DEPENDENCY_LIMIT,
+    PackageSizeEstimator,
+    describe_size,
+)
+
+logger = logging.getLogger(__name__)
 
 
 MCPResolver = Callable[
@@ -134,10 +143,66 @@ class Phase10Pipeline:
         if candidate.protocol == "a2a":
             return [await self._normalize_a2a(candidate)]
         if candidate.protocol == "mcp":
+            await self._reject_oversized_package(candidate)
             return await self._normalize_mcp(candidate)
         raise CandidateRejected(
             "unsupported protocol", [f"protocol={candidate.protocol}"]
         )
+
+    async def _reject_oversized_package(self, candidate: CandidateReference) -> None:
+        """Reject registry-package MCP candidates too heavy for the sandbox.
+
+        The sandbox container runs local (npx/uvx) servers under a hard
+        memory cap; packages whose install footprint exceeds it are killed
+        (exit 137) every single time. Gating HERE - at the catalog boundary -
+        means such servers never become Items, so they never appear in
+        search results and the user can never start a test that can only
+        fail. Fail-open: unknown size (registry error/missing metadata)
+        never rejects; the sandbox's own OOM diagnosis handles the rest.
+        """
+        raw = candidate.raw_metadata.get("source_candidate")
+        packages = tuple(getattr(raw, "packages", ()) or ())
+        package = next(
+            (
+                p for p in packages
+                if isinstance(p, dict) and p.get("identifier")
+            ),
+            None,
+        )
+        if package is None:
+            return
+        registry_type = str(
+            package.get("registry_type") or package.get("registryType") or "npm"
+        )
+        identifier = str(package.get("identifier"))
+        runtime_hint = str(
+            package.get("runtime_hint") or package.get("runtimeHint") or ""
+        )
+        if registry_type == "pypi" or "uvx" in runtime_hint:
+            size_registry = "pypi"
+        else:
+            size_registry = "npm"
+
+        estimator = PackageSizeEstimator()
+        try:
+            estimate = await estimator.estimate(size_registry, identifier)
+        except Exception as exc:  # noqa: BLE001 - estimation must never break cataloging
+            logger.debug("Package size estimation failed for %s: %s", identifier, exc)
+            return
+        finally:
+            await estimator.aclose()
+
+        if estimate.known and estimate.over_limit:
+            raise CandidateRejected(
+                "package exceeds the sandbox install-footprint limit and cannot "
+                "be run or tested here",
+                list(candidate.evidence)
+                + [
+                    f"{identifier}: {describe_size(estimate)} "
+                    f"(npm limit {NPM_UNPACKED_SIZE_LIMIT_BYTES // (1024 * 1024)}MB, "
+                    f"pypi limit {PYPI_DEPENDENCY_LIMIT} dependencies)"
+                ],
+            )
 
     async def _normalize_a2a(self, candidate: CandidateReference) -> Item:
         resolution = self._extract_a2a_resolution(candidate)

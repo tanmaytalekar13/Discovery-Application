@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from app.config import Settings
@@ -313,6 +314,162 @@ async def test_phase10_normalizes_validated_a2a_with_full_provenance_and_evidenc
     assert len(item.evidence) >= 2
     assert item.reliability.security_validation > 0
     assert repo.items
+
+
+
+
+# ---------------------------------------------------------------------------
+# Sandbox-footprint catalog gate: oversized registry packages never become
+# Items, so they never appear in search results at all.
+# ---------------------------------------------------------------------------
+
+
+def _npm_packument(size_bytes: int, version: str = "1.0.0") -> dict:
+    return {
+        "dist-tags": {"latest": version},
+        "versions": {
+            version: {
+                "version": version,
+                "dist": {"unpackedSize": size_bytes},
+            }
+        },
+    }
+
+
+def _registry_candidate(identifier: str, registry_type: str = "npm") -> CandidateReference:
+    raw = MCPRegistryCandidate(
+        server_name="io.example/heavy",
+        title="Heavy MCP",
+        description="Some Model Context Protocol server",
+        version="1.0.0",
+        repository_url="https://github.com/example/heavy-mcp",
+        packages=({"registryType": registry_type, "identifier": identifier},),
+        remotes=(),
+        raw_server={"name": "io.example/heavy", "version": "1.0.0"},
+        source=DiscoverySource(
+            type=SourceType.MCP_REGISTRY,
+            id="io.example/heavy",
+            url="https://github.com/example/heavy-mcp",
+        ),
+    )
+    return CandidateReference(
+        protocol="mcp",
+        item_type=ItemType.TOOL,
+        source_type=SourceType.MCP_REGISTRY,
+        source_provider="MCP Registry",
+        source_id="io.example/heavy",
+        url="https://github.com/example/heavy-mcp",
+        repository_url="https://github.com/example/heavy-mcp",
+        title="Heavy MCP",
+        description="Some Model Context Protocol server",
+        evidence=("returned by the official MCP Registry as version 1.0.0",),
+        raw_metadata={"source_candidate": raw},
+    )
+
+
+@pytest.mark.asyncio
+async def test_phase10_rejects_oversized_npm_package_before_catalog(monkeypatch):
+    """A package over the sandbox footprint limit must be REJECTED at the
+    catalog boundary - no Item, so it can never appear in search results."""
+    from app.sandbox.package_size import NPM_UNPACKED_SIZE_LIMIT_BYTES
+
+    oversized = NPM_UNPACKED_SIZE_LIMIT_BYTES + 1024 * 1024
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_npm_packument(oversized))
+
+    async def fake_estimate(self, registry_type, identifier):
+        from app.sandbox.package_size import PackageSizeEstimate
+
+        return PackageSizeEstimate(
+            identifier=identifier, registry="npm", bytes_estimate=oversized
+        )
+
+    monkeypatch.setattr(
+        "app.sandbox.package_size.PackageSizeEstimator.estimate", fake_estimate
+    )
+
+    repo = FakeRepository()
+    settings = Settings(
+        arcadedb_host="localhost",
+        arcadedb_database="test",
+        arcadedb_user="root",
+        arcadedb_password="root",
+        reliability_threshold=0.75,
+    )
+    result = await Phase10Pipeline(repo, settings).process(
+        [_registry_candidate("@example/huge-mcp")]
+    )
+
+    assert len(result.approved) == 0
+    assert len(result.rejected) == 1
+    assert "sandbox" in result.rejected[0].reason.lower()
+    assert any("install closure" in r for r in result.rejected[0].evidence)
+    assert repo.items == []  # never persisted -> never searchable
+
+
+@pytest.mark.asyncio
+async def test_phase10_rejects_oversized_pypi_package(monkeypatch):
+    from app.sandbox.package_size import PYPI_DEPENDENCY_LIMIT, PackageSizeEstimate
+
+    async def fake_estimate(self, registry_type, identifier):
+        return PackageSizeEstimate(
+            identifier=identifier,
+            registry="pypi",
+            dependency_count=PYPI_DEPENDENCY_LIMIT + 5,
+        )
+
+    monkeypatch.setattr(
+        "app.sandbox.package_size.PackageSizeEstimator.estimate", fake_estimate
+    )
+
+    repo = FakeRepository()
+    settings = Settings(
+        arcadedb_host="localhost",
+        arcadedb_database="test",
+        arcadedb_user="root",
+        arcadedb_password="root",
+        reliability_threshold=0.75,
+    )
+    result = await Phase10Pipeline(repo, settings).process(
+        [_registry_candidate("huge-pypi-server", registry_type="pypi")]
+    )
+
+    assert len(result.approved) == 0
+    assert len(result.rejected) == 1
+    assert repo.items == []
+
+
+@pytest.mark.asyncio
+async def test_phase10_size_gate_fails_open_on_unknown_size(monkeypatch):
+    """Registry error / missing metadata must NOT reject the candidate."""
+    from app.sandbox.package_size import PackageSizeEstimate
+
+    async def fake_estimate(self, registry_type, identifier):
+        return PackageSizeEstimate(identifier=identifier, registry="npm")
+
+    monkeypatch.setattr(
+        "app.sandbox.package_size.PackageSizeEstimator.estimate", fake_estimate
+    )
+
+    repo = FakeRepository()
+    settings = Settings(
+        arcadedb_host="localhost",
+        arcadedb_database="test",
+        arcadedb_user="root",
+        arcadedb_password="root",
+        reliability_threshold=0.75,
+    )
+    result = await Phase10Pipeline(repo, settings).process(
+        [_registry_candidate("@example/some-mcp")]
+    )
+
+    # Unknown size: candidate proceeds into the normal pipeline and is
+    # either approved or rejected for OTHER reasons - never the size gate.
+    size_rejections = [
+        r for r in result.rejected if "sandbox" in (r.reason or "").lower()
+    ]
+    assert size_rejections == []
 
 
 def test_reliability_includes_security_signal_and_explainable_reasons():

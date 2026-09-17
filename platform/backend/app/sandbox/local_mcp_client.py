@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 INITIAL_STARTUP_TIMEOUT = 120.0  # 2 minutes for npm download
 JSON_RPC_TIMEOUT = 60.0  # 1 minute for JSON-RPC calls
 
+# Delay before the single OOM-retry connect attempt: gives the kernel time to
+# reclaim memory, and the first attempt has usually warmed the uv/npm cache
+# volumes so the retry skips the download/extract phase that caused the spike.
+OOM_RETRY_DELAY_S = 2.0
+
 # ---------------------------------------------------------------------------
 # Data Classes
 # ---------------------------------------------------------------------------
@@ -84,6 +89,8 @@ class LocalMCPClient:
         self._stderr_lines: list[str] = []
         self._buffer: str = ""  # For handling partial JSON responses
         self._startup_done: bool = False
+        self._oom_retried: bool = False
+        self._last_exit_code: int | None = None
 
     async def connect(
         self,
@@ -93,6 +100,11 @@ class LocalMCPClient:
         container_id: str | None = None,
     ) -> LocalConnectResult:
         """Execute command inside container and connect to MCP server.
+
+        If the server is OOM-killed during startup (exit 137), the connect
+        is retried once after a short delay: the first attempt has usually
+        warmed the uv/npm cache volumes, so the retry skips the download/
+        extract phase that caused the memory spike.
 
         Args:
             command: Command to execute (e.g., ["npx", "-y", "package-name"])
@@ -112,10 +124,43 @@ class LocalMCPClient:
                 user_message="Container ID is required for local MCP connection.",
             )
 
+        self._oom_retried = False
+        self._last_exit_code = None
+
+        result = await self._connect_once(command, env_vars, timeout)
+        if (
+            not result.connected
+            and result.user_message == self._OOM_USER_MESSAGE
+            and not self._oom_retried
+        ):
+            self._oom_retried = True
+            logger.warning(
+                "Local MCP server was OOM-killed during startup; retrying once "
+                "with warm package cache and sequential uv extraction "
+                "(container=%s exit_code=%s)",
+                container_id, self._last_exit_code,
+            )
+            await self._cleanup()
+            await asyncio.sleep(OOM_RETRY_DELAY_S)
+            # The install/extract phase parallelizes aggressively by default,
+            # which is exactly what transiently blew the memory cap. Retry with
+            # uv concurrency pinned to 1 (sequential extract) - a little slower,
+            # but the cache is warm so most of the time cost is gone.
+            retry_env = {**env_vars, "UV_CONCURRENT_DOWNLOADS": "1", "UV_CONCURRENT_BUILDS": "1"}
+            result = await self._connect_once(command, retry_env, timeout)
+        return result
+
+    async def _connect_once(
+        self,
+        command: list[str],
+        env_vars: dict[str, str],
+        timeout: float = 60.0,
+    ) -> LocalConnectResult:
+        """Run a single connect attempt (see connect() for retry semantics)."""
         try:
             # Structured logging stages for BUG 1 diagnosis
             logger.info("Local MCP spawn stage=connect_start container=%s command=%r env_keys=%s",
-                        container_id, command, list(env_vars.keys()))
+                        self._container_id, command, list(env_vars.keys()))
 
             # Pre-install package in container to avoid 127 entrypoint error
             # The package id is inside the -c shell command (e.g., '-- @toolsdk.ai/tavily-mcp')
@@ -176,7 +221,8 @@ class LocalMCPClient:
                     connected=False,
                     # stderr can include provider-specific details; keep it in
                     # server logs and return the safe diagnosis separately.
-                    error=f"MCP server exited with code {self._process.returncode}",
+                    error=f"MCP server exited with code {self._process.returncode}"
+                          + (" (SIGKILL)" if self._process.returncode == 137 else ""),
                     user_message=user_msg,
                     auth_reason=auth_reason,
                     required_env_vars=required_env_vars,
@@ -290,6 +336,8 @@ class LocalMCPClient:
             stderr_text = self._get_stderr_text()
             logger.warning("Local MCP connection failure (container=%s command=%r exit_code=%s stderr=%r)", self._container_id, command, self._process.returncode if self._process else None, stderr_text[-4000:])
             returncode = self._process.returncode if self._process else None
+            if returncode is not None:
+                self._last_exit_code = returncode
             # Handle 127 (entrypoint/binary missing) with rebuild hint so it can recover
             if returncode == 127 or (stderr_text and ("not found" in stderr_text.lower() or "no such file" in stderr_text.lower())):
                 user_msg = "MCP server binary/entrypoint missing (exit 127). Rebuild attempted; retry connection."
@@ -459,6 +507,17 @@ class LocalMCPClient:
             )
         except Exception as exc:
             error_text = str(exc)
+            # The server can be OOM-killed mid-invocation (exit 137): surface
+            # the sandbox-memory diagnosis instead of a bare exit code.
+            if self._detect_oom_kill(
+                self._process.returncode if self._process else None,
+                self._get_stderr_text(),
+            ):
+                return LocalInvokeResult(
+                    status="error",
+                    error=error_text,
+                    user_message=self._OOM_USER_MESSAGE,
+                )
             requires_auth = self._looks_like_auth_error(error_text)
             return LocalInvokeResult(
                 status="error",
@@ -635,6 +694,8 @@ class LocalMCPClient:
                     # EOF reached: fail outstanding RPCs immediately with the
                     # exit code instead of waiting for the initialize timeout.
                     code = self._process.returncode if self._process else None
+                    if code is not None:
+                        self._last_exit_code = code
                     error = RuntimeError(f"MCP server exited with code {code}" if code is not None else "MCP server closed stdout")
                     for future in self._pending.values():
                         if not future.done():
@@ -723,12 +784,105 @@ class LocalMCPClient:
         logger.info("Local MCP readiness stage=timeout_alive buffer_empty")
         return True
 
+    # -----------------------------------------------------------------------
+    # OOM (exit 137) diagnosis
+    #
+    # The sandbox container runs with a hard memory cap. Heavyweight Python
+    # servers installed via `uvx` can transiently exceed it while uv is
+    # extracting dozens of wheels and the server imports its dependencies;
+    # the kernel OOM killer then SIGKILLs the process, which surfaces as
+    # exit code 137 (128 + 9) with an empty traceback. Without this check
+    # the user just sees the opaque "MCP server exited with code 137".
+    # -----------------------------------------------------------------------
+
+    _OOM_USER_MESSAGE = (
+        "The MCP server was killed while starting up because it exceeded the "
+        "sandbox container's memory limit (exit code 137 / SIGKILL). This is "
+        "usually transient — try again now that dependencies are cached. If it "
+        "keeps happening, the server needs more memory than the sandbox allows."
+    )
+
+    def _detect_oom_kill(self, returncode: int | None, stderr: str) -> bool:
+        """Best-effort detection that the sandbox OOM killer killed the server.
+
+        Exit code 137 alone only proves SIGKILL, so corroborate the OOM
+        origin via (1) OOM markers in the server's stderr, (2) Docker's
+        ``.State.OOMKilled`` flag, or (3) the container's cgroup OOM
+        counters — which also catch SIGKILLed ``docker exec`` children
+        that ``.State.OOMKilled`` misses. In this memory-capped sandbox a
+        bare 137 is still overwhelmingly the OOM killer (nothing else
+        SIGKILLs the server), so without evidence it is classified as OOM
+        too; the message stays accurate because it says "usually".
+
+        ``returncode`` may be ``None`` when the stdout EOF is processed
+        before the kernel reaps the process; in that case only the strong
+        Docker/cgroup evidence may classify the kill as an OOM.
+        """
+        if returncode is not None and returncode != 137:
+            return False
+        stderr_lower = (stderr or "").lower()
+        if returncode == 137 and any(marker in stderr_lower for marker in (
+            "out of memory", "oom", "memory limit", "killed",
+        )):
+            return True
+
+        if self._container_id:
+            try:
+                import subprocess
+
+                # 1) Docker's own OOM flag (container init process was OOM killed).
+                result = subprocess.run(
+                    ["docker", "inspect", "-f", "{{.State.OOMKilled}}", self._container_id],
+                    capture_output=True, text=True, timeout=4,
+                )
+                if result.returncode == 0 and result.stdout.strip().lower().startswith("true"):
+                    logger.info("Local MCP OOM confirmed via docker inspect (container=%s)", self._container_id)
+                    return True
+
+                # 2) cgroup OOM counters inside the still-running sandbox container.
+                #    cgroup v2: /sys/fs/cgroup/memory.events -> "oom_kill <n>"
+                #    cgroup v1: /sys/fs/cgroup/memory/memory.failcnt -> limit-hit count
+                result = subprocess.run(
+                    ["docker", "exec", self._container_id, "sh", "-c",
+                     "cat /sys/fs/cgroup/memory.events 2>/dev/null; "
+                     "cat /sys/fs/cgroup/memory/memory.failcnt 2>/dev/null"],
+                    capture_output=True, text=True, timeout=4,
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.lower().splitlines():
+                        parts = line.split()
+                        if len(parts) == 2 and parts[0] in ("oom_kill", "failcnt") \
+                                and parts[1].isdigit() and int(parts[1]) > 0:
+                            logger.info(
+                                "Local MCP OOM confirmed via cgroup counters (container=%s %s=%s)",
+                                self._container_id, parts[0], parts[1],
+                            )
+                            return True
+            except Exception as exc:  # noqa: BLE001 - diagnosis must never mask the real error
+                logger.debug("OOM diagnosis failed (non-fatal): %s", exc)
+
+        if returncode == 137:
+            logger.info(
+                "Local MCP exit 137 without corroborating evidence; "
+                "classifying as sandbox OOM (container=%s)", self._container_id,
+            )
+            return True
+        return False
+
     def _analyze_error(
         self, stderr: str, returncode: int | None
     ) -> tuple[str | None, str | None, list[str]]:
         """Analyze stderr text to generate a user-friendly error message."""
         stderr_lower = stderr.lower()
         required_env_vars = self._extract_required_env_vars(stderr)
+
+        # Exit 137 = 128 + SIGKILL(9): inside the memory-capped sandbox this
+        # is almost always the kernel OOM killer (heavy uvx/pip installs or
+        # server import spiking past the container limit), not a server bug.
+        # Diagnose it before the generic patterns so the user sees an
+        # actionable message instead of a bare exit code.
+        if self._detect_oom_kill(returncode, stderr):
+            return (self._OOM_USER_MESSAGE, None, [])
 
         # Packages frequently validate their API key on startup and exit 1.
         # Treat those as an actionable credentials request, not a generic crash.
@@ -825,3 +979,4 @@ class LocalMCPClient:
 
         self._pending.clear()
         self._buffer = ""
+        self._stderr_lines.clear()

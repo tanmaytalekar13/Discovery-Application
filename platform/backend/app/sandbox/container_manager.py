@@ -51,14 +51,29 @@ SESSION_TIMEOUT_SECONDS = 10 * 60  # 10 minutes
 CLEANUP_INTERVAL_SECONDS = 60
 
 # Container resource limits (configurable via environment variables for faster local execution)
+# Memory: 768MB with swap disabled OOM-killed heavyweight Python servers during
+# startup (uvx extracting dozens of wheels + server import can transiently exceed
+# 768MB) — the process was SIGKILLed with exit code 137 mid-handshake. 1536MB
+# covers realistic server startup; heavy servers can be raised via SANDBOX_MEMORY_LIMIT_MB.
 CONTAINER_CPU_LIMIT = float(os.getenv("SANDBOX_CPU_LIMIT", "1.5"))  # 1.5 CPU cores
-CONTAINER_MEMORY_LIMIT = int(os.getenv("SANDBOX_MEMORY_LIMIT_MB", "768")) * 1024 * 1024  # 768 MB
+CONTAINER_MEMORY_LIMIT = int(os.getenv("SANDBOX_MEMORY_LIMIT_MB", "1536")) * 1024 * 1024  # 1536 MB
+# Small swap headroom above the hard limit so transient allocation spikes are
+# reclaimed instead of instantly SIGKILLed, while total memory+swap stays bounded.
+CONTAINER_SWAP_HEADROOM = int(os.getenv("SANDBOX_SWAP_HEADROOM_MB", "256")) * 1024 * 1024
+CONTAINER_MEMSWAP_LIMIT = CONTAINER_MEMORY_LIMIT + CONTAINER_SWAP_HEADROOM
 CONTAINER_DISK_LIMIT = int(os.getenv("SANDBOX_DISK_LIMIT_MB", "256")) * 1024 * 1024  # 256 MB
 
 # Shared package cache volumes to avoid re-downloading dependencies on every test
 SANDBOX_ENABLE_CACHE_VOLUMES = os.getenv("SANDBOX_ENABLE_CACHE_VOLUMES", "true").lower() in ("true", "1", "yes")
 NPM_CACHE_VOLUME = os.getenv("SANDBOX_NPM_CACHE_VOLUME", "mcp_npm_cache")
 PIP_CACHE_VOLUME = os.getenv("SANDBOX_PIP_CACHE_VOLUME", "mcp_pip_cache")
+UV_CACHE_VOLUME = os.getenv("SANDBOX_UV_CACHE_VOLUME", "mcp_uv_cache")
+
+# Labels stamped on every sandbox container so this process can recognize its
+# own containers after a restart and destroy the ones whose session record died
+# with the old process (otherwise they linger holding their memory reservation
+# until the host is rebooted).
+SANDBOX_LABELS = {"agentic.sandbox": "mcp-test"}
 
 # Default images per registry type
 DEFAULT_IMAGES = {
@@ -217,9 +232,19 @@ class LocalToolConfig:
                 # The official registry commonly declares uvx for Python
                 # servers.  Running it as pipx changes dependency resolution
                 # and previously failed with command-not-found in slim images.
+                #
+                # Memory safety: uv extracts downloaded wheels in parallel by
+                # default, which transiently spikes past the container cap and
+                # gets the process SIGKILLed (exit 137) mid-install. Cap the
+                # concurrency via ${VAR:-default} so the OOM retry path in
+                # LocalMCPClient.connect can pin it to 1 (sequential) by
+                # exporting the same variable through docker exec -e.
                 full_cmd = (
-                    "(command -v uvx >/dev/null 2>&1 || python -m pip install "
-                    "--quiet --no-warn-script-location --prefer-binary uv) && "
+                    "(command -v uvx >/dev/null 2>&1 || UV_CONCURRENT_DOWNLOADS=2 "
+                    "python -m pip install --quiet --no-warn-script-location "
+                    "--prefer-binary uv) && "
+                    'UV_CONCURRENT_DOWNLOADS="${UV_CONCURRENT_DOWNLOADS:-2}" '
+                    'UV_CONCURRENT_BUILDS="${UV_CONCURRENT_BUILDS:-1}" '
                     f"uvx {shlex.quote(self.identifier)}"
                 )
             else:
@@ -598,10 +623,11 @@ class ContainerManager:
             "detach": True,
             "nano_cpus": int(CONTAINER_CPU_LIMIT * 1e9),
             "mem_limit": CONTAINER_MEMORY_LIMIT,
-            "memswap_limit": CONTAINER_MEMORY_LIMIT,
+            "memswap_limit": CONTAINER_MEMSWAP_LIMIT,
             "cap_drop": ["MKNOD", "SETFCAP", "SETPCAP", "NET_RAW", "SYS_CHROOT", "KILL"],
             "security_opt": ["no-new-privileges"],
             "auto_remove": False,
+            "labels": SANDBOX_LABELS,
         }
 
         if bind_workdir:
@@ -815,6 +841,9 @@ class ContainerManager:
                 volumes[NPM_CACHE_VOLUME] = {"bind": "/root/.npm", "mode": "rw"}
             elif registry_type == "pip":
                 volumes[PIP_CACHE_VOLUME] = {"bind": "/root/.cache/pip", "mode": "rw"}
+                # uv (used by `uvx ...` runtime hints) caches in its own directory;
+                # mount it too so retries skip the download/extract phase entirely.
+                volumes[UV_CACHE_VOLUME] = {"bind": "/root/.cache/uv", "mode": "rw"}
 
         # Container configuration
         # Start with a simple long-running command (sleep infinity) to keep container alive
@@ -827,12 +856,15 @@ class ContainerManager:
             # Resource limits
             "nano_cpus": int(CONTAINER_CPU_LIMIT * 1e9),
             "mem_limit": CONTAINER_MEMORY_LIMIT,
-            "memswap_limit": CONTAINER_MEMORY_LIMIT,  # Disable swap
+            "memswap_limit": CONTAINER_MEMSWAP_LIMIT,  # Hard limit + small swap headroom
             # Drop capabilities (but not all - some needed for network)
             "cap_drop": ["MKNOD", "SETFCAP", "SETPCAP", "NET_RAW", "SYS_CHROOT", "KILL"],
             "security_opt": ["no-new-privileges"],
             # Don't auto-remove - we want to inspect logs if needed
             "auto_remove": False,
+            # Lets cleanup reconcile/remove containers whose session record was
+            # lost to a process restart.
+            "labels": SANDBOX_LABELS,
         }
 
         if volumes:
@@ -880,8 +912,54 @@ class ContainerManager:
             )
             self._cleanup_thread.start()
 
+    def _reconcile_orphaned_containers(self) -> int:
+        """Force-remove labeled sandbox containers this process no longer tracks.
+
+        A backend restart wipes the in-process session dict, but its containers
+        keep running (`sleep infinity`) - silently holding their full memory
+        reservation and starving every later test until the host runs out.
+        Runs once when the cleanup thread starts. Assumes a single backend
+        process (docker-compose deployment); multi-process deployments would
+        need a shared session registry instead of this heuristic.
+        """
+        client = self.docker
+        try:
+            containers = client.containers.list(
+                filters={"label": f"{next(iter(SANDBOX_LABELS))}={SANDBOX_LABELS[next(iter(SANDBOX_LABELS))]}", "status": "running"},
+                all=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - docker hiccup must not break the thread
+            logger.debug("Sandbox reconciliation skipped (docker list failed): %s", exc)
+            return 0
+
+        with self._lock:
+            tracked_ids = {s.container_id for s in self._sessions.values() if s.container_id}
+
+        removed = 0
+        for container in containers:
+            if container.id in tracked_ids:
+                continue
+            try:
+                logger.warning(
+                    "Removing orphaned sandbox container %s (no live session in this process)",
+                    getattr(container, "name", None) or container.id,
+                )
+                container.remove(force=True)
+                removed += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Orphan removal failed for %s: %s", container.id, exc)
+        if removed:
+            logger.info("Sandbox reconciliation removed %d orphaned container(s)", removed)
+        return removed
+
     def _cleanup_loop(self) -> None:
         """Background loop to clean up expired sessions."""
+        # Reconcile FIRST: kill leftovers from a previous process before the
+        # periodic expiry sweep, so they stop holding memory immediately.
+        try:
+            self._reconcile_orphaned_containers()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Sandbox reconciliation failed: %s", exc)
         while not self._stop_cleanup.wait(CLEANUP_INTERVAL_SECONDS):
             try:
                 loop = asyncio.new_event_loop()

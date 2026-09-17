@@ -15,6 +15,13 @@ from urllib.parse import urlparse
 
 
 from app.verification.models import McpServerRecord, Transport
+from app.sandbox.package_size import (
+    NPM_UNPACKED_SIZE_LIMIT_BYTES,
+    PYPI_DEPENDENCY_LIMIT,
+    PackageSizeEstimate,
+    PackageSizeEstimator,
+    describe_size,
+)
 
 # ---------------------------------------------------------------------------
 # Section 7.4: known-incompatible third-party hosting platforms.
@@ -113,6 +120,90 @@ class PrefilterResult:
 
 _INSTALL_HINT = re.compile(r"\b(npx|uvx|pipx|pip install|npm install|docker run)\b")
 
+# ---------------------------------------------------------------------------
+# Sandbox-size prefilter (exit 137 prevention at the source)
+#
+# Heavyweight packages (dozens of transitive dependencies) transiently
+# exceed the sandbox memory cap during install and get OOM-killed. Rather
+# than letting every such package die inside a container at verification
+# time, estimate the install footprint from registry metadata while the
+# record is still being ingested and mark it `malformed` - it never enters
+# the verification queue and never shows up as a testable server.
+# ---------------------------------------------------------------------------
+
+
+def local_package_from_install_cmd(install_cmd: str | None) -> tuple[str, str] | None:
+    """(registry_type, identifier) from a documented local install command.
+
+    Mirrors the runtime parsing in verifiers._local_tool_config but only
+    for the two package registries this size check applies to (npm, pypi).
+    Returns None for anything else (remote, github-source, docker, node/python
+    scripts) - those have no registry metadata to measure cheaply.
+    """
+    cmd = (install_cmd or "").strip()
+    if not cmd:
+        return None
+    tokens = cmd.split()
+    if not tokens:
+        return None
+    head = tokens[0].lower()
+    rest = [
+        t for t in tokens[1:]
+        if t not in ("-y", "--yes", "run") and not t.startswith("--")
+    ]
+    if not rest:
+        return None
+    if head == "npx":
+        return "npm", rest[0]
+    if head in ("uvx", "pipx"):
+        return "pypi", rest[0]
+    return None
+
+
+def _size_prefilter_failure(estimate: PackageSizeEstimate) -> list[str]:
+    return [
+        f"package_too_large: {describe_size(estimate)} exceeds the sandbox "
+        f"install limit (npm {NPM_UNPACKED_SIZE_LIMIT_BYTES // (1024 * 1024)}MB "
+        f"/ pypi {PYPI_DEPENDENCY_LIMIT} deps)"
+    ]
+
+
+async def prefilter_server_with_size(
+    record: McpServerRecord,
+    *,
+    estimator: PackageSizeEstimator | None = None,
+    dns_resolver=None,
+) -> PrefilterResult:
+    """Prefilter plus a registry-metadata size check for LOCAL records.
+
+    Fail-open: when the size is unknown (registry error, missing metadata)
+    the record passes this stage and the normal verification path decides.
+    """
+    result = prefilter_server(record, dns_resolver=dns_resolver)
+    if not result.passed or record.transport is not Transport.LOCAL:
+        return result
+
+    package = local_package_from_install_cmd(record.install_cmd)
+    if package is None:
+        return result
+
+    registry_type, identifier = package
+    owns_estimator = estimator is None
+    estimator = estimator or PackageSizeEstimator()
+    try:
+        estimate = await estimator.estimate(registry_type, identifier)
+    finally:
+        if owns_estimator:
+            await estimator.aclose()
+
+    if estimate.known and estimate.over_limit:
+        return PrefilterResult(
+            passed=False,
+            status="malformed",
+            failures=_size_prefilter_failure(estimate),
+        )
+    return result
+
 
 def prefilter_server(
     record: McpServerRecord,
@@ -202,7 +293,9 @@ async def resolve_dns(host: str) -> bool:
 __all__ = [
     "PrefilterResult",
     "prefilter_server",
+    "prefilter_server_with_size",
     "prefilter_from_candidate",
+    "local_package_from_install_cmd",
     "is_smithery_hosted",
     "is_known_incompatible_host",
     "known_incompatible_reason",

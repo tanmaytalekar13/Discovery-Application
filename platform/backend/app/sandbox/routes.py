@@ -79,6 +79,9 @@ from app.sandbox.oauth import (
     register_dynamic_client,
     resolve_authorization_server,
 )
+# NOTE: package-size gating moved to the catalog layer (Phase 10 pipeline).
+# Oversized packages are rejected at ingestion, so oversized items never exist
+# in search results at all - the test endpoints stay dumb and trust the catalog.
 from app.sandbox.schemas import GithubSourceHint, LocalPackageHint, LocalRunConfig, RemoteCandidate
 from app.sandbox.session import get_session_store, SessionStore
 

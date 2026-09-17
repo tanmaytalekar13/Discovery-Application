@@ -1,4 +1,5 @@
 
+import asyncio
 import logging
 
 from fastapi import FastAPI
@@ -63,6 +64,28 @@ async def start_verification_workers() -> None:
         )
         return
     _verification_tasks = start_background_loops(handles)
+
+
+@app.on_event("startup")
+async def reconcile_orphaned_sandbox_containers() -> None:
+    """Remove sandbox containers left behind by a previous backend process.
+
+    A restart wipes the in-process session dict, but the old containers keep
+    running `sleep infinity` - each one holding its full memory reservation,
+    which later OOM-kills every fresh test. Must run before the first session
+    is created (the session-triggered cleanup thread is too late).
+    """
+    from app.sandbox.container_manager import get_container_manager
+
+    manager = get_container_manager()
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, manager._reconcile_orphaned_containers
+        )
+    except Exception:  # noqa: BLE001 - docker hiccup must never block startup
+        logging.getLogger(__name__).warning(
+            "Sandbox orphan reconciliation could not run at startup", exc_info=True
+        )
 
 
 @app.on_event("shutdown")
