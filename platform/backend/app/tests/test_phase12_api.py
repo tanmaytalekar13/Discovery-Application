@@ -195,29 +195,16 @@ def test_item_detail_artifacts_schema_and_provenance_contracts():
     assert provenance.json()["evidence"][0]["kind"] == "protocol_validation"
 
 
-def test_execution_routes_are_contract_placeholders_until_sandbox_phases():
+def test_removed_placeholder_execution_routes_return_404():
+    """The dead 501 stubs were removed: real testing lives in the sandbox
+    routes (/test/connect, /test/invoke, /test/local/*, /test/source/*)."""
     tool = item()
     agent = item(item_type=ItemType.AGENT)
     repository = FakeItemRepository([tool, agent])
     client = client_with_overrides({get_item_repository: lambda: repository})
 
-    tool_response = client.post(
-        f"/api/items/{tool.item_id}/test", json={"city": "Pune"}
-    )
-    agent_response = client.post(
-        f"/api/items/{agent.item_id}/agent-test", json={"task": "forecast"}
-    )
-
-    assert tool_response.status_code == 501
-    assert (
-        tool_response.json()["detail"]
-        == "MCP sandbox execution is implemented in Phase 15."
-    )
-    assert agent_response.status_code == 501
-    assert (
-        agent_response.json()["detail"]
-        == "A2A sandbox execution is implemented in Phase 16."
-    )
+    assert client.post(f"/api/items/{tool.item_id}/test").status_code == 404
+    assert client.post(f"/api/items/{agent.item_id}/agent-test").status_code == 404
 
 
 def test_test_run_and_sse_log_contracts():

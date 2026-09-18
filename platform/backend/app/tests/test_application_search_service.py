@@ -20,7 +20,7 @@ from app.normalization.pipeline import Phase10Result
 from app.query.planner import QueryPlan
 from app.query.ranking import RankedItem
 from app.query.service import Phase11SearchResult
-from app.search.application import ApplicationSearchService
+from app.search.application import ApplicationSearchService, _merge_items
 from app.search.orchestrator import SearchOrchestratorResult
 
 
@@ -65,7 +65,7 @@ def settings(mode: str) -> Settings:
     )
 
 
-def item(name: str, *, verified: bool = True) -> Item:
+def item(name: str, *, verified: bool = True, repo: str | None = None) -> Item:
     now = datetime.now(timezone.utc)
     source = DiscoverySource(
         type=SourceType.MCP_REGISTRY,
@@ -73,6 +73,16 @@ def item(name: str, *, verified: bool = True) -> Item:
         url=f"https://example.com/{name}",
         provider="test",
     )
+    provenance = [source]
+    if repo:
+        provenance.append(
+            DiscoverySource(
+                type=SourceType.GITHUB,
+                id=repo,
+                url=f"https://github.com/{repo}",
+                provider="GitHub",
+            )
+        )
     return Item(
         item_id=uuid4(),
         canonical_id=name,
@@ -80,7 +90,7 @@ def item(name: str, *, verified: bool = True) -> Item:
         name=name,
         description=f"{name} weather forecast data",
         source=source,
-        provenance=[source],
+        provenance=provenance,
         evidence=[
             DiscoveryEvidence(
                 evidence_id=uuid4(),
@@ -174,8 +184,9 @@ class FakePhase11:
 
 
 class FakeOrchestrator:
-    def __init__(self):
+    def __init__(self, approved_items=()):
         self.calls = []
+        self._approved = list(approved_items)
         self.discovery = SearchOrchestratorResult(
             candidates=(candidate(),),
             sources_attempted=("mcp:mcp_registry",),
@@ -190,8 +201,17 @@ class FakeOrchestrator:
         phase10_pipeline,
         item_type="all",
         max_results=20,
+        min_results=1,
     ):
-        self.calls.append((query, phase10_pipeline, item_type, max_results))
+        self.calls.append(
+            {
+                "query": query,
+                "phase10_pipeline": phase10_pipeline,
+                "item_type": item_type,
+                "max_results": max_results,
+                "min_results": min_results,
+            }
+        )
         return self.discovery, phase10_pipeline.result
 
 
@@ -223,57 +243,18 @@ async def test_cached_mode_only_uses_phase11_cached_search():
 
 
 @pytest.mark.asyncio
-async def test_live_mode_runs_discovery_catalog_then_ranks_approved_items():
-    live_item = item("live_weather")
-    phase11 = FakePhase11()
-    orchestrator = FakeOrchestrator()
-    phase10 = FakePhase10([live_item])
-    service = ApplicationSearchService(
-        settings=settings("live"),
-        phase11=phase11,
-        orchestrator=orchestrator,
-        phase10_pipeline=phase10,
-    )
+async def test_db_shortlist_full_stops_external_discovery_early():
+    """Early stop: >= cap servable DB hits -> external discovery never starts.
 
-    result = await service.search("weather", item_type="tool", limit=3)
-
-    assert orchestrator.calls == [("weather", phase10, "tool", 3)]
-    assert phase11.search_calls == []
-    assert phase11.rank_calls[0][1] == [live_item]
-    assert result.metadata.mode == "live"
-    assert result.metadata.live_candidates == 1
-    assert result.metadata.approved_count == 1
-    assert result.metadata.db_fallback is False
-    assert result.ranked.results[0].item is live_item
-
-
-class FailingOrchestrator:
-    """Discovery source that cannot be reached at all (external outage)."""
-
-    def __init__(self):
-        self.calls = []
-
-    async def discover_and_catalog(
-        self,
-        query,
-        *,
-        phase10_pipeline,
-        item_type="all",
-        max_results=20,
-    ):
-        self.calls.append(query)
-        raise ConnectionError("official MCP registry unreachable")
-
-
-@pytest.mark.asyncio
-async def test_live_mode_discovery_failure_serves_db_catalog_fallback():
-    """DB is the source of truth: an external discovery outage must degrade to
-    the stored official + verified servers, never to an empty response."""
-    cached_items = [item(f"db_weather_{i}") for i in range(3)]
+    The cap is the app's own `search_verified_result_cap` (default 3):
+    1 official + 2-3 verified servers must answer a query from the DB
+    without touching the registry or GitHub.
+    """
+    cached_items = [item(f"db_weather_{i}") for i in range(4)]
     phase11 = FakePhase11(cached_items)
-    orchestrator = FailingOrchestrator()
+    orchestrator = FakeOrchestrator()
     service = ApplicationSearchService(
-        settings=settings("live"),
+        settings=settings("mixed"),
         phase11=phase11,
         orchestrator=orchestrator,
         phase10_pipeline=FakePhase10([]),
@@ -281,112 +262,84 @@ async def test_live_mode_discovery_failure_serves_db_catalog_fallback():
 
     result = await service.search("weather", item_type="tool", limit=10)
 
-    assert orchestrator.calls == ["weather"]
+    assert orchestrator.calls == []  # external discovery never started
+    assert result.metadata.mode == "merged"
+    assert result.metadata.sources_attempted == ("arcadedb",)
+    assert result.metadata.sources_succeeded == ("arcadedb",)
     assert [ranked.item.name for ranked in result.ranked.results] == [
-        f"db_weather_{i}" for i in range(3)
+        f"db_weather_{i}" for i in range(4)
     ]
-    assert result.metadata.mode == "live"
+    assert result.metadata.cached_results == 4
+
+
+@pytest.mark.asyncio
+async def test_db_shortfall_runs_discovery_with_min_results():
+    """DB short of the cap -> discovery runs with the shortfall as min_results."""
+    cached_items = [item("db_weather_only")]
+    live_items = [item("live_weather_1"), item("live_weather_2")]
+    phase11 = FakePhase11(cached_items)
+    orchestrator = FakeOrchestrator(approved_items=live_items)
+    phase10 = FakePhase10(live_items)
+    service = ApplicationSearchService(
+        settings=settings("mixed"),
+        phase11=phase11,
+        orchestrator=orchestrator,
+        phase10_pipeline=phase10,
+    )
+
+    result = await service.search("weather", item_type="tool", limit=10)
+
+    # cap (7) - 1 DB hit = 6 shortfall. Cap is applied via `limit`, so the
+    # discovery request itself carries min(10, 7) - 1 = 6.
+    assert len(orchestrator.calls) == 1
+    assert orchestrator.calls[0]["min_results"] == 6
+    assert result.metadata.mode == "merged"
+    names = [ranked.item.name for ranked in result.ranked.results]
+    assert "db_weather_only" in names
+    assert "live_weather_1" in names
+    assert "live_weather_2" in names
+    assert result.metadata.approved_count == 2
+    assert result.metadata.cached_results == 1
+
+
+@pytest.mark.asyncio
+async def test_discovery_failure_serves_db_catalog_fallback():
+    """DB is the source of truth: an external discovery outage must degrade to
+    the stored official + verified servers, never to an empty response."""
+    cached_items = [item(f"db_weather_{i}") for i in range(2)]
+    phase11 = FakePhase11(cached_items)
+
+    class FailingOrchestrator:
+        async def discover_and_catalog(self, query, **kwargs):
+            raise ConnectionError("official MCP registry unreachable")
+
+    service = ApplicationSearchService(
+        settings=settings("mixed"),
+        phase11=phase11,
+        orchestrator=FailingOrchestrator(),
+        phase10_pipeline=FakePhase10([]),
+    )
+
+    result = await service.search("weather", item_type="tool", limit=10)
+
+    assert [ranked.item.name for ranked in result.ranked.results] == [
+        f"db_weather_{i}" for i in range(2)
+    ]
+    assert result.metadata.mode == "merged"
     assert result.metadata.db_fallback is True
-    assert result.metadata.cached_results == 3
+    assert result.metadata.cached_results == 2
     assert result.metadata.sources_attempted[0] == "arcadedb"
     assert "arcadedb" in result.metadata.sources_succeeded
 
 
 @pytest.mark.asyncio
-async def test_live_mode_empty_discovery_serves_db_catalog_fallback():
-    """Discovery succeeding with zero approved results still falls back to the
-    durable catalog instead of serving an empty page."""
-    phase11 = FakePhase11([item("db_weather_only")])
-    orchestrator = FakeOrchestrator()
-    orchestrator.discovery = SearchOrchestratorResult(
-        candidates=(),
-        sources_attempted=("mcp:mcp_registry",),
-        sources_succeeded=("mcp:mcp_registry",),
-        sources_failed=(),
-    )
-    service = ApplicationSearchService(
-        settings=settings("live"),
-        phase11=phase11,
-        orchestrator=orchestrator,
-        phase10_pipeline=FakePhase10([]),
-    )
-
-    result = await service.search("weather", item_type="tool", limit=10)
-
-    assert [ranked.item.name for ranked in result.ranked.results] == [
-        "db_weather_only"
-    ]
-    assert result.metadata.db_fallback is True
-    assert result.metadata.live_candidates == 0
-    assert result.metadata.approved_count == 0
-
-
-@pytest.mark.asyncio
-async def test_mixed_mode_warm_hit_still_runs_live_discovery_and_merges():
-    """Spec v2 Section 4.2 (Warm Search): a catalog hit answers instantly from
-    ArcadeDB but live discovery still runs and merges with the cached shortlist.
-    """
-    cached_items = [item(f"cached_weather_{i}") for i in range(5)]
-    live_item = item("live_weather")
-    phase11 = FakePhase11(cached_items)
-    orchestrator = FakeOrchestrator()
-    phase10 = FakePhase10([live_item])
-    service = ApplicationSearchService(
-        settings=settings("mixed"),
-        phase11=phase11,
-        orchestrator=orchestrator,
-        phase10_pipeline=phase10,
-    )
-
-    result = await service.search("weather", item_type="tool", limit=10)
-
-    # Live discovery ran even though the catalog had verified hits.
-    assert orchestrator.calls != []
-    assert result.metadata.mode == "merged"
-    assert result.metadata.sources_attempted == ("arcadedb", "mcp:mcp_registry")
-    assert result.metadata.sources_succeeded == ("arcadedb", "mcp:mcp_registry")
-    assert result.metadata.live_candidates == 1
-    assert result.metadata.approved_count == 1
-    # Merged shortlist: the live item plus the cached entries, capped.
-    names = [ranked.item.name for ranked in result.ranked.results]
-    assert "live_weather" in names
-    assert any(name.startswith("cached_weather_") for name in names)
-    assert len(result.ranked.results) == 6
-    assert result.metadata.cached_results == 5
-
-
-@pytest.mark.asyncio
-async def test_mixed_mode_catalog_hit_with_no_live_approval_serves_catalog_shortlist():
-    """When live discovery approves nothing, the verified catalog entries serve."""
-    cached_items = [item(f"cached_weather_{i}") for i in range(5)]
-    phase11 = FakePhase11(cached_items)
-    orchestrator = FakeOrchestrator()
-    phase10 = FakePhase10([])
-    service = ApplicationSearchService(
-        settings=settings("mixed"),
-        phase11=phase11,
-        orchestrator=orchestrator,
-        phase10_pipeline=phase10,
-    )
-
-    result = await service.search("weather", item_type="tool", limit=10)
-
-    assert orchestrator.calls != []
-    assert result.metadata.mode == "merged"
-    assert result.metadata.cached_results == 5
-    assert result.metadata.approved_count == 0
-    assert [ranked.item.name for ranked in result.ranked.results][:5] == [
-        f"cached_weather_{i}" for i in range(5)
-    ]
-
-
-@pytest.mark.asyncio
-async def test_mixed_mode_cold_miss_runs_live_discovery_and_caps_results(monkeypatch):
-    """No verified catalog hit -> live cascade runs, results stay capped."""
+async def test_cold_miss_with_no_db_hits_still_runs_discovery_and_caps(monkeypatch):
+    """No servable DB hit -> discovery runs; results stay capped."""
     _gate_verifies_nothing(monkeypatch)
     phase11 = FakePhase11([item("stale_weather", verified=False)])
-    orchestrator = FakeOrchestrator()
-    phase10 = FakePhase10([item("live_weather", verified=False)])
+    live_items = [item("live_weather", verified=False)]
+    orchestrator = FakeOrchestrator(approved_items=live_items)
+    phase10 = FakePhase10(live_items)
     service = ApplicationSearchService(
         settings=settings("mixed"),
         phase11=phase11,
@@ -396,22 +349,20 @@ async def test_mixed_mode_cold_miss_runs_live_discovery_and_caps_results(monkeyp
 
     result = await service.search("weather", item_type="tool", limit=10)
 
-    assert orchestrator.calls == [("weather", phase10, "tool", 10)]
+    assert orchestrator.calls[0]["min_results"] == 7  # full cap shortfall
     assert result.metadata.mode == "merged"
     assert result.metadata.live_candidates == 1
     assert result.metadata.approved_count == 1
     # The unverified cached row is gated OUT of the shortlist entirely.
-    assert phase11.rank_calls[0][1] == [phase10.result.approved[0]]
-    assert [ranked.item for ranked in result.ranked.results] == [
-        phase10.result.approved[0]
-    ]
+    assert [ranked.item for ranked in result.ranked.results] == live_items
     assert result.metadata.cached_results == 0
 
 
 @pytest.mark.asyncio
-async def test_mixed_mode_cold_miss_serves_official_catalog_fallback_when_live_approves_nothing(monkeypatch):
-    """Stale-but-available: with no live approval the verified/official
-    catalog shortlist serves - and the cap applies to it."""
+async def test_sufficient_official_catalog_stops_external_discovery(monkeypatch):
+    """Early stop covers official rows too: enough seeded official servers
+    answer the query from the durable catalog without touching discovery,
+    capped at the cold-miss cap."""
     _gate_verifies_nothing(monkeypatch)  # nothing badge-verified in cache
     cached_items = [item(f"official_weather_{i}") for i in range(9)]
     # Mark every fixture as a seeded official connector.
@@ -429,46 +380,77 @@ async def test_mixed_mode_cold_miss_serves_official_catalog_fallback_when_live_a
 
     result = await service.search("weather", item_type="tool", limit=20)
 
-    assert orchestrator.calls != []
+    assert orchestrator.calls == []  # external discovery never started
     assert result.metadata.mode == "merged"
     assert result.metadata.approved_count == 0
-    # Fallback capped at the cold-miss cap (7), not the requested 20.
+    assert result.metadata.db_fallback is False
+    # Shortlist capped at the cold-miss cap (7), not the requested 20.
     assert len(result.ranked.results) == 7
     assert result.metadata.cached_results == 7
 
 
 @pytest.mark.asyncio
-async def test_merged_mode_counts_every_cached_row_under_colliding_canonical_keys():
-    """Regression: 'cached' must count catalog rows, not distinct canonical_id values.
-
-    Phase 10 stores one row per (server, tool) with the sha256 canonical id
-    derived from different payloads, so multiple cached rows for the same
-    server can carry DIFFERENT canonical_id values while `_merge_items`
-    deduped them under one uuid5 key. Counting membership of the merged
-    shortlist's keys against `live_ids` therefore underreported: 4 cached
-    Tavily rows showed as `1 cached` next to `4 approved` live candidates.
-    """
-    # Same shape the live DB had: four verified registry items, all with
-    # distinct canonical ids.
-    cached_items = [item(f"cached_tavily_{i}") for i in range(4)]
-    # Live discovery re-found the same server: its approved copy shares the
-    # canonical identity the merge collapses onto, so 4 cached -> 1 merged.
-    live_copy = cached_items[0].model_copy(deep=True)
+async def test_official_fallback_marks_db_fallback_when_discovery_runs_and_approves_nothing(monkeypatch):
+    """True cold miss: only 1 official row in the DB, discovery runs, the
+    registry fails and validates nothing - the single official row serves
+    (external failure never blanks the catalog) and `db_fallback` is set."""
+    _gate_verifies_nothing(monkeypatch)
+    cached_items = [item("official_weather")]
+    cached_items[0].provenance[0].provider = "official_connectors"
     phase11 = FakePhase11(cached_items)
-    orchestrator = FakeOrchestrator()
-    phase10 = FakePhase10([live_copy])
+
+    class FailingOrchestrator:
+        async def discover_and_catalog(self, query, **kwargs):
+            raise ConnectionError("official MCP registry unreachable")
+
     service = ApplicationSearchService(
         settings=settings("mixed"),
         phase11=phase11,
-        orchestrator=orchestrator,
-        phase10_pipeline=phase10,
+        orchestrator=FailingOrchestrator(),
+        phase10_pipeline=FakePhase10([]),
     )
 
-    result = await service.search("tavily", item_type="tool", limit=10)
+    result = await service.search("weather", item_type="tool", limit=10)
 
+    assert [ranked.item.name for ranked in result.ranked.results] == [
+        "official_weather"
+    ]
     assert result.metadata.mode == "merged"
-    # All 4 catalog rows were served (3 un-collapsed + 1 live-won copy).
-    assert len(result.ranked.results) == 4
-    assert result.metadata.cached_results == 4
-    assert result.metadata.approved_count == 1
-    assert result.metadata.live_candidates == 1
+    assert result.metadata.db_fallback is True
+    assert result.metadata.cached_results == 1
+    assert result.metadata.sources_attempted[0] == "arcadedb"
+    assert "arcadedb" in result.metadata.sources_succeeded
+
+
+def test_merge_items_deduplicates_on_repo_identity():
+    """Registry mirror + GitHub repo for the SAME repository -> one result."""
+    db_copy = item("slack_db", repo="owner/slack-mcp")
+    registry_copy = item("slack_registry", repo="owner/slack-mcp")
+    distinct = item("other_tool", repo="owner/other-mcp")
+
+    merged = _merge_items([db_copy], [registry_copy, distinct])
+
+    names = [entry.name for entry in merged]
+    assert names == ["slack_db", "other_tool"]  # duplicate live copy dropped
+    assert merged[0] is db_copy  # the durable catalog row stays
+
+
+def test_merge_items_keeps_genuinely_different_servers():
+    db_copy = item("db_one", repo="owner/one-mcp")
+    live_a = item("live_a", repo="owner/two-mcp")
+    live_b = item("live_b", repo="owner/three-mcp")
+
+    merged = _merge_items([db_copy], [live_a, live_b])
+
+    assert [entry.name for entry in merged] == ["db_one", "live_a", "live_b"]
+
+
+def test_merge_items_collapses_rows_without_repo_urls():
+    """Items with no repo identity still dedupe on canonical identity."""
+    db_copy = item("slack_db")
+    live_copy = item("slack_db")  # same canonical_id, no repo provenance
+
+    merged = _merge_items([db_copy], [live_copy])
+
+    assert [entry.name for entry in merged] == ["slack_db"]
+    assert merged[0] is live_copy  # live copy wins the key

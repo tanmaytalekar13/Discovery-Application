@@ -1,6 +1,30 @@
+"""Application search coordinator: DB-first discovery.
+
+Target architecture (single source of truth per subsystem):
+
+    USER SEARCH
+        |
+        +-- ArcadeDB catalog (official + verified servers = durable truth)
+        |
+        +-- external discovery (MCP Registry -> GitHub cascade)
+                only when the DB shortlist is smaller than
+                search_verified_result_cap, and stopped as soon as the
+                DB can answer on its own
+
+The DB is the persistent knowledge of reliable MCP servers; external
+sources are a completion mechanism, never the primary answer when the
+catalog already has enough. Every live candidate still passes the full
+Phase 10 validation (MCP resolution / best-effort evidence rules)
+before it can appear in a result, and live-approved items are merged
+into the response WITHOUT being marked as trusted catalog content -
+only a real successful test/verification run persists a verified
+server (verification.bridge / verification workers).
+"""
+
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 
 from app.config import Settings
@@ -40,7 +64,7 @@ class ApplicationSearchResult:
 
 
 class ApplicationSearchService:
-    """Application search coordinator for the Phase 09 -> 10 -> 11 runtime path."""
+    """DB-first search coordinator with external discovery as a completion mechanism."""
 
     def __init__(
         self,
@@ -64,6 +88,7 @@ class ApplicationSearchService:
     ) -> ApplicationSearchResult:
         mode = self._settings.discovery_mode
         if mode == "cached":
+            # Explicit DB-only deployment: external discovery never runs.
             cached = await self._phase11.search(query, item_type=item_type, limit=limit)
             servable = await self._servable_cached_results(
                 [entry.item for entry in cached.results]
@@ -79,109 +104,99 @@ class ApplicationSearchService:
                 ),
             )
 
-        if mode == "live":
-            discovery, catalog = await self._run_live_discovery(query, item_type, limit)
-            live_approved = list(catalog.approved) if catalog is not None else []
-            if live_approved:
-                ranked = await self._rank_items(
-                    query,
-                    live_approved,
-                    item_type=item_type,
-                    limit=limit,
-                )
-                return ApplicationSearchResult(
-                    ranked=ranked,
-                    metadata=self._live_metadata(discovery, catalog, mode="live"),
-                )
-            # Live discovery failed or approved nothing. The durable catalog
-            # is the source of truth for official + verified servers, so
-            # serve those from ArcadeDB instead of an empty response.
-            return await self._db_fallback_result(
-                query,
-                item_type=item_type,
-                limit=limit,
-                mode="live",
-                discovery=discovery,
-                catalog=catalog,
-            )
+        return await self._search_db_first(query, item_type=item_type, limit=limit)
 
-        return await self._search_mixed(query, item_type=item_type, limit=limit)
-
-    async def _search_mixed(
+    async def _search_db_first(
         self,
         query: str,
         *,
         item_type: PreferredType | None,
         limit: int | None,
     ) -> ApplicationSearchResult:
-        """Warm-start search: catalog shortlist + live discovery, merged.
+        """Answer from the durable catalog first; discover externally only to fill.
 
-        Spec v2 Section 4.2 (Warm Search): a query already represented in the
-        catalog is answered from ArcadeDB immediately, but live discovery
-        still runs and its approved results are merged with the cached ones -
-        one query should surface every server for that service across the
-        catalog (vendor-published official connectors), the official MCP
-        Registry, and GitHub (the plan's multi-source merge), not just the
-        first catalog hit.
+        Early stop: when the DB already holds at least
+        `search_verified_result_cap` servable (official or verified-badge)
+        hits for this query, external discovery is never started. The cap
+        is the application's own existing shortlist-size requirement
+        ("1 official + 2-3 verified"), not an invented threshold.
 
-        Inside live discovery the registry -> GitHub trust cascade still
-        holds (enforced in `MCPDiscoveryAdapter`): GitHub is only queried
-        when the registry yields nothing. Ranking then orders the merge:
-        `official_connectors` provenance outranks registry mirrors, which
-        outrank GitHub repos, so the vendor's own endpoint lists first while
-        community mirrors remain visible below it.
+        When the DB is short, discovery runs with the shortfall
+        (`min_results`) so the registry -> GitHub cascade inside
+        MCPDiscoveryAdapter keeps pulling until the shortlist is full -
+        and GitHub is only queried when the registry alone is not enough.
 
-        The merged shortlist is capped (`search_cold_miss_result_cap`,
-        default 7) to stay a shortlist, not a firehose. If neither the
-        catalog nor live discovery produces a verifiable item, the best
-        catalog matches are served stale-but-available rather than leaving
-        the user with a blank page.
+        The merged shortlist is deduplicated on the existing canonical
+        identity strategy and capped. If live discovery approves nothing,
+        the best catalog matches serve stale-but-available instead of
+        leaving the user with a blank page.
         """
+        cap = min(
+            limit or self._settings.search_cold_miss_result_cap,
+            self._settings.search_cold_miss_result_cap,
+        )
         cached = await self._phase11.search(
             query, item_type=item_type, limit=self._settings.ranking_candidate_limit
         )
-        # Cache gate (spec intent): the catalog stores every
-        # reliability-approved discovery hit, but only servers whose
-        # McpServer record holds a verified badge - plus the seeded official
-        # directory - belong in the search shortlist. Without this, registry
-        # metadata alone (never handshaked, never badge-earned) surfaces as
-        # a "cached" result next to genuinely verified ones.
-        cached_servable = await self._servable_cached_results(
+        # Servability gate: the catalog stores every reliability-approved
+        # discovery hit, but only servers whose McpServer record holds a
+        # verified badge - plus the seeded official directory - belong in
+        # the search shortlist. Without this, registry metadata alone
+        # (never handshaked, never badge-earned) would surface as a result
+        # next to genuinely verified ones.
+        servable = await self._servable_cached_results(
             [entry.item for entry in cached.results]
         )
-        verified = [
-            entry for entry in cached.results if _cache_key(entry.item) in cached_servable
+        verified_db = [
+            entry for entry in cached.results if _cache_key(entry.item) in servable
         ]
 
-        discovery, catalog = await self._run_live_discovery(query, item_type, limit)
-        live_metadata = self._live_metadata(discovery, catalog, mode="merged")
-        live_items = list(catalog.approved) if catalog is not None else []
-        merged_cap = self._settings.search_cold_miss_result_cap
+        # Early stop: enough reliable DB results -> external discovery is
+        # not required at all.
+        if len(verified_db) >= self._settings.search_verified_result_cap:
+            ranked = await self._rank_items(
+                query,
+                [entry.item for entry in verified_db],
+                item_type=item_type,
+                limit=cap,
+                plan=cached.plan,
+            )
+            return ApplicationSearchResult(
+                ranked=ranked,
+                metadata=ApplicationSearchMetadata(
+                    mode="merged",
+                    sources_attempted=("arcadedb",),
+                    sources_succeeded=("arcadedb",),
+                    cached_results=len(ranked.results),
+                ),
+            )
 
-        # Merge verified catalog entries with freshly approved live items.
-        # `_merge_items` deduplicates on canonical identity and prefers the
-        # live copy when both sources found the same server.
-        cached_items = [entry.item for entry in verified]
-        merged = _merge_items(cached_items, live_items)
+        # DB insufficient: fill the shortfall from the registry -> GitHub
+        # cascade (GitHub only queried when the registry is not enough).
+        shortfall = cap - len(verified_db)
+        discovery, catalog = await self._run_live_discovery(
+            query, item_type=item_type, limit=limit, min_results=shortfall
+        )
+        live_items = list(catalog.approved) if catalog is not None else []
+
+        merged = _merge_items([entry.item for entry in verified_db], live_items)
         if merged:
             ranked = await self._rank_items(
                 query,
                 merged,
                 item_type=item_type,
-                limit=min(limit or merged_cap, merged_cap),
+                limit=cap,
                 plan=cached.plan,
             )
-            # "cached" means: served from the catalog. The merge prefers the
-            # live copy for servers BOTH sources found, but those items still
-            # originate from the catalog, so they count as cached; only items
-            # the catalog never had are purely live-discovered. Match on the
-            # same identity key the merge used - matching canonical_id alone
-            # is wrong here because different cached rows can carry different
-            # canonical_id values for the same server while the merge deduped
-            # them under ONE key (0-/1- sha256 collisions), which is exactly
-            # what underreported 4 cached rows as 1.
+            # Count what the shortlist actually shows: rows that came from
+            # the catalog vs rows only live discovery produced. Match on
+            # the same identity keys the merge used - matching
+            # canonical_id alone is wrong when several catalog rows carry
+            # different canonical_id values for the same server while the
+            # merge collapsed them under one key.
             cached_identity_keys = {
-                item.canonical_id or str(item.item_id) for item in cached_items
+                item.canonical_id or str(item.item_id)
+                for item in (entry.item for entry in verified_db)
             }
             cached_in_results = sum(
                 1
@@ -191,46 +206,44 @@ class ApplicationSearchService:
             )
             return ApplicationSearchResult(
                 ranked=ranked,
-                metadata=ApplicationSearchMetadata(
+                metadata=self._discovery_metadata(
+                    discovery,
+                    catalog,
                     mode="merged",
-                    sources_attempted=("arcadedb", *live_metadata.sources_attempted),
-                    sources_succeeded=(
-                        ("arcadedb", *live_metadata.sources_succeeded)
-                        if cached.results
-                        else live_metadata.sources_succeeded
-                    ),
-                    sources_failed=live_metadata.sources_failed,
                     cached_results=cached_in_results,
-                    live_candidates=live_metadata.live_candidates,
-                    approved_count=live_metadata.approved_count,
-                    rejected_count=live_metadata.rejected_count,
+                    # Discovery attempted but validated nothing: the
+                    # response is the durable catalog, not live content.
+                    db_fallback=catalog is None or not catalog.approved,
+                    sources_attempted_prefix=("arcadedb",),
+                    sources_succeeded_prefix=("arcadedb",),
                 ),
             )
 
-        # Cold miss with no live approval: serve the best verified catalog
-        # matches (stale-but-available) instead of an empty response. When
-        # live discovery approved nothing there is nothing badge-new to
-        # merge, so the cap applies to the verified/official catalog
-        # shortlist alone.
-        fallback = self._limit_entries(cached, cached_servable, merged_cap)
+        # Cold miss: discovery ran and approved nothing. Serve the best
+        # servable catalog matches (stale-but-available) - an external
+        # outage must degrade to the durable catalog, never to an empty
+        # page.
+        fallback = self._limit_entries(cached, servable, cap)
         ranked = await self._rank_items(
             query,
             [entry.item for entry in fallback],
             item_type=item_type,
-            limit=min(limit or merged_cap, merged_cap),
+            limit=cap,
             plan=cached.plan,
         )
         return ApplicationSearchResult(
             ranked=ranked,
-            metadata=ApplicationSearchMetadata(
+            metadata=self._discovery_metadata(
+                discovery,
+                catalog,
                 mode="merged",
-                sources_attempted=("arcadedb", *live_metadata.sources_attempted),
-                sources_succeeded=("arcadedb", *live_metadata.sources_succeeded),
-                sources_failed=live_metadata.sources_failed,
+                db_fallback=True,
                 cached_results=len(ranked.results),
-                live_candidates=live_metadata.live_candidates,
-                approved_count=live_metadata.approved_count,
-                rejected_count=live_metadata.rejected_count,
+                sources_attempted_prefix=("arcadedb",),
+                # The DB genuinely served the response (the fallback rows
+                # are its answer), so the catalog counts as a succeeded
+                # source even though the external sources failed.
+                sources_succeeded_prefix=("arcadedb",),
             ),
         )
 
@@ -261,8 +274,10 @@ class ApplicationSearchService:
     async def _run_live_discovery(
         self,
         query: str,
+        *,
         item_type: PreferredType | None,
         limit: int | None,
+        min_results: int,
     ) -> tuple[SearchOrchestratorResult | None, Phase10Result | None]:
         if self._orchestrator is None or self._phase10_pipeline is None:
             return None, None
@@ -272,6 +287,7 @@ class ApplicationSearchService:
                 phase10_pipeline=self._phase10_pipeline,
                 item_type=item_type or "all",
                 max_results=limit or self._settings.discovery_max_results_per_source,
+                min_results=max(min_results, 1),
             )
         except Exception:  # noqa: BLE001 - discovery outage must never fail search
             # Sources report their own failures via sources_failed; anything
@@ -304,100 +320,31 @@ class ApplicationSearchService:
         )
 
     @staticmethod
-    def _live_metadata(
+    def _discovery_metadata(
         discovery: SearchOrchestratorResult | None,
         catalog: Phase10Result | None,
         *,
         mode: str,
+        cached_results: int = 0,
         db_fallback: bool = False,
+        sources_attempted_prefix: tuple[str, ...] = (),
+        sources_succeeded_prefix: tuple[str, ...] = (),
     ) -> ApplicationSearchMetadata:
+        """Metadata for a search that (attempted) external discovery."""
+        attempted = discovery.sources_attempted if discovery else ()
+        succeeded = discovery.sources_succeeded if discovery else ()
+        failed = discovery.sources_failed if discovery else ()
         return ApplicationSearchMetadata(
             mode=mode,
-            sources_attempted=discovery.sources_attempted if discovery else (),
-            sources_succeeded=discovery.sources_succeeded if discovery else (),
-            sources_failed=discovery.sources_failed if discovery else (),
+            sources_attempted=(*sources_attempted_prefix, *attempted),
+            sources_succeeded=(*sources_succeeded_prefix, *succeeded),
+            sources_failed=failed,
+            cached_results=cached_results,
             live_candidates=len(discovery.candidates) if discovery else 0,
             approved_count=len(catalog.approved) if catalog else 0,
             rejected_count=len(catalog.rejected) if catalog else 0,
             db_fallback=db_fallback,
         )
-
-    async def _db_fallback_result(
-        self,
-        query: str,
-        *,
-        item_type: PreferredType | None,
-        limit: int | None,
-        mode: str,
-        discovery: SearchOrchestratorResult | None,
-        catalog: Phase10Result | None,
-    ) -> ApplicationSearchResult:
-        """Serve official + verified catalog servers when live discovery fails.
-
-        The DB is the durable source of truth: every search already
-        persists official connectors (Phase 10 upsert) and verified
-        badges (user tests / verification workers write McpServer
-        records), so an external outage must degrade to the catalog
-        shortlist, never to an empty page. The gate is the same
-        verified-badge + official-directory rule the merged path uses,
-        so fallback results match what the warm path would serve.
-        """
-        cap = min(
-            limit or self._settings.search_cold_miss_result_cap,
-            self._settings.search_cold_miss_result_cap,
-        )
-        cached = await self._phase11.search(
-            query, item_type=item_type, limit=self._settings.ranking_candidate_limit
-        )
-        servable = await self._servable_cached_results(
-            [entry.item for entry in cached.results]
-        )
-        fallback = self._limit_entries(cached, servable, cap)
-        ranked = await self._rank_items(
-            query,
-            [entry.item for entry in fallback],
-            item_type=item_type,
-            limit=cap,
-            plan=cached.plan,
-        )
-        metadata = self._live_metadata(
-            discovery, catalog, mode=mode, db_fallback=True
-        )
-        metadata = replace(
-            metadata,
-            sources_attempted=("arcadedb", *metadata.sources_attempted),
-            sources_succeeded=(
-                ("arcadedb", *metadata.sources_succeeded)
-                if ranked.results
-                else metadata.sources_succeeded
-            ),
-            cached_results=len(ranked.results),
-        )
-        return ApplicationSearchResult(ranked=ranked, metadata=metadata)
-
-
-def _is_verified(item: Item) -> bool:
-    """A catalog item is 'verified' when its protocol was actually validated.
-
-    Phase 10 only attaches `protocol_validation` evidence to items whose MCP
-    resolution (or best-effort source-backed acceptance) succeeded; candidates
-    rejected during normalization never enter the catalog with it.
-
-    Vendor-published official connectors (seeded from the curated directory,
-    provider='official_connectors') count as verified provenance too: the
-    vendor's own directory is first-party evidence that the endpoint exists
-    and is the official one for that service. The live protocol check still
-    happens on every Test Tool connect — this gate only controls whether the
-    item may appear in the search shortlist, where official servers must
-    surface above registry/GitHub mirrors (and before any live cascade).
-    """
-    if any(entry.kind == "protocol_validation" for entry in item.evidence):
-        return True
-    return any(
-        entry.kind == "official_directory"
-        and entry.source.provider == "official_connectors"
-        for entry in item.evidence
-    )
 
 
 def _is_official(item: Item) -> bool:
@@ -413,20 +360,70 @@ def _cache_key(item: Item) -> str:
     return item.canonical_id or str(item.item_id)
 
 
+def _item_repo_identities(item: Item) -> set[str]:
+    """Canonical owner/repo identities for one item's URLs.
+
+    Reuses `verification.ingestion.normalize_repo_identity` - the same
+    owner/repo normalizer the verification bridge and badge lookups use -
+    so deduplication and verification can never disagree about what
+    "the same repository" means.
+    """
+    from app.verification.ingestion import normalize_repo_identity
+
+    urls: list[str] = []
+    if item.source is not None and item.source.url:
+        urls.append(str(item.source.url))
+    urls.extend(str(s.url) for s in (item.provenance or []) if s.url)
+    artifacts = getattr(item, "artifacts", None)
+    if artifacts is not None and artifacts.source_url:
+        urls.append(str(artifacts.source_url))
+    return {
+        identity
+        for identity in (normalize_repo_identity(url) for url in urls)
+        if identity
+    }
+
+
 def _merge_items(cached: list[Item], live: list[Item]) -> list[Item]:
-    merged: dict[str, Item] = {}
-    for item in cached:
-        key = item.canonical_id or str(item.item_id)
-        merged.setdefault(key, item)
-    for item in live:
-        key = item.canonical_id or str(item.item_id)
+    """Deduplicate DB + live items into one unique, ordered shortlist.
+
+    Primary key: the existing canonical identity (`canonical_id`, the
+    protocol-aware sha256 from deduplication.identity; seeded rows carry
+    their own stable ids). Secondary key: the canonical owner/repo
+    identity from `normalize_repo_identity`, so a registry mirror and a
+    GitHub repo describing the SAME repository collapse into one result
+    while genuinely different servers stay distinct.
+
+    Semantics: cached rows claim their keys first (stable order), live
+    rows with the same canonical identity win the content of that key
+    (fresher evidence) without adding a duplicate row. A live row that
+    matches only via repository identity never replaces the durable
+    catalog row. Order: cached originals first, then live items the
+    catalog never had.
+    """
+    merged: OrderedDict[str, Item] = OrderedDict()
+    repo_owner: dict[str, str] = {}  # repo identity -> owning merged key
+
+    def _claim(item: Item, *, prefer_new: bool) -> None:
+        key = _cache_key(item)
+        identities = _item_repo_identities(item)
+        for identity in identities:
+            owner = repo_owner.get(identity)
+            if owner is not None:
+                # Same repository already merged. The durable catalog row
+                # stays (the DB is the source of truth); only an exact
+                # canonical-identity match may refresh the content below.
+                return
+        if key in merged:
+            if prefer_new:
+                merged[key] = item
+            return
         merged[key] = item
-    # Prefer live-approved results when discovery succeeded for the active query.
-    # This keeps seeded demo entries in the system while preventing them from
-    # dominating a real provider-backed search result set.
-    ordered = list(live)
+        for identity in identities:
+            repo_owner.setdefault(identity, key)
+
     for item in cached:
-        key = item.canonical_id or str(item.item_id)
-        if key not in {entry.canonical_id or str(entry.item_id) for entry in live}:
-            ordered.append(item)
-    return ordered
+        _claim(item, prefer_new=False)
+    for item in live:
+        _claim(item, prefer_new=True)
+    return list(merged.values())

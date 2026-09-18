@@ -197,14 +197,6 @@ class ItemArtifactsResponse(BaseModel):
     integration: IntegrationSnippet
     source_preview: SourcePreview
 
-# ------------------------------------------------------------------------------
-
-
-class DeferredExecutionResponse(BaseModel):
-    item_id: UUID
-    status: Literal["not_implemented"]
-    detail: str
-
 
 class TestRunResponse(BaseModel):
     test_run: TestRun

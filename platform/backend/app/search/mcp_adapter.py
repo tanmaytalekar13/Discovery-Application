@@ -1,29 +1,21 @@
-"""MCP-side multi-source discovery adapter (Phase 09).
+"""MCP discovery source cascade (Registry -> GitHub).
 
-Per CODEX_EXECUTION_PLAN.md Section 7:
-
-    DiscoveryOrchestrator
-            |
-            +--> MCPDiscoveryAdapter
-            |       +--> GitHub
-    |       +--> MCP Registry
-
-This module contains no provider-specific logic itself (that already
-lives in each Phase 04/05/07/08 adapter); it only fans a single user
-query out to whichever MCP discovery sources are configured, converts
-each source's own candidate type into the common `CandidateReference`
-(Phase 09's `app.discovery.common.candidate`), and isolates one
-source's failure from the others (rule #21) via
+This module contains no provider-specific logic itself (that lives in
+each discovery client); it runs the official MCP Registry (plus the
+registry-backed service search) first and falls back to GitHub only
+when the combined DB-known + registry-validated candidate count is
+still below the caller's shortfall (`min_results`). Each source's
+failure is isolated from the others via
 `app.search.concurrency.gather_source_outcomes`.
 
+`min_results` is the shortfall the DB shortlist left behind: the
+cascade keeps GitHub out of the picture while the registry alone
+covers it, and stops treating sources once enough candidates exist.
+`max_results` remains each source's own page size.
+
 Every constructor argument is optional: a `None` adapter means that
-source is disabled (Section 32/33 - each source must be independently
-enabled/disabled), matching the `ENABLE_*_DISCOVERY` configuration
-flags. The "Optional DNS" branch from Section 7 has no adapter yet
-(Section 6 lists it under "Additional", not "Mandatory/core") and is
-intentionally not implemented here rather than stubbed out (rule #35 -
-Codex protocol: "Do not create placeholder classes/endpoints merely to
-make a phase appear complete.").
+source is disabled, matching the `ENABLE_*_DISCOVERY` configuration
+flags.
 """
 
 from __future__ import annotations
@@ -36,7 +28,7 @@ from app.discovery.common.candidate import from_github_candidate as _from_github
 from app.discovery.common.candidate import (
     from_mcp_registry_candidate as _from_mcp_registry,
 )
-from app.discovery.github.client import GitHubDiscoveryAdapter
+from app.discovery.github.client import GitHubDiscoveryAdapter, github_mcp_search_query
 from app.discovery.mcp_registry.client import MCPRegistryClient
 from app.discovery.mcp_registry.service_adapter import discover_services
 from app.search.concurrency import gather_source_outcomes
@@ -72,7 +64,7 @@ def _candidate_is_excluded(candidate: CandidateReference) -> bool:
 
 
 class MCPDiscoveryAdapter:
-    """Aggregate the supported MCP discovery sources: Registry, GitHub, and Service Search."""
+    """Registry-first MCP discovery cascade with a GitHub completion step."""
 
     def __init__(
         self,
@@ -89,16 +81,18 @@ class MCPDiscoveryAdapter:
         self,
         query: str,
         max_results: int = DEFAULT_MAX_RESULTS,
+        min_results: int = 1,
     ) -> list[SourceOutcome]:
-        """Run MCP discovery sources as a sequential trust cascade.
+        """Run the official-first trust cascade for one query.
 
-        Spec v2 Section 9.1: the official MCP Registry is the
-        higher-trust, cheaper-to-query source (structured, already has
-        manifests), so it is consulted first — together with the
-        registry-backed service search, which targets the same official
-        source. GitHub is only queried when the official sources yield
-        *nothing* for the query. A registry hit stops the cascade and
-        GitHub is never contacted for that query.
+        Step 1: the official MCP Registry (and registry-backed service
+        search) run concurrently - same official source, one trust tier.
+
+        Step 2: GitHub runs only when the DB-known shortfall
+        (`min_results`) is not already covered by the registry/service
+        candidates. The caller passes the DB shortlist size in, so
+        `DB + Registry >= cap` skips GitHub entirely while
+        `DB + Registry < cap` pulls until the gap is closed.
 
         Returns one `SourceOutcome` per *attempted* source (a disabled
         source, i.e. constructor arg left `None`, is simply absent -
@@ -112,19 +106,26 @@ class MCPDiscoveryAdapter:
         if self._enable_service_discovery:
             official_tasks["service"] = self._discover_service(query, max_results)
 
+        official_candidates: list[CandidateReference] = []
         if official_tasks:
             official_outcomes = await gather_source_outcomes(official_tasks)
             outcomes.extend(official_outcomes)
-            if any(
-                outcome.succeeded and outcome.candidates
-                for outcome in official_outcomes
-            ):
+            for outcome in official_outcomes:
+                if outcome.succeeded:
+                    official_candidates.extend(outcome.candidates)
+            # Enough validated official candidates: cascade stops here and
+            # GitHub is never contacted for this query.
+            if len(official_candidates) >= min_results:
                 return outcomes
 
         if self._github is not None:
+            # Fetch only what the shortfall still needs after the registry
+            # results (at least one candidate's worth; a full page is
+            # pointless when the gap is 1-2 servers).
+            github_fetch = max(min_results - len(official_candidates), 1)
             outcomes.extend(
                 await gather_source_outcomes(
-                    {"github": self._discover_github(query, max_results)}
+                    {"github": self._discover_github(query, github_fetch)}
                 )
             )
 
@@ -136,7 +137,9 @@ class MCPDiscoveryAdapter:
         max_results: int,
     ) -> list[CandidateReference]:
         assert self._github is not None
-        candidates = await self._github.discover(query, max_results)
+        candidates = await self._github.discover(
+            github_mcp_search_query(query), max_results
+        )
         return [_from_github(candidate) for candidate in candidates]
 
     async def _discover_registry(

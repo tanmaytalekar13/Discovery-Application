@@ -8,11 +8,8 @@ import subprocess
 import sys
 import time
 
-# Add parent to path if needed
-sys.path.insert(0, "/Users/tanmay/Desktop/Discovery Application/platform/backend/app")
-
-from sandbox.local_mcp_client import LocalMCPClient
-from sandbox.mcp_client import MCPTestClient
+from app.sandbox.local_mcp_client import LocalMCPClient
+from app.sandbox.mcp_client import MCPTestClient
 
 
 def test_local_stdio_connect_and_env_trim():
@@ -58,7 +55,7 @@ sys.stdout.flush()
 def test_remote_auth_header_format_and_trim():
     """BUG 2: confirm trimmed token + correct header format (Bearer / custom)."""
     # We test the header construction logic directly (no live server needed)
-    from sandbox.mcp_client import MCPTestClient
+    from app.sandbox.mcp_client import MCPTestClient
     client = MCPTestClient(url="http://example.com/mcp", auth_token="  secret_key  ", auth_header="X-Api-Key", auth_value_prefix="")
     headers = client._build_headers()
     assert headers.get("X-Api-Key") == "secret_key", "BUG 2: token not trimmed or custom header wrong"
@@ -73,7 +70,7 @@ def test_remote_auth_header_format_and_trim():
 def test_env_injection_hash_never_raw():
     """BUG 2: confirm env injection logs contain hash not raw value."""
     # Code-level check: local_mcp_client._build_docker_exec_command uses hashlib.sha256(...).hexdigest()[:16]
-    from sandbox.local_mcp_client import LocalMCPClient
+    from app.sandbox.local_mcp_client import LocalMCPClient
     import inspect
     source = inspect.getsource(LocalMCPClient._build_docker_exec_command)
     assert "hashlib.sha256" in source, "Missing hash-based logging for env injection"

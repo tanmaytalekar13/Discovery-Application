@@ -246,16 +246,19 @@ class MCPRegistryClient:
         meaningful_terms = [t for t in raw_terms if t not in _PROTOCOL_NOISE_TERMS]
         terms = meaningful_terms if meaningful_terms else raw_terms
 
-        haystack_pieces = [
-            candidate.server_name.lower(),
-            strip_registry_namespace(candidate.server_name),
-            (candidate.title or "").lower(),
-            candidate.description.lower(),
-        ]
-        if candidate.repository_url:
-            haystack_pieces.append(candidate.repository_url.lower())
-
-        haystack = " ".join(haystack_pieces)
+        # Identity metadata only (name, slug, title, description). The
+        # repository URL is deliberately excluded: an entry's repo host
+        # (e.g. io.example/calendar in a repo named example/weather) says
+        # nothing about what the server does, and matching on it surfaced
+        # irrelevant servers for otherwise precise queries.
+        haystack = " ".join(
+            (
+                candidate.server_name.lower(),
+                strip_registry_namespace(candidate.server_name),
+                (candidate.title or "").lower(),
+                candidate.description.lower(),
+            )
+        )
         return any(term in haystack for term in terms)
 
     @staticmethod

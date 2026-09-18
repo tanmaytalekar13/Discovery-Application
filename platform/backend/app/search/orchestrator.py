@@ -1,34 +1,22 @@
-"""Multi-source discovery orchestrator (Phase 09).
+"""Multi-source discovery orchestrator.
 
-Per CODEX_EXECUTION_PLAN.md Section 39 (Phase 09 Definition of Done):
-
-    - sources execute concurrently;
-    - one source can fail without breaking search;
-    - candidates aggregate correctly.
-
-and Section 7's architecture diagram, this is the top-level
-`DiscoveryOrchestrator` that runs `MCPDiscoveryAdapter` and
-`A2ADiscoveryAdapter` (each of which already fans out to its own
-sources concurrently - see `app.search.mcp_adapter` /
-`app.search.a2a_adapter`) at the same time, and flattens their
-per-source `SourceOutcome`s into the aggregate result shape used by
-Section 28's search response `metadata`
+The orchestrator fans a user query out to the MCP discovery adapter and
+flattens its per-source `SourceOutcome`s into the aggregate result shape
+used by the search response metadata
 (`sources_attempted`/`sources_succeeded`/`sources_failed`).
 
-What this module deliberately does *not* do yet, because it belongs to
-a later phase and Section 44's Codex protocol says "Implement only
-that phase":
+What this module deliberately does *not* do:
 
-    - query ArcadeDB / decide cold vs warm search (Phase 17/Section 17-18);
-    - MCP `initialize`/`tools/list` or Agent Card protocol validation
-      of the aggregated candidates (already partly done inside the
-      Well-Known source, Section 9/10 for the rest - Phase 10);
-    - deduplication, reliability scoring, or persistence (Phase 10);
+    - query ArcadeDB / decide cold vs warm search (the DB-first gate
+      lives in `app.search.application`);
+    - MCP `initialize`/`tools/list` protocol validation of the
+      aggregated candidates (Phase 10 normalization);
+    - reliability scoring or persistence decisions (Phase 10);
     - ranking (Phase 11).
 
 Live discovery here only ever aggregates untrusted candidates; nothing
 in this module writes to ArcadeDB or is treated as an approved catalog
-entry (rule #7/#8).
+entry.
 """
 
 from __future__ import annotations
@@ -37,7 +25,6 @@ import asyncio
 from dataclasses import dataclass, field
 
 from app.discovery.common.candidate import CandidateReference
-from app.search.a2a_adapter import A2ADiscoveryAdapter
 from app.search.mcp_adapter import MCPDiscoveryAdapter
 
 DEFAULT_MAX_RESULTS = 20
@@ -54,7 +41,7 @@ class SearchOrchestratorResult:
     sources_failed: tuple[str, ...]
 
     # Keyed by the same source names as `sources_failed`, for
-    # observability (Section 36) without ever logging secret values.
+    # observability without ever logging secret values.
     source_errors: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -67,22 +54,19 @@ class SearchOrchestratorResult:
 
 
 class DiscoveryOrchestrator:
-    """Fan a query out to the MCP and A2A discovery adapters concurrently."""
+    """Run the MCP discovery adapter and flatten its per-source outcomes."""
 
     def __init__(
         self,
         *,
-        mcp_adapter: MCPDiscoveryAdapter | None = None,
-        a2a_adapter: A2ADiscoveryAdapter | None = None,
+        mcp_adapter: MCPDiscoveryAdapter,
     ) -> None:
-        if mcp_adapter is None and a2a_adapter is None:
+        if mcp_adapter is None:
             raise ValueError(
-                "DiscoveryOrchestrator requires at least one of "
-                "mcp_adapter/a2a_adapter to be configured"
+                "DiscoveryOrchestrator requires an mcp_adapter"
             )
 
         self._mcp_adapter = mcp_adapter
-        self._a2a_adapter = a2a_adapter
 
     async def discover_and_catalog(
         self,
@@ -91,15 +75,18 @@ class DiscoveryOrchestrator:
         phase10_pipeline,
         item_type: str = "all",
         max_results: int = DEFAULT_MAX_RESULTS,
+        min_results: int = 1,
     ):
-        """Run Phase 09 discovery and immediately pass candidates through Phase 10.
+        """Run discovery and immediately pass candidates through Phase 10.
 
-        The existing ``discover`` contract is intentionally unchanged, so Phase 09
-        callers remain source-aggregation-only. This method is the explicit Phase 10
-        integration boundary and returns both the discovery metadata and catalog result.
+        This method is the explicit Phase 10 integration boundary and
+        returns both the discovery metadata and catalog result. Phase 10
+        validation (MCP resolution / evidence rules) decides what becomes
+        an approved item; unvalidated candidates are rejected, never
+        fabricated into results.
         """
         discovery = await self.discover(
-            query, item_type=item_type, max_results=max_results
+            query, item_type=item_type, max_results=max_results, min_results=min_results
         )
         catalog = await phase10_pipeline.process(discovery.candidates)
         return discovery, catalog
@@ -109,35 +96,31 @@ class DiscoveryOrchestrator:
         query: str,
         item_type: str = "all",
         max_results: int = DEFAULT_MAX_RESULTS,
+        min_results: int = 1,
     ) -> SearchOrchestratorResult:
-        """Run every enabled protocol group concurrently for `query`.
+        """Run the enabled sources for `query`.
 
         `item_type` mirrors Section 28's `GET /api/search` contract
         (``all | tool | agent``): it only decides *which* protocol
         group(s) run, never filters an individual source's own
-        classification.
+        classification. Only the MCP protocol group has live sources;
+        `item_type="agent"` therefore discovers nothing live.
+
+        `min_results` is the shortfall the DB shortlist left behind: the
+        MCP adapter uses it as its registry -> GitHub cascade threshold.
         """
         if not query.strip():
             raise ValueError("Discovery query must not be empty")
         if item_type not in ("all", "tool", "agent"):
             raise ValueError("item_type must be 'all', 'tool', or 'agent'")
 
-        want_mcp = item_type in ("all", "tool") and self._mcp_adapter is not None
-        want_a2a = item_type in ("all", "agent") and self._a2a_adapter is not None
+        want_mcp = item_type in ("all", "tool")
 
-        mcp_task = (
-            asyncio.ensure_future(self._mcp_adapter.discover(query, max_results))
+        outcomes = (
+            await self._mcp_adapter.discover(query, max_results, min_results)
             if want_mcp
-            else None
+            else []
         )
-        a2a_task = (
-            asyncio.ensure_future(self._a2a_adapter.discover(query, max_results))
-            if want_a2a
-            else None
-        )
-
-        mcp_outcomes = await mcp_task if mcp_task is not None else []
-        a2a_outcomes = await a2a_task if a2a_task is not None else []
 
         candidates: list[CandidateReference] = []
         sources_attempted: list[str] = []
@@ -145,18 +128,17 @@ class DiscoveryOrchestrator:
         sources_failed: list[str] = []
         source_errors: dict[str, str] = {}
 
-        for prefix, outcomes in (("mcp", mcp_outcomes), ("a2a", a2a_outcomes)):
-            for outcome in outcomes:
-                name = f"{prefix}:{outcome.source}"
-                sources_attempted.append(name)
+        for outcome in outcomes:
+            name = f"mcp:{outcome.source}"
+            sources_attempted.append(name)
 
-                if outcome.succeeded:
-                    sources_succeeded.append(name)
-                    candidates.extend(outcome.candidates)
-                else:
-                    sources_failed.append(name)
-                    if outcome.error:
-                        source_errors[name] = outcome.error
+            if outcome.succeeded:
+                sources_succeeded.append(name)
+                candidates.extend(outcome.candidates)
+            else:
+                sources_failed.append(name)
+                if outcome.error:
+                    source_errors[name] = outcome.error
 
         return SearchOrchestratorResult(
             candidates=tuple(candidates),

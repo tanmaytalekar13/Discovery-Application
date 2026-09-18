@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import httpx
+import sys
 
 import pytest
 
@@ -45,7 +46,10 @@ from app.sandbox.mcp_client import (
     ConnectResult,
     InvokeResult,
 )
-from exceptiongroup import BaseExceptionGroup, ExceptionGroup  # type: ignore
+if sys.version_info < (3, 11):  # ExceptionGroup is stdlib from 3.11 on
+    from exceptiongroup import BaseExceptionGroup, ExceptionGroup  # type: ignore  # noqa: F401
+else:
+    from builtins import BaseExceptionGroup, ExceptionGroup  # noqa: F401
 
 
 # ---------------------------------------------------------------------------

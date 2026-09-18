@@ -8,8 +8,6 @@ from app.config import Settings
 from app.discovery.common.candidate import CandidateReference
 from app.discovery.github.client import GitHubCandidate
 from app.discovery.mcp_registry.client import MCPRegistryCandidate
-from app.discovery.web_extraction.client import WebExtractionCandidate
-from app.discovery.web_search.client import WebSearchCandidate
 from app.models import ItemType, SourceType
 from app.models import DiscoverySource
 from app.normalization.pipeline import Phase10Pipeline
@@ -25,15 +23,15 @@ class FakeRepository:
         return item
 
 
-def candidate(protocol="a2a"):
+def candidate():
     return CandidateReference(
-        protocol=protocol,
-        item_type=ItemType.AGENT if protocol == "a2a" else ItemType.TOOL,
-        source_type=SourceType.A2A_CATALOG if protocol == "a2a" else SourceType.MCP_REGISTRY,
+        protocol="mcp",
+        item_type=ItemType.TOOL,
+        source_type=SourceType.MCP_REGISTRY,
         source_provider="test",
-        source_id="agent-1" if protocol == "a2a" else "server-1",
-        url="https://example.com/agent-card.json",
-        title="Test Agent",
+        source_id="server-1",
+        url="https://github.com/example/weather-mcp",
+        title="Weather MCP",
         description="Test",
         evidence=("registry evidence",),
     )
@@ -46,110 +44,12 @@ async def test_phase10_rejects_unvalidated_mcp_and_reports_rejection_evidence():
     settings = Settings(
         arcadedb_host="localhost", arcadedb_database="test", arcadedb_user="root", arcadedb_password="root"
     )
-    result = await Phase10Pipeline(repo, settings).process([candidate("mcp")])
+    result = await Phase10Pipeline(repo, settings).process([candidate()])
     assert not result.approved
     assert len(result.rejected) == 1
     assert result.rejected[0].evidence
     assert "MCP Registry metadata alone" in " ".join(result.rejected[0].evidence)
     assert repo.items == []  # rejection was not persisted as an Item either
-
-
-@pytest.mark.asyncio
-async def test_phase10_accepts_web_search_result_as_best_effort_live_hit():
-    repo = FakeRepository()
-    settings = Settings(
-        arcadedb_host="localhost",
-        arcadedb_database="test",
-        arcadedb_user="root",
-        arcadedb_password="root",
-        reliability_threshold=0.75,
-    )
-    web_candidate = CandidateReference(
-        protocol="mcp",
-        item_type=ItemType.TOOL,
-        source_type=SourceType.WEB_SEARCH,
-        source_provider="web_search",
-        source_id="https://example.com/mcp-server",
-        url="https://example.com/mcp-server",
-        title="Example MCP Server",
-        description="Model Context Protocol server for example tools",
-        evidence=("result title/snippet explicitly identifies an MCP server",),
-    )
-
-    result = await Phase10Pipeline(repo, settings).process([web_candidate])
-
-    assert len(result.approved) == 1
-    item = result.approved[0]
-    assert item.type is ItemType.TOOL
-    assert item.source.type is SourceType.WEB_SEARCH
-    assert item.name == "Example MCP Server"
-
-
-@pytest.mark.asyncio
-async def test_phase10_stores_extracted_web_search_content_as_artifact_source_code():
-    repo = FakeRepository()
-    settings = Settings(
-        arcadedb_host="localhost",
-        arcadedb_database="test",
-        arcadedb_user="root",
-        arcadedb_password="root",
-        reliability_threshold=0.75,
-    )
-    raw = WebSearchCandidate(
-        title="Example MCP Server",
-        url="https://example.com/mcp-server",
-        snippet="Model Context Protocol server for example tools",
-        item_type=ItemType.TOOL,
-        evidence=("result title/snippet explicitly identifies an MCP server",),
-        source=DiscoverySource(
-            type=SourceType.WEB_SEARCH,
-            id="https://example.com/mcp-server",
-            url="https://example.com/mcp-server",
-        ),
-        raw_result={"title": "Example MCP Server", "url": "https://example.com/mcp-server"},
-    )
-    extracted = WebExtractionCandidate(
-        title="Example MCP Server",
-        url="https://example.com/mcp-server",
-        text_excerpt="Short page text",
-        item_type=ItemType.TOOL,
-        evidence=("page text explicitly identifies an MCP server",),
-        source=DiscoverySource(
-            type=SourceType.WEB_PAGE,
-            id="https://example.com/mcp-server",
-            url="https://example.com/mcp-server",
-        ),
-        content_type="text/html",
-        text_content="Full extracted page text with Model Context Protocol details.",
-    )
-    web_candidate = CandidateReference(
-        protocol="mcp",
-        item_type=ItemType.TOOL,
-        source_type=SourceType.WEB_SEARCH,
-        source_provider="Web Search",
-        source_id="https://example.com/mcp-server",
-        url="https://example.com/mcp-server",
-        title="Example MCP Server",
-        description="Model Context Protocol server for example tools",
-        evidence=raw.evidence,
-        raw_metadata={
-            "source_candidate": raw,
-            "web_extraction_candidate": extracted,
-        },
-    )
-
-    result = await Phase10Pipeline(repo, settings).process([web_candidate])
-
-    assert len(result.approved) == 1
-    item = result.approved[0]
-    assert item.source.type is SourceType.WEB_SEARCH
-    assert item.artifacts.source_code == (
-        "Full extracted page text with Model Context Protocol details."
-    )
-    assert {entry["kind"] for entry in item.artifacts.config_files} == {
-        "web_search_result",
-        "web_extraction",
-    }
 
 
 @pytest.mark.asyncio
@@ -290,28 +190,6 @@ async def test_phase10_accepts_mcp_registry_candidate_and_exposes_registry_artif
     }
 
 
-@pytest.mark.asyncio
-async def test_phase10_normalizes_validated_a2a_with_full_provenance_and_evidence():
-    repo = FakeRepository()
-    settings = Settings(
-        arcadedb_host="localhost", arcadedb_database="test", arcadedb_user="root", arcadedb_password="root",
-        reliability_threshold=0.75,
-    )
-    async def resolver(_):
-        return {
-            "endpoint": "https://example.com/rpc",
-            "protocol_version": "1.0",
-            "raw_agent_card": {"name": "Test Agent", "description": "Validated agent", "url": "https://example.com/rpc", "skills": []},
-            "agent": {"endpoint": "https://example.com/rpc", "skills": [], "capabilities": [], "declared_dependencies": []},
-        }
-    result = await Phase10Pipeline(repo, settings, a2a_resolver=resolver).process([candidate()])
-    assert len(result.approved) == 1
-    item = result.approved[0]
-    assert item.canonical_id
-    assert item.provenance[0].provider == "test"
-    assert len(item.evidence) >= 2
-    assert item.reliability.security_validation > 0
-    assert repo.items
 
 
 

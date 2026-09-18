@@ -14,7 +14,6 @@ from app.api.dependencies import (
     get_test_run_repository,
 )
 from app.api.schemas import (
-    DeferredExecutionResponse,
     IntegrationSnippet,
     ItemArtifactsResponse,
     ItemClassificationResponse,
@@ -38,9 +37,9 @@ from app.query.planner import PreferredType
 from app.sandbox.classifier import classify_tool
 from app.search.application import ApplicationSearchService
 
-router = APIRouter(prefix="/api", tags=["discovery"])
-
 SearchType = Literal["all", "tool", "agent"]
+
+router = APIRouter(prefix="/api", tags=["discovery"])
 
 
 @router.get("/search", response_model=SearchResponse)
@@ -288,44 +287,6 @@ async def get_source_file_content(
         language=file_result.language,
         content=file_result.content,
         note=file_result.note,
-    )
-
-
-@router.post(
-    "/items/{item_id}/test",
-    response_model=DeferredExecutionResponse,
-    status_code=status.HTTP_501_NOT_IMPLEMENTED,
-)
-async def test_tool(
-    item_id: UUID,
-    repository: ItemRepository = Depends(get_item_repository),
-) -> DeferredExecutionResponse:
-    item = await _require_item(item_id, repository)
-    if item.tool is None:
-        raise HTTPException(status_code=409, detail="Item is not an MCP tool")
-    return DeferredExecutionResponse(
-        item_id=item.item_id,
-        status="not_implemented",
-        detail="MCP sandbox execution is implemented in Phase 15.",
-    )
-
-
-@router.post(
-    "/items/{item_id}/agent-test",
-    response_model=DeferredExecutionResponse,
-    status_code=status.HTTP_501_NOT_IMPLEMENTED,
-)
-async def test_agent(
-    item_id: UUID,
-    repository: ItemRepository = Depends(get_item_repository),
-) -> DeferredExecutionResponse:
-    item = await _require_item(item_id, repository)
-    if item.agent is None:
-        raise HTTPException(status_code=409, detail="Item is not an A2A agent")
-    return DeferredExecutionResponse(
-        item_id=item.item_id,
-        status="not_implemented",
-        detail="A2A sandbox execution is implemented in Phase 16.",
     )
 
 

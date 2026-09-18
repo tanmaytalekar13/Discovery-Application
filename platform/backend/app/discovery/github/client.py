@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +33,27 @@ class GitHubRateLimitError(GitHubDiscoveryError):
 
 class GitHubAPIError(GitHubDiscoveryError):
     """Raised for non-success GitHub API responses."""
+
+
+_PROTOCOL_NOISE_WORDS = frozenset({"mcp", "server", "servers", "model", "context", "protocol"})
+
+
+def github_mcp_search_query(raw_query: str) -> str:
+    """Normalize a user query into a GitHub MCP repository search string.
+
+    Keeps the service words the user typed ("Slack" -> "slack mcp") and
+    drops protocol boilerplate ("Google Calendar MCP server" ->
+    "google calendar mcp") so the repository search targets the service
+    instead of matching the words MCP/server themselves.
+    """
+    words = [
+        word
+        for word in re.findall(r"[a-z0-9]+", raw_query.lower())
+        if word not in _PROTOCOL_NOISE_WORDS
+    ]
+    if not words:
+        return "mcp"
+    return " ".join([*words, "mcp"])
 
 
 @dataclass(frozen=True)
@@ -115,7 +137,10 @@ class GitHubDiscoveryAdapter:
             "/search/repositories",
             params={
                 "q": query,
-                "per_page": min(max_results, 100),
+                # GitHub sorts by popularity; keep the original wide
+                # retrieval window so low-star MCP repositories are not
+                # excluded before classification.
+                "per_page": min(max(max_results, 30), 100),
                 "page": 1,
             },
         )
@@ -168,19 +193,17 @@ class GitHubDiscoveryAdapter:
 
     async def discover_mcp(
         self,
+        query: str = "MCP server",
         max_results: int = DEFAULT_MAX_RESULTS,
     ) -> list[GitHubCandidate]:
-        return await self.discover(
-            '"MCP server" OR "Model Context Protocol"',
-            max_results,
-        )
+        """Search repositories for MCP servers matching `query`.
 
-    async def discover_a2a(
-        self,
-        max_results: int = DEFAULT_MAX_RESULTS,
-    ) -> list[GitHubCandidate]:
+        The query is normalized through `github_mcp_search_query`, so a
+        service query ("Slack") searches "slack mcp" while a generic
+        sweep ("MCP server") stays a broad MCP repository search.
+        """
         return await self.discover(
-            '"A2A agent" OR "Agent Card"',
+            github_mcp_search_query(query),
             max_results,
         )
 

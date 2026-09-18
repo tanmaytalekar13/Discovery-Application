@@ -43,7 +43,6 @@ MCPResolver = Callable[
     | list[dict[str, Any]]
     | None,
 ]
-A2AResolver = Callable[[CandidateReference], Awaitable[dict[str, Any]] | dict[str, Any]]
 
 
 class CandidateRejected(Exception):
@@ -67,13 +66,11 @@ class Phase10Pipeline:
         settings: Settings,
         *,
         mcp_resolver: MCPResolver | None = None,
-        a2a_resolver: A2AResolver | None = None,
         embedder: LocalEmbeddingModel | None = None,
     ) -> None:
         self.repository = repository
         self.settings = settings
         self.mcp_resolver = mcp_resolver
-        self.a2a_resolver = a2a_resolver
         self.embedder = embedder or LocalEmbeddingModel(settings.embedding_dimensions)
 
     async def process(
@@ -132,8 +129,9 @@ class Phase10Pipeline:
         )
 
     async def _normalize_candidate(self, candidate: CandidateReference) -> list[Item]:
-        if candidate.protocol == "a2a":
-            return [await self._normalize_a2a(candidate)]
+        # The product discovers only MCP servers. A2A-classified candidates
+        # (GitHub repos whose evidence points at Agent Cards) are cleanly
+        # rejected here - never presented as MCP servers, never fabricated.
         if candidate.protocol == "mcp":
             await self._reject_oversized_package(candidate)
             return await self._normalize_mcp(candidate)
@@ -195,76 +193,6 @@ class Phase10Pipeline:
                     f"pypi limit {PYPI_DEPENDENCY_LIMIT} dependencies)"
                 ],
             )
-
-    async def _normalize_a2a(self, candidate: CandidateReference) -> Item:
-        resolution = self._extract_a2a_resolution(candidate)
-        if resolution is None and self.a2a_resolver is not None:
-            resolution = await _maybe_await(self.a2a_resolver(candidate))
-        if resolution is None:
-            resolution = await self._resolve_a2a_with_existing_client(candidate)
-        if not resolution:
-            raise CandidateRejected(
-                "A2A Agent Card could not be resolved and validated",
-                list(candidate.evidence) or ["no Agent Card resolution available"],
-            )
-
-        agent = resolution.get("agent") or {}
-        endpoint = (
-            resolution.get("endpoint")
-            or agent.get("endpoint")
-            or str(candidate.url or "")
-        )
-        if not endpoint:
-            raise CandidateRejected(
-                "validated A2A Agent Card did not declare an endpoint"
-            )
-        card = resolution.get("raw_agent_card") or resolution.get("agent_card") or {}
-        identity = str(card.get("name") or candidate.source_id)
-        version = card.get("version") or resolution.get("protocol_version")
-        now = datetime.now(timezone.utc)
-        source = _source(candidate)
-        evidence = _evidence(
-            candidate, source, now, "discovery", list(candidate.evidence)
-        )
-        evidence.append(
-            _new_evidence(
-                candidate,
-                source,
-                now,
-                "protocol_validation",
-                "A2A Agent Card fetched and schema-validated",
-                {"protocol_version": resolution.get("protocol_version")},
-            )
-        )
-        canonical = canonical_identity(
-            candidate, {"agent_identity": identity, "endpoint": endpoint}
-        )
-        item = Item(
-            item_id=uuid5(NAMESPACE_URL, f"phase10:{canonical}"),
-            canonical_id=canonical,
-            type=ItemType.AGENT,
-            name=identity,
-            description=candidate.description or str(card.get("description") or ""),
-            source=source,
-            provenance=[source],
-            evidence=evidence,
-            version=version,
-            status=ItemStatus.ACTIVE,
-            reliability=Reliability(score=0.0, confidence=0.0),
-            discovery=DiscoveryMetadata(first_seen=now, last_seen=now, last_synced=now),
-            agent=AgentMetadata(
-                endpoint=endpoint,
-                agent_card=card,
-                skills=list(agent.get("skills") or []),
-                capabilities=list(agent.get("capabilities") or []),
-                declared_dependencies=list(agent.get("declared_dependencies") or []),
-            ),
-            artifacts=ArtifactMetadata(
-                source_available=bool(candidate.repository_url),
-                source_url=candidate.repository_url,
-            ),
-        )
-        return item
 
     async def _normalize_mcp(self, candidate: CandidateReference) -> list[Item]:
         resolution = None
@@ -400,50 +328,6 @@ class Phase10Pipeline:
             artifacts=_artifact_metadata(candidate),
         )
 
-    async def _resolve_a2a_with_existing_client(
-        self, candidate: CandidateReference
-    ) -> dict[str, Any] | None:
-        raw = candidate.raw_metadata.get("source_candidate")
-        target = None
-        card_path = "/.well-known/agent-card.json"
-        if (
-            raw is not None
-            and hasattr(raw, "agent_card_url")
-            and getattr(raw, "agent_card_url")
-        ):
-            target = getattr(raw, "agent_card_url")
-            card_path = ""
-        elif (
-            raw is not None
-            and hasattr(raw, "resolution")
-            and getattr(raw, "resolution")
-        ):
-            resolution = getattr(raw, "resolution")
-            return {
-                "endpoint": resolution.endpoint,
-                "protocol_version": resolution.protocol_version,
-                "raw_agent_card": resolution.raw_agent_card,
-                "agent": resolution.agent.model_dump(mode="json"),
-            }
-        else:
-            target = str(candidate.url or "")
-        if not target:
-            return None
-        from app.discovery.a2a.client import resolve_a2a_agent
-
-        try:
-            resolution = await resolve_a2a_agent(target, card_path=card_path)
-        except Exception as exc:
-            raise CandidateRejected(
-                "A2A Agent Card resolution failed", [str(exc)]
-            ) from exc
-        return {
-            "endpoint": resolution.endpoint,
-            "protocol_version": resolution.protocol_version,
-            "raw_agent_card": resolution.raw_agent_card,
-            "agent": resolution.agent.model_dump(mode="json"),
-        }
-
     async def _resolve_mcp_with_existing_client(
         self, candidate: CandidateReference
     ) -> dict[str, Any] | None:
@@ -466,21 +350,6 @@ class Phase10Pipeline:
         return {
             "server_info": resolved.server_info.__dict__,
             "tools": [tool.model_dump(mode="json") for tool in resolved.tools],
-        }
-
-    @staticmethod
-    def _extract_a2a_resolution(candidate: CandidateReference) -> dict[str, Any] | None:
-        raw = candidate.raw_metadata.get("source_candidate")
-        if raw is None or not hasattr(raw, "resolution"):
-            return None
-        resolution = getattr(raw, "resolution")
-        if resolution is None:
-            return None
-        return {
-            "endpoint": resolution.endpoint,
-            "protocol_version": resolution.protocol_version,
-            "raw_agent_card": resolution.raw_agent_card,
-            "agent": resolution.agent.model_dump(mode="json"),
         }
 
     @staticmethod
