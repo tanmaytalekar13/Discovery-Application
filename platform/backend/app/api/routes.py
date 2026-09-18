@@ -69,10 +69,18 @@ async def search(
     # registry; never blocks or fails the search response itself), then
     # the presentation order: official > verified > everything else
     # (stable within tiers - the ranking engine's score order holds).
-    from app.verification.bridge import attach_verification_badges, order_results_by_tier
+    from app.verification.bridge import (
+        attach_verification_badges,
+        count_badge_tiers,
+        order_results_by_tier,
+    )
 
     await attach_verification_badges(rows)
     rows = order_results_by_tier(rows)
+    # Shortlist breakdown by provenance, matching what the cards show:
+    # McpServer-registry badges for 'verified', official directory
+    # provenance for 'official'.
+    verified_count, official_count = count_badge_tiers(rows)
 
     tools = [
         SearchToolItem(
@@ -101,6 +109,9 @@ async def search(
             live_candidates=result.metadata.live_candidates,
             approved_count=result.metadata.approved_count,
             rejected_count=result.metadata.rejected_count,
+            verified_count=verified_count,
+            official_count=official_count,
+            db_fallback=result.metadata.db_fallback,
             plan=result.ranked.plan,
         ),
     )

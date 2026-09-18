@@ -19,14 +19,10 @@ from app.reliability.engine import evaluate
 class FakeRepository:
     def __init__(self):
         self.items = []
-        self.rejections = []
 
     async def upsert_catalog_item(self, item, evaluation):
         self.items.append((item, evaluation))
         return item
-
-    async def persist_rejection(self, rejection):
-        self.rejections.append(rejection)
 
 
 def candidate(protocol="a2a"):
@@ -44,7 +40,8 @@ def candidate(protocol="a2a"):
 
 
 @pytest.mark.asyncio
-async def test_phase10_rejects_unvalidated_mcp_and_persists_rejection_evidence():
+async def test_phase10_rejects_unvalidated_mcp_and_reports_rejection_evidence():
+    """Rejections stay in the pipeline result; nothing is written to the DB."""
     repo = FakeRepository()
     settings = Settings(
         arcadedb_host="localhost", arcadedb_database="test", arcadedb_user="root", arcadedb_password="root"
@@ -52,8 +49,9 @@ async def test_phase10_rejects_unvalidated_mcp_and_persists_rejection_evidence()
     result = await Phase10Pipeline(repo, settings).process([candidate("mcp")])
     assert not result.approved
     assert len(result.rejected) == 1
-    assert repo.rejections[0].evidence
-    assert "MCP Registry metadata alone" in " ".join(repo.rejections[0].evidence)
+    assert result.rejected[0].evidence
+    assert "MCP Registry metadata alone" in " ".join(result.rejected[0].evidence)
+    assert repo.items == []  # rejection was not persisted as an Item either
 
 
 @pytest.mark.asyncio

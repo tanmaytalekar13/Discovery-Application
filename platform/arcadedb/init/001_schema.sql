@@ -96,63 +96,15 @@ CREATE INDEX ON TestRun (run_id) UNIQUE;
 
 
 -- ============================================================
--- Phase 10 discovery provenance/evidence
+-- Phase 10 provenance/evidence (removed)
+--
+-- The DiscoverySource / DiscoveryEvidence / ReliabilityEvaluation /
+-- DiscoveryRejection vertex types were write-only: nothing in the
+-- codebase ever read them back. All of that data is already denormalized
+-- onto the Item vertex (provenance / evidence_summary / reliability_*).
+-- See app/db/prune_unused_types.py to drop them from an existing
+-- database.
 -- ============================================================
-
-CREATE VERTEX TYPE DiscoverySource;
-CREATE PROPERTY DiscoverySource.source_key STRING;
-CREATE PROPERTY DiscoverySource.source_type STRING;
-CREATE PROPERTY DiscoverySource.source_id STRING;
-CREATE PROPERTY DiscoverySource.source_url STRING;
-CREATE PROPERTY DiscoverySource.provider STRING;
-CREATE PROPERTY DiscoverySource.first_seen DATETIME;
-CREATE PROPERTY DiscoverySource.last_seen DATETIME;
-CREATE INDEX ON DiscoverySource (source_key) UNIQUE;
-
-CREATE VERTEX TYPE DiscoveryEvidence;
-CREATE PROPERTY DiscoveryEvidence.evidence_id STRING;
-CREATE PROPERTY DiscoveryEvidence.item_id STRING;
-CREATE PROPERTY DiscoveryEvidence.kind STRING;
-CREATE PROPERTY DiscoveryEvidence.statement STRING;
-CREATE PROPERTY DiscoveryEvidence.source_type STRING;
-CREATE PROPERTY DiscoveryEvidence.source_id STRING;
-CREATE PROPERTY DiscoveryEvidence.source_url STRING;
-CREATE PROPERTY DiscoveryEvidence.provider STRING;
-CREATE PROPERTY DiscoveryEvidence.observed_at DATETIME;
-CREATE PROPERTY DiscoveryEvidence.details MAP;
-CREATE INDEX ON DiscoveryEvidence (evidence_id) UNIQUE;
-
-CREATE VERTEX TYPE ReliabilityEvaluation;
-CREATE PROPERTY ReliabilityEvaluation.evaluation_id STRING;
-CREATE PROPERTY ReliabilityEvaluation.item_id STRING;
-CREATE PROPERTY ReliabilityEvaluation.score DOUBLE;
-CREATE PROPERTY ReliabilityEvaluation.confidence DOUBLE;
-CREATE PROPERTY ReliabilityEvaluation.scoring_version STRING;
-CREATE PROPERTY ReliabilityEvaluation.approved BOOLEAN;
-CREATE PROPERTY ReliabilityEvaluation.signals MAP;
-CREATE PROPERTY ReliabilityEvaluation.reasons LIST;
-CREATE PROPERTY ReliabilityEvaluation.security_validation DOUBLE;
-CREATE PROPERTY ReliabilityEvaluation.evaluated_at DATETIME;
-CREATE INDEX ON ReliabilityEvaluation (evaluation_id) UNIQUE;
-
-CREATE VERTEX TYPE DiscoveryRejection;
-CREATE PROPERTY DiscoveryRejection.rejection_id STRING;
-CREATE PROPERTY DiscoveryRejection.candidate_id STRING;
-CREATE PROPERTY DiscoveryRejection.item_id STRING;
-CREATE PROPERTY DiscoveryRejection.protocol STRING;
-CREATE PROPERTY DiscoveryRejection.source_type STRING;
-CREATE PROPERTY DiscoveryRejection.source_id STRING;
-CREATE PROPERTY DiscoveryRejection.source_url STRING;
-CREATE PROPERTY DiscoveryRejection.provider STRING;
-CREATE PROPERTY DiscoveryRejection.reason STRING;
-CREATE PROPERTY DiscoveryRejection.evidence LIST;
-CREATE PROPERTY DiscoveryRejection.details MAP;
-CREATE PROPERTY DiscoveryRejection.observed_at DATETIME;
-CREATE INDEX ON DiscoveryRejection (rejection_id) UNIQUE;
-
-CREATE EDGE TYPE HAS_DISCOVERY_SOURCE;
-CREATE EDGE TYPE HAS_DISCOVERY_EVIDENCE;
-CREATE EDGE TYPE HAS_RELIABILITY_EVALUATION;
 
 -- ============================================================
 -- MCP Server Verification registry (spec v2, Sections 2-12)

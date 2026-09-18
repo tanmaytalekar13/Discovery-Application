@@ -8,8 +8,12 @@ function here; workers only read `pending`/`retry_pending` records and
 write results back through the repository.
 
 Three loops:
-- verification workers: drain `pending` / `retry_pending` servers;
-- TTL re-verification: requeue expired `verified` records (Section 11);
+- verification workers: drain `pending` / `retry_pending` servers, then
+  re-attempt `review` records that still have attempts left, and
+  re-verify expired-TTL `verified` records (Section 11);
+- TTL re-verification: reset the attempt counter on expired `verified`
+  records (Section 11) so the worker loop re-verifies them while they
+  keep serving their last known (stale-but-available) status;
 - cold-miss cascade: registry -> GitHub discovery for search misses (9.1).
 """
 
@@ -28,6 +32,7 @@ from app.discovery.mcp_registry.client import MCPRegistryClient
 from app.verification.ingestion import VerificationIngestionService
 from app.verification.models import (
     ColdMissQueryRecord,
+    McpServerRecord,
     ServerStatus,
 )
 from app.verification.prefilter import prefilter_server, prefilter_server_with_size
@@ -170,15 +175,81 @@ async def _ingest_candidate(
 # ---------------------------------------------------------------------------
 
 
+def _due_for_attempt(record: McpServerRecord, now: datetime) -> bool:
+    """Retry-schedule eligibility (Section 5.2/6: now / +1h / +6h).
+
+    A record is due when its backoff window since the last attempt has
+    elapsed. Records never attempted are immediately due. An unreadable
+    timestamp fails open so a malformed stamp cannot strand a record
+    forever.
+    """
+    last = record.last_attempt_at
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(str(last))
+    except ValueError:
+        return True
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+    required = next_retry_delay(record.attempts_completed)
+    return (now - last_dt).total_seconds() >= required
+
+
 async def process_next_server(handles: WorkerHandles) -> bool:
-    """Verify one pending/retry-pending server; True when work was done."""
-    candidates = await handles.servers.list_status(
+    """Verify one eligible server; True when work was done.
+
+    Eligibility, in priority order:
+      1. `pending` (fresh work, incl. user-requested rechecks);
+      2. `retry_pending` whose backoff window has elapsed;
+      3. expired-TTL `verified` records (Section 11 re-verification:
+         they keep serving their stale status while being re-checked);
+      4. `review` records that still have attempts left (the scorer's
+         "score >= 80 but low confidence -> needs another retry pass"
+         bucket). Without this, a remote server verified on quality in
+         its first attempt but planned for 3 (auth ambiguity) would sit
+         in `review` forever and never earn the verified badge.
+
+    Attempts-exhausted `review` records are NOT auto-retried - they
+    belong to the human review queue (Section 10). Without that guard a
+    permanently mid-score server would be re-verified in a tight loop
+    forever.
+    """
+    now = datetime.now(timezone.utc)
+
+    record = None
+    queued = await handles.servers.list_status(
         ServerStatus.PENDING.value, ServerStatus.RETRY_PENDING.value, limit=5
     )
-    if not candidates:
-        return False
+    for candidate in queued:
+        if candidate.status.value == ServerStatus.PENDING.value:
+            record = candidate
+            break
+        if _due_for_attempt(candidate, now):
+            record = candidate
+            break
 
-    record = candidates[0]
+    if record is None:
+        expired = await handles.servers.list_expired_ttl(
+            now_iso=now.isoformat(), limit=1
+        )
+        if expired:
+            record = expired[0]
+
+    if record is None:
+        reviewing = await handles.servers.list_status(
+            ServerStatus.REVIEW.value, limit=20
+        )
+        for candidate in reviewing:
+            if (
+                candidate.attempts_completed < candidate.attempts_planned
+                and _due_for_attempt(candidate, now)
+            ):
+                record = candidate
+                break
+
+    if record is None:
+        return False
 
     # Prefilter re-check (cheap, catches records enqueued before a
     # prefilter rule change).
@@ -210,37 +281,12 @@ async def process_next_server(handles: WorkerHandles) -> bool:
     return True
 
 
-async def _apply_remote_retry_backoff(handles: WorkerHandles) -> None:
-    """Hold retry_pending remote records across time windows (now/+1h/+6h)."""
-    retrying = await handles.servers.list_status(ServerStatus.RETRY_PENDING.value, limit=50)
-    now = datetime.now(timezone.utc)
-    for record in retrying:
-        if record.transport.value != "remote":
-            continue
-        last = record.last_attempt_at
-        if not last:
-            continue
-        try:
-            last_dt = datetime.fromisoformat(str(last))
-        except ValueError:
-            continue
-        if last_dt.tzinfo is None:
-            last_dt = last_dt.replace(tzinfo=timezone.utc)
-        required = next_retry_delay(record.attempts_completed)
-        if (now - last_dt).total_seconds() < required:
-            # Not yet due - push the next attempt out by re-stamping
-            # last_attempt_at is wrong; instead leave untouched and let
-            # the poll loop skip by re-checking here each cycle.
-            continue
-
-
 async def verification_loop(handles: WorkerHandles) -> None:
     logger.info("Verification worker loop started (interval=%ss)", handles.poll_interval_s)
     while True:
         try:
             did_work = await process_next_server(handles)
             if not did_work:
-                await _apply_remote_retry_backoff(handles)
                 await asyncio.sleep(handles.poll_interval_s)
         except asyncio.CancelledError:
             raise
@@ -255,12 +301,16 @@ async def verification_loop(handles: WorkerHandles) -> None:
 
 
 async def requeue_expired_ttl(handles: WorkerHandles) -> int:
+    """Reset attempts on expired `verified` records (Section 11).
+
+    The record keeps serving its last known status (stale-but-available)
+    while the verification worker loop re-verifies it: these records are
+    now also part of `process_next_server` eligibility, so the attempt
+    reset is what actually re-enqueues them.
+    """
     expired = await handles.servers.list_expired_ttl()
     count = 0
     for record in expired:
-        # Keep serving the last known status (stale-but-available): the
-        # record stays `verified` in search until re-verification
-        # completes and overwrites it. Reset attempts for a fresh cycle.
         await handles.servers.update(record.server_id, {
             "attempts_completed": 0,
         })

@@ -113,6 +113,13 @@ export interface SearchMetadata {
   live_candidates: number;
   approved_count: number;
   rejected_count: number;
+  /** Verified (non-official) servers in the final shortlist. */
+  verified_count?: number;
+  /** Official vendor connectors in the final shortlist. */
+  official_count?: number;
+  /** True when live discovery failed and results were served from the
+   * durable DB catalog (official + verified servers). */
+  db_fallback?: boolean;
   plan?: QueryPlan;
 }
 

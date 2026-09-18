@@ -22,6 +22,13 @@ class SearchMetadata(BaseModel):
     live_candidates: int = 0
     approved_count: int = 0
     rejected_count: int = 0
+    # Shortlist breakdown by provenance: catalog-verified servers
+    # (excluding official) and official vendor connectors.
+    verified_count: int = 0
+    official_count: int = 0
+    # True when live discovery failed/was empty and the response was
+    # served from the durable DB catalog (official + verified servers).
+    db_fallback: bool = False
     plan: QueryPlan | None = None
 
 

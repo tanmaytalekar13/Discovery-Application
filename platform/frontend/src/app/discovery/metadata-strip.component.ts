@@ -22,9 +22,24 @@ import { SearchMetadata, DiscoveryError } from './models';
       <!-- Counts row -->
       @if (metadata && !loading) {
         <div class="counts-area">
-          <span class="count-item">
-            <strong>{{ metadata.cached_results }}</strong> cached
+          <span class="count-item" title="Results served from the durable database catalog (official + verified servers)">
+            <strong>{{ metadata.cached_results }}</strong> in DB
           </span>
+          @if (verifiedCount > 0) {
+            <span class="count-sep">·</span>
+            <span class="count-item count-item--verified" title="Verified servers in this result set">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+              <strong>{{ verifiedCount }}</strong> verified
+            </span>
+          }
+          @if (officialCount > 0) {
+            <span class="count-sep">·</span>
+            <span class="count-item count-item--official" title="Official vendor connectors in this result set">
+              <strong>{{ officialCount }}</strong> official
+            </span>
+          }
           @if (metadata.live_candidates > 0) {
             <span class="count-sep">·</span>
             <span class="count-item">
@@ -78,6 +93,18 @@ import { SearchMetadata, DiscoveryError } from './models';
             }
           </div>
         </div>
+      }
+
+      <!-- DB fallback note (durable catalog served instead of live discovery) -->
+      @if (metadata && !loading && metadata.db_fallback) {
+        <p class="fallback-note fallback-note--db">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
+            <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
+            <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
+          </svg>
+          Live discovery unavailable — showing official &amp; verified servers stored in the database.
+        </p>
       }
 
       <!-- Fallback note -->
@@ -152,6 +179,12 @@ import { SearchMetadata, DiscoveryError } from './models';
         color: var(--color-text);
         font-weight: 700;
       }
+      .count-item--verified {
+        color: #15803d;
+      }
+      .count-item--official {
+        color: #1d4ed8;
+      }
       .count-sep {
         opacity: 0.4;
       }
@@ -213,6 +246,11 @@ import { SearchMetadata, DiscoveryError } from './models';
         font-style: normal;
         font-weight: 600;
       }
+      .fallback-note--db {
+        background: #dbeafe;
+        border-top-color: #bfdbfe;
+        color: #1d4ed8;
+      }
     `,
   ],
 })
@@ -221,12 +259,25 @@ export class MetadataStripComponent {
   @Input() error: DiscoveryError | null = null;
   @Input() loading = false;
 
+  /** Verified (non-official) servers in the final shortlist. Falls back to
+   * counting badges on results when the backend predates verified_count. */
+  get verifiedCount(): number {
+    if (!this.metadata) return 0;
+    return this.metadata.verified_count ?? 0;
+  }
+
+  /** Official vendor connectors in the final shortlist. */
+  get officialCount(): number {
+    if (!this.metadata) return 0;
+    return this.metadata.official_count ?? 0;
+  }
+
   get modeLabel(): string {
     if (!this.metadata) return '';
     const labels: Record<string, string> = {
-      cached: 'Cached',
+      cached: 'DB',
       live: 'Live',
-      merged: 'Cached + Live',
+      merged: 'DB + Live',
     };
     return labels[this.metadata.mode] ?? this.metadata.mode;
   }

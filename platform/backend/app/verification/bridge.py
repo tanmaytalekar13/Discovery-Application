@@ -237,6 +237,103 @@ def _result_tier(row: Any) -> int:
     return TIER_UNVERIFIED
 
 
+def count_badge_tiers(rows: list[Any]) -> tuple[int, int]:
+    """(verified_count, official_count) over the final shortlist.
+
+    Counts what the cards actually show: a row is 'verified' when the
+    bridge attached a verified badge from the McpServer registry, and
+    'official' when its provenance carries the official directory
+    provider. Kept next to `_result_tier` so the two definitions can
+    never drift apart.
+    """
+    verified = official = 0
+    for row in rows:
+        tier = _result_tier(row)
+        if tier == TIER_OFFICIAL:
+            official += 1
+        elif tier == TIER_VERIFIED:
+            verified += 1
+    return verified, official
+
+
+async def verified_catalog_keys(items: list[Any]) -> set[str]:
+    """Identity keys of items that hold a McpServer verified badge.
+
+    The Item catalog stores every reliability-approved discovery hit
+    (registry metadata alone can earn protocol evidence without a real
+    handshake), so "in the catalog" does NOT mean "verified". This is the
+    cache gate: a cached item may surface in search only when its server
+    also exists in the McpServer registry with status=verified (the same
+    records the pipeline, auth flows, user tests, and manual review
+    write). Matching mirrors the badge lookup: source_url exact,
+    registry_name, and canonical owner/repo identity; official connectors
+    are never filtered (their identity may legitimately have no
+    McpServer row). Best-effort: on any registry failure the gate opens
+    (returns everything) - search must never break.
+    """
+    if not items:
+        return set()
+    repo = _repo()
+    if repo is None:
+        return set()
+
+    from app.verification.ingestion import normalize_repo_identity
+
+    source_urls: list[str] = []
+    registry_names: list[str] = []
+    repo_identities: list[str] = []
+    for item in items:
+        urls, names, identities = _item_identities(item)
+        source_urls.extend(urls)
+        registry_names.extend(names)
+        repo_identities.extend(identities)
+
+    try:
+        rows = await _fetch_badge_rows(
+            repo,
+            source_urls=sorted(set(source_urls)),
+            registry_names=sorted(set(registry_names)),
+            repo_identities=sorted(set(repo_identities)),
+        )
+    except Exception:  # noqa: BLE001 - search must never fail on badge lookup
+        logger.warning(
+            "Verified-catalog gate lookup failed; serving catalog unfiltered",
+            exc_info=True,
+        )
+        return {
+            item.canonical_id or str(getattr(item, "item_id", idx))
+            for idx, item in enumerate(items)
+        }
+
+    return {
+        item.canonical_id or str(getattr(item, "item_id", idx))
+        for idx, item in enumerate(items)
+        if _item_matches_badge_row(item, rows, normalize_repo_identity)
+    }
+
+
+def _item_matches_badge_row(
+    item: Any,
+    rows: list[dict[str, Any]],
+    normalize_repo_identity,
+) -> bool:
+    """True when any verified-badge row matches the item's identities."""
+    urls, names, identities = _item_identities(item)
+    for row in rows:
+        if not row.get("verified_badge"):
+            continue
+        row_url = row.get("source_url")
+        if row_url and row_url in urls:
+            return True
+        row_name = row.get("registry_name")
+        if row_name and row_name in names:
+            return True
+        row_identity = normalize_repo_identity(row.get("repository_url"))
+        if row_identity and row_identity in identities:
+            return True
+    return False
+
+
 def order_results_by_tier(rows: list[Any]) -> list[Any]:
     """Order search rows: official first, then verified, then the rest.
 

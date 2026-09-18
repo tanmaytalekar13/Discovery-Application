@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from app.db.client import ArcadeDBClient
-from app.models import DiscoveryEvidence, DiscoverySource, Item, TestRun
+from app.models import Item, TestRun
 
 
 def _make_serializable(obj: Any, max_depth: int = 10, current_depth: int = 0) -> Any:
@@ -74,18 +74,11 @@ class ItemRepository:
     ALLOWED_EDGE_TYPES = {
         "USES_TOOL",
         "HAS_TEST_RUN",
-        "HAS_DISCOVERY_SOURCE",
-        "HAS_DISCOVERY_EVIDENCE",
-        "HAS_RELIABILITY_EVALUATION",
     }
 
     ALLOWED_VERTEX_TYPES = {
         "Item",
         "TestRun",
-        "DiscoverySource",
-        "DiscoveryEvidence",
-        "ReliabilityEvaluation",
-        "DiscoveryRejection",
     }
 
     ALLOWED_UPDATE_FIELDS = {
@@ -306,7 +299,8 @@ class ItemRepository:
         return await self.update(item_id, {"embedding": embedding})
 
     async def upsert_catalog_item(self, item: Item, evaluation: Any) -> Item:
-        """Persist an approved canonical Item and all Phase 10 provenance/evidence."""
+        """Persist an approved canonical Item (reliability is denormalized
+        onto the vertex; see the Phase 10 provenance note in the schema)."""
         existing = await self.get(item.item_id)
         payload = {
             "item_id": str(item.item_id),
@@ -348,160 +342,7 @@ class ItemRepository:
                 if key in self.ALLOWED_UPDATE_FIELDS
             }
             await self.update(item.item_id, updates)
-        item_rid = await self._get_record_rid("Item", "item_id", item.item_id)
-        for source in item.provenance:
-            source_key = (
-                f"{source.type.value}|{source.id}|{source.url}|{source.provider}"
-            )
-            await self._upsert_source(
-                item_rid, source_key, source, item.discovery.last_seen
-            )
-        for evidence in item.evidence:
-            await self._upsert_evidence(item_rid, item.item_id, evidence)
-        await self._upsert_reliability_evaluation(item_rid, item.item_id, evaluation)
         return item
-
-    async def _upsert_source(
-        self,
-        item_rid: str,
-        source_key: str,
-        source: DiscoverySource,
-        observed_at: datetime,
-    ) -> None:
-        found = await self._db.command(
-            "sql",
-            "SELECT FROM DiscoverySource WHERE source_key = :source_key LIMIT 1",
-            {"source_key": source_key},
-        )
-        rows = found.get("result", [])
-        if rows:
-            source_rid = str(rows[0]["@rid"])
-            await self._db.command(
-                "sql",
-                "UPDATE DiscoverySource SET last_seen = :last_seen WHERE source_key = :source_key",
-                {
-                    "source_key": source_key,
-                    "last_seen": _prepare_value(observed_at),
-                },
-            )
-        else:
-            payload = {
-                "source_key": source_key,
-                "source_type": source.type.value,
-                "source_id": source.id,
-                "source_url": str(source.url) if source.url else None,
-                "provider": source.provider,
-                "first_seen": _prepare_value(observed_at),
-                "last_seen": _prepare_value(observed_at),
-            }
-            await self._db.command(
-                "sql",
-                "CREATE VERTEX DiscoverySource CONTENT :payload",
-                {"payload": payload},
-            )
-            source_rid = await self._get_record_rid(
-                "DiscoverySource", "source_key", source_key
-            )
-        await self._db.command(
-            "sql",
-            f"CREATE EDGE HAS_DISCOVERY_SOURCE FROM {item_rid} TO {source_rid} IF NOT EXISTS",
-        )
-
-    async def _upsert_evidence(
-        self, item_rid: str, item_id: UUID, evidence: DiscoveryEvidence
-    ) -> None:
-        evidence_id = str(evidence.evidence_id)
-        found = await self._db.command(
-            "sql",
-            "SELECT FROM DiscoveryEvidence WHERE evidence_id = :evidence_id LIMIT 1",
-            {"evidence_id": evidence_id},
-        )
-        rows = found.get("result", [])
-        if rows:
-            evidence_rid = str(rows[0]["@rid"])
-        else:
-            payload = {
-                "evidence_id": evidence_id,
-                "item_id": str(item_id),
-                "kind": evidence.kind,
-                "statement": evidence.statement,
-                "source_type": evidence.source.type.value,
-                "source_id": evidence.source.id,
-                "source_url": str(evidence.source.url) if evidence.source.url else None,
-                "provider": evidence.source.provider,
-                "observed_at": _prepare_value(evidence.observed_at),
-                "details": evidence.details,
-            }
-            await self._db.command(
-                "sql",
-                "CREATE VERTEX DiscoveryEvidence CONTENT :payload",
-                {"payload": payload},
-            )
-            evidence_rid = await self._get_record_rid(
-                "DiscoveryEvidence", "evidence_id", evidence_id
-            )
-        await self._db.command(
-            "sql",
-            f"CREATE EDGE HAS_DISCOVERY_EVIDENCE FROM {item_rid} TO {evidence_rid} IF NOT EXISTS",
-        )
-
-    async def _upsert_reliability_evaluation(
-        self, item_rid: str, item_id: UUID, evaluation: Any
-    ) -> None:
-        evaluation_id = str(uuid4())
-        payload = {
-            "evaluation_id": evaluation_id,
-            "item_id": str(item_id),
-            "score": evaluation.score,
-            "confidence": evaluation.confidence,
-            "scoring_version": "v1",
-            "approved": evaluation.approved,
-            "signals": evaluation.signals,
-            "reasons": evaluation.reasons,
-            "security_validation": evaluation.security_validation,
-            "evaluated_at": datetime.now().isoformat(),
-        }
-        await self._db.command(
-            "sql",
-            "CREATE VERTEX ReliabilityEvaluation CONTENT :payload",
-            {"payload": payload},
-        )
-        evaluation_rid = await self._get_record_rid(
-            "ReliabilityEvaluation", "evaluation_id", evaluation_id
-        )
-        await self._db.command(
-            "sql",
-            f"CREATE EDGE HAS_RELIABILITY_EVALUATION FROM {item_rid} TO {evaluation_rid} IF NOT EXISTS",
-        )
-
-    async def persist_rejection(self, rejection: Any) -> None:
-        """Persist a DiscoveryRejection vertex for an item/candidate that failed discovery."""
-        payload = {
-            "rejection_id": str(uuid4()),
-            "candidate_id": str(rejection.candidate_id),
-            "item_id": str(rejection.item_id) if rejection.item_id else None,
-            "protocol": rejection.protocol,
-            "source_type": rejection.source.type.value,
-            "source_id": rejection.source.id,
-            "source_url": str(rejection.source.url) if rejection.source.url else None,
-            "provider": rejection.source.provider,
-            "reason": rejection.reason,
-            "evidence": (
-                rejection.evidence if isinstance(rejection.evidence, list) else []
-            ),
-            "details": (
-                _make_serializable(rejection.details) if rejection.details else {}
-            ),
-            "observed_at": _prepare_value(rejection.observed_at),
-        }
-        # Ensure the entire payload is JSON serializable
-        payload = _make_serializable(payload)
-
-        await self._db.command(
-            "sql",
-            "CREATE VERTEX DiscoveryRejection CONTENT :payload",
-            {"payload": payload},
-        )
 
     async def _get_record_rid(
         self, record_type: str, field: str, value: UUID | str

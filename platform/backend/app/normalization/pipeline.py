@@ -56,9 +56,9 @@ class CandidateRejected(Exception):
 class Phase10Pipeline:
     """Phase 10 boundary: resolve -> normalize -> deduplicate -> score -> persist.
 
-    Discovery candidates remain untrusted until protocol resolution succeeds. Every
-    rejection is retained as evidence, while only reliability-approved items enter
-    the Item catalog.
+    Discovery rejections are returned in the result only; nothing is
+    persisted to the DB (the write-only DiscoveryRejection vertex was
+    removed).
     """
 
     def __init__(
@@ -69,14 +69,12 @@ class Phase10Pipeline:
         mcp_resolver: MCPResolver | None = None,
         a2a_resolver: A2AResolver | None = None,
         embedder: LocalEmbeddingModel | None = None,
-        persist_rejections: bool = True,
     ) -> None:
         self.repository = repository
         self.settings = settings
         self.mcp_resolver = mcp_resolver
         self.a2a_resolver = a2a_resolver
         self.embedder = embedder or LocalEmbeddingModel(settings.embedding_dimensions)
-        self.persist_rejections = persist_rejections
 
     async def process(
         self, candidates: list[CandidateReference] | tuple[CandidateReference, ...]
@@ -95,15 +93,11 @@ class Phase10Pipeline:
                     candidate, exc.reason, exc.evidence
                 )
                 rejected.append(rejection)
-                if self.persist_rejections:
-                    await self.repository.persist_rejection(rejection)
             except Exception as exc:
                 rejection = Rejection.from_candidate(
                     candidate, "unexpected normalization/resolution failure", [str(exc)]
                 )
                 rejected.append(rejection)
-                if self.persist_rejections:
-                    await self.repository.persist_rejection(rejection)
 
         deduplicated = self._deduplicate(approved)
         persisted: list[Item] = []
@@ -123,8 +117,6 @@ class Phase10Pipeline:
                     evaluation.reasons,
                 )
                 rejected.append(rejection)
-                if self.persist_rejections:
-                    await self.repository.persist_rejection(rejection)
                 continue
             if item.embedding is None:
                 item.embedding = self.embedder.embed_item(item)

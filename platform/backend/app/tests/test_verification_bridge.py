@@ -16,8 +16,10 @@ import pytest
 from app.models import DiscoverySource, Item, Reliability, DiscoveryMetadata, SourceType
 from app.verification.bridge import (
     attach_verification_badges,
+    count_badge_tiers,
     order_results_by_tier,
     record_user_verified_success,
+    verified_catalog_keys,
 )
 from app.verification.models import McpServerRecord, ServerStatus, Transport
 
@@ -303,6 +305,94 @@ class TestTierOrdering:
 
         ordered = order_results_by_tier([verified, official_unverified])
         assert ordered[0].item.name == "Official Only"
+
+    def test_count_badge_tiers_matches_card_view(self):
+        """count_badge_tiers reports the same tiers the ordering applies."""
+        plain = _result(_make_item(name="PlainMirror"))
+        v1 = _result(_make_item(name="VerifiedOne"))
+        v1.verification = {
+            "verified_badge": True, "verified_via_auth": False,
+            "last_verified_via": "user_test", "status": "verified",
+            "quality_score": 90, "invocation_verified": True,
+        }
+        v2 = _result(_make_item(name="VerifiedTwo"))
+        v2.verification = dict(v1.verification)
+        official = _result(_official_item("Official: Tavily"))
+
+        verified_count, official_count = count_badge_tiers(
+            [plain, v1, v2, official]
+        )
+
+        assert verified_count == 2
+        assert official_count == 1
+
+
+# ---------------------------------------------------------------------------
+# verified_catalog_keys: the cache gate (verified badge -> catalog key)
+# ---------------------------------------------------------------------------
+
+
+class TestVerifiedCatalogKeys:
+    @pytest.mark.asyncio
+    async def test_badged_server_key_is_included(self, monkeypatch):
+        repo = FakeVerificationRepo()
+        repo.add(_make_row_record(
+            "https://registry.example/tavily",
+            registry_name="io.github.tavily-ai/tavily-mcp",
+        ))
+        monkeypatch.setattr("app.verification.bridge._repo", lambda: repo)
+
+        item = _make_item()
+        keys = await verified_catalog_keys([item])
+
+        assert str(item.item_id) in keys
+
+    @pytest.mark.asyncio
+    async def test_unbadged_server_key_is_excluded(self, monkeypatch):
+        """A catalog row whose server never earned a badge must NOT be
+        counted as cached-verified (the 4-vs-3 Tavily gap)."""
+        repo = FakeVerificationRepo()
+        repo.add(_make_row_record("https://registry.example/unrelated"))
+        monkeypatch.setattr("app.verification.bridge._repo", lambda: repo)
+
+        item = _make_item()
+        keys = await verified_catalog_keys([item])
+
+        assert keys == set()
+
+    @pytest.mark.asyncio
+    async def test_repo_missing_means_nothing_verified(self, monkeypatch):
+        """No verification registry -> nothing is verified; officials are
+        added by the search service, not here."""
+        monkeypatch.setattr("app.verification.bridge._repo", lambda: None)
+
+        item = _make_item()
+        assert await verified_catalog_keys([item]) == set()
+
+    @pytest.mark.asyncio
+    async def test_registry_failure_fails_open(self, monkeypatch):
+        """A DB outage must never blank the search page: serve the catalog
+        unfiltered (stale-but-available) instead."""
+        class ExplodingRepo:
+            async def select_badge_rows(self, **kwargs):
+                raise RuntimeError("db down")
+
+        monkeypatch.setattr(
+            "app.verification.bridge._repo", lambda: ExplodingRepo()
+        )
+
+        item = _make_item()
+        keys = await verified_catalog_keys([item])
+
+        assert str(item.item_id) in keys
+
+    @pytest.mark.asyncio
+    async def test_empty_items_short_circuits(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.verification.bridge._repo",
+            lambda: (_ for _ in ()).throw(AssertionError("repo must not be built")),
+        )
+        assert await verified_catalog_keys([]) == set()
 
 
 # ---------------------------------------------------------------------------

@@ -32,10 +32,6 @@ class FakeArcadeDB:
         self.commands: list[dict] = []
         self.item_records: dict[str, dict] = {}
         self.test_run_records: dict[str, dict] = {}
-        self.discovery_source_records: dict[str, dict] = {}
-        self.discovery_evidence_records: dict[str, dict] = {}
-        self.reliability_evaluation_records: dict[str, dict] = {}
-        self.discovery_rejection_records: dict[str, dict] = {}
         self.edges: list[dict] = []
 
     async def command(
@@ -105,45 +101,6 @@ class FakeArcadeDB:
             if run_id in self.test_run_records:
                 return {
                     "result": [{"@rid": f"#2:{run_id}"}],
-                }
-
-            return {
-                "result": [],
-            }
-
-        if normalized.startswith("SELECT @RID FROM DISCOVERYSOURCE"):
-            assert params is not None
-
-            source_key = str(params["value"])
-            if source_key in self.discovery_source_records:
-                return {
-                    "result": [{"@rid": f"#3:{source_key}"}],
-                }
-
-            return {
-                "result": [],
-            }
-
-        if normalized.startswith("SELECT @RID FROM DISCOVERYEVIDENCE"):
-            assert params is not None
-
-            evidence_id = str(params["value"])
-            if evidence_id in self.discovery_evidence_records:
-                return {
-                    "result": [{"@rid": f"#4:{evidence_id}"}],
-                }
-
-            return {
-                "result": [],
-            }
-
-        if normalized.startswith("SELECT @RID FROM RELIABILITYEVALUATION"):
-            assert params is not None
-
-            evaluation_id = str(params["value"])
-            if evaluation_id in self.reliability_evaluation_records:
-                return {
-                    "result": [{"@rid": f"#5:{evaluation_id}"}],
                 }
 
             return {
@@ -245,101 +202,6 @@ class FakeArcadeDB:
 
             return {
                 "count": 0,
-            }
-
-        # ----------------------------------------------------
-        # Phase 10 provenance/evidence vertices
-        # ----------------------------------------------------
-
-        if "CREATE VERTEX DISCOVERYSOURCE" in normalized:
-            assert params is not None
-
-            payload = params["payload"]
-            record = dict(payload)
-            self.discovery_source_records[str(payload["source_key"])] = record
-
-            return {
-                "result": [record],
-            }
-
-        if "SELECT FROM DISCOVERYSOURCE" in normalized:
-            assert params is not None
-
-            record = self.discovery_source_records.get(str(params["source_key"]))
-            if record is None:
-                return {
-                    "result": [],
-                }
-
-            return {
-                "result": [
-                    {
-                        **record,
-                        "@rid": f"#3:{record['source_key']}",
-                    }
-                ],
-            }
-
-        if "UPDATE DISCOVERYSOURCE" in normalized:
-            assert params is not None
-
-            record = self.discovery_source_records.get(str(params["source_key"]))
-            if record is not None:
-                record["last_seen"] = params["last_seen"]
-
-            return {
-                "result": [record] if record else [],
-            }
-
-        if "CREATE VERTEX DISCOVERYEVIDENCE" in normalized:
-            assert params is not None
-
-            payload = params["payload"]
-            record = dict(payload)
-            self.discovery_evidence_records[str(payload["evidence_id"])] = record
-
-            return {
-                "result": [record],
-            }
-
-        if "SELECT FROM DISCOVERYEVIDENCE" in normalized:
-            assert params is not None
-
-            record = self.discovery_evidence_records.get(str(params["evidence_id"]))
-            if record is None:
-                return {
-                    "result": [],
-                }
-
-            return {
-                "result": [
-                    {
-                        **record,
-                        "@rid": f"#4:{record['evidence_id']}",
-                    }
-                ],
-            }
-
-        if "CREATE VERTEX RELIABILITYEVALUATION" in normalized:
-            assert params is not None
-
-            payload = params["payload"]
-            record = dict(payload)
-            self.reliability_evaluation_records[str(payload["evaluation_id"])] = record
-
-            return {
-                "result": [record],
-            }
-
-        if "CREATE VERTEX DISCOVERYREJECTION" in normalized:
-            assert params is not None
-
-            payload = params["payload"]
-            record = dict(payload)
-            self.discovery_rejection_records[str(payload["rejection_id"])] = record
-
-            return {
-                "result": [record],
             }
 
         # ----------------------------------------------------
@@ -771,10 +633,12 @@ async def test_create_agent_item(
 
 
 @pytest.mark.asyncio
-async def test_upsert_catalog_item_persists_new_phase10_record(
+async def test_upsert_catalog_item_persists_new_item(
     fake_db: FakeArcadeDB,
     tool_item: Item,
 ) -> None:
+    """Upsert writes only the Item vertex - no provenance/evaluation side
+    vertices (those removed types were write-only and never read back)."""
     repository = ItemRepository(fake_db)
     tool_item.provenance = [tool_item.source]
 
@@ -791,20 +655,12 @@ async def test_upsert_catalog_item_persists_new_phase10_record(
     stored = fake_db.item_records[str(tool_item.item_id)]
     assert stored["item_id"] == str(tool_item.item_id)
     assert stored["name"] == "search_tracks"
-    assert fake_db.discovery_source_records
-    assert fake_db.reliability_evaluation_records
-
-    edge_commands = [edge["command"] for edge in fake_db.edges]
-    assert any(
-        "CREATE EDGE HAS_DISCOVERY_SOURCE" in command for command in edge_commands
-    )
-    assert any(
-        "CREATE EDGE HAS_RELIABILITY_EVALUATION" in command for command in edge_commands
-    )
+    assert stored["reliability_score"] == 0.91
+    assert fake_db.edges == []
 
 
 @pytest.mark.asyncio
-async def test_upsert_catalog_item_refreshes_existing_phase10_record(
+async def test_upsert_catalog_item_refreshes_existing_item(
     fake_db: FakeArcadeDB,
     tool_item: Item,
 ) -> None:
@@ -923,7 +779,7 @@ async def test_create_edge_rejects_unknown_edge(
 
 
 @pytest.mark.asyncio
-async def test_create_phase10_discovery_edge(
+async def test_create_phase10_edge_removed_types_rejected(
     fake_db: FakeArcadeDB,
     tool_item: Item,
 ) -> None:
@@ -931,28 +787,15 @@ async def test_create_phase10_discovery_edge(
 
     await repository.create(tool_item)
 
-    source_key = "mcp_registry|spotify-mcp-server|https://example.com/spotify-mcp|None"
-    fake_db.discovery_source_records[source_key] = {
-        "source_key": source_key,
-        "source_type": "mcp_registry",
-        "source_id": "spotify-mcp-server",
-        "source_url": "https://example.com/spotify-mcp",
-        "provider": None,
-        "first_seen": "2026-08-31T00:00:00+00:00",
-        "last_seen": "2026-08-31T00:00:00+00:00",
-    }
-
-    await repository.create_edge(
-        edge_type="HAS_DISCOVERY_SOURCE",
-        from_type="Item",
-        from_id=tool_item.item_id,
-        to_type="DiscoverySource",
-        to_id=source_key,
-        to_field="source_key",
-    )
-
-    assert len(fake_db.edges) == 1
-    assert "CREATE EDGE HAS_DISCOVERY_SOURCE" in fake_db.edges[0]["command"]
+    with pytest.raises(ValueError):
+        await repository.create_edge(
+            edge_type="HAS_DISCOVERY_SOURCE",
+            from_type="Item",
+            from_id=tool_item.item_id,
+            to_type="DiscoverySource",
+            to_id="does-not-matter",
+            to_field="source_key",
+        )
 
 
 @pytest.mark.asyncio
